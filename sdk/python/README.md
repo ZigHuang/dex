@@ -1,4 +1,4 @@
-# OpenAI Dex Python SDK
+# Dex Python SDK
 
 Build Python applications that start Dex threads, run turns, stream progress,
 and control workspace access.

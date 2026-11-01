@@ -533,7 +533,7 @@ def test_source_sdk_package_declares_stable_documentation() -> None:
         in pyproject["project"]["classifiers"],
         "license": pyproject["project"]["license"],
         "documentation": pyproject["project"]["urls"]["Documentation"],
-        "readme_is_stable": "# OpenAI Dex Python SDK\n" in readme,
+        "readme_is_stable": "# Dex Python SDK\n" in readme,
         "local_license_file": (ROOT / "LICENSE").exists(),
     } == {
         "description": "Python SDK for Dex",

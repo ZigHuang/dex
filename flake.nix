@@ -1,5 +1,5 @@
 {
-  description = "Development Nix flake for OpenAI Dex CLI";
+  description = "Development Nix flake for Dex CLI";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

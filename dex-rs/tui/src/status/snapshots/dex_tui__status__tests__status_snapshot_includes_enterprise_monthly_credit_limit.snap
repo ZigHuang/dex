@@ -5,12 +5,12 @@ expression: sanitized
 /status
 
 ╭───────────────────────────────────────────────────────────────────────────────────╮
-│  >_ OpenAI Dex (v0.0.0)                                                         │
+│  >_ Dex (v0.0.0)                                                                  │
 │                                                                                   │
-│ Visit https://chatgpt.com/dex/settings/usage for up-to-date                     │
+│ Visit https://chatgpt.com/dex/settings/usage for up-to-date                       │
 │ information on rate limits and credits                                            │
 │                                                                                   │
-│  Model:                  gpt-5.1-dex-max (reasoning none, summaries auto)       │
+│  Model:                  gpt-5.1-dex-max (reasoning none, summaries auto)         │
 │  Directory: [[workspace]]                                                         │
 │  Permissions:            Custom (workspace with network access, Ask for approval) │
 │  Agents.md:              <none>                                                   │

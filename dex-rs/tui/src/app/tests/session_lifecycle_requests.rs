@@ -1024,14 +1024,14 @@ async fn underfilled_scrollback_fetches_older_pages_without_opening_the_transcri
         };
         let partial = render_overlay(overlay);
         assert!(partial.contains("Earlier messages are available — scroll up to load them"));
-        assert!(!partial.contains("OpenAI Dex"));
+        assert!(!partial.contains("Dex"));
         assert!(!partial.contains("This is a test announcement"));
         assert!(!partial.contains('%'));
 
         overlay.set_history_state(crate::pager_overlay::TranscriptHistoryState::LoadingOlder);
         let loading = render_overlay(overlay);
         assert!(loading.contains("Loading earlier messages..."));
-        assert!(!loading.contains("OpenAI Dex"));
+        assert!(!loading.contains("Dex"));
         assert!(!loading.contains('%'));
     } else {
         panic!("expected transcript overlay");

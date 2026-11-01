@@ -1,4 +1,4 @@
-# OpenAI Dex Python SDK - API Reference
+# Dex Python SDK - API Reference
 
 Public surface of `openai_dex` for Dex workflows.
 

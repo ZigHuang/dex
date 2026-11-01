@@ -673,7 +673,7 @@ impl PluginRequestProcessor {
                 Err(err) if explicit_marketplace_kinds => {
                     return Err(remote_plugin_catalog_error_to_jsonrpc(
                         err,
-                        "list OpenAI Curated remote plugin catalog",
+                        "list Curated remote plugin catalog",
                     ));
                 }
                 Err(RemotePluginCatalogError::AuthRequired) => {}

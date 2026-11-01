@@ -920,7 +920,7 @@ pub(super) async fn fetch_additional_plugin_remote_sections(
     if !remote_plugin_enabled {
         sections.push((
             "vertical",
-            "OpenAI Curated",
+            "Curated",
             vec![PluginListMarketplaceKind::Vertical],
         ));
     }
@@ -1440,7 +1440,7 @@ mod tests {
                 "Sign in to ChatGPT, then try loading this section again.",
             ),
             (
-                "OpenAI Curated",
+                "Curated",
                 "chatgpt authentication required for remote plugin catalog; api key auth is not supported",
                 "Sign in with ChatGPT auth; API key auth cannot load remote plugin catalogs.",
             ),

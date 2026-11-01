@@ -47,7 +47,7 @@ rustPlatform.buildRustPackage (_: {
   };
 
   meta = with lib; {
-    description = "OpenAI Dex command‑line interface rust implementation";
+    description = "Dex command‑line interface rust implementation";
     license = licenses.asl20;
     homepage = "https://github.com/openai/dex";
     mainProgram = "dex";

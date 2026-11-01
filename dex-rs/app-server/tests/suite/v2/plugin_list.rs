@@ -1938,7 +1938,7 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
             .interface
             .as_ref()
             .and_then(|interface| interface.display_name.as_deref()),
-        Some("OpenAI Curated Remote")
+        Some("Curated Remote")
     );
     assert_eq!(remote_marketplace.plugins.len(), 1);
     assert_eq!(
@@ -2665,7 +2665,7 @@ async fn plugin_list_includes_openai_curated_remote_collection_when_remote_plugi
             .interface
             .as_ref()
             .and_then(|interface| interface.display_name.as_deref()),
-        Some("OpenAI Curated Remote")
+        Some("Curated Remote")
     );
     assert_eq!(remote_marketplace.plugins.len(), 1);
     let plugin = &remote_marketplace.plugins[0];
@@ -2750,7 +2750,7 @@ async fn plugin_list_propagates_openai_curated_remote_collection_errors_when_rem
     assert!(
         err.error
             .message
-            .contains("list OpenAI Curated remote plugin catalog")
+            .contains("list Curated remote plugin catalog")
     );
     Ok(())
 }
@@ -2831,7 +2831,7 @@ async fn plugin_list_includes_api_curated_marketplace_for_api_auth_when_remote_p
             .interface
             .as_ref()
             .and_then(|interface| interface.display_name.as_deref()),
-        Some("OpenAI Curated")
+        Some("Curated")
     );
     assert_eq!(api_curated_marketplace.plugins.len(), 1);
     assert_eq!(
@@ -5220,7 +5220,7 @@ fn write_openai_api_curated_marketplace(
         dex_home,
         "api_marketplace.json",
         "openai-api-curated",
-        Some("OpenAI Curated"),
+        Some("Curated"),
         plugin_names,
     )
 }

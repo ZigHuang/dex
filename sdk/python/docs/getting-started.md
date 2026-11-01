@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide gets a published OpenAI Dex Python SDK installation running
+This guide gets a published Dex Python SDK installation running
 with a multi-turn thread.
 
 ## 1. Install
