@@ -1,0 +1,56 @@
+[package]
+name = "dex-app-server-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "dex_app_server_protocol"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+dex-experimental-api-macros = { workspace = true }
+dex-app-server-protocol-noop-macros = { workspace = true }
+dex-extension-items = { workspace = true }
+dex-history = { workspace = true }
+dex-protocol = { workspace = true }
+dex-rollout = { workspace = true }
+dex-secrets = { workspace = true }
+dex-shell-command = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+dex-utils-path-uri = { workspace = true }
+dex-utils-redacted-string = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_with = { workspace = true }
+strum_macros = { workspace = true }
+thiserror = { workspace = true }
+rmcp = { workspace = true, default-features = false, features = [
+    "base64",
+    "macros",
+    "server",
+] }
+inventory = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["serde", "v7"] }
+zstd = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+dex-utils-cargo-bin = { workspace = true }
+pretty_assertions = { workspace = true }
+rmcp = { workspace = true, default-features = false, features = [
+    "base64",
+    "macros",
+    "schemars",
+    "server",
+] }
+schemars = { workspace = true }
+similar = { workspace = true }
+tempfile = { workspace = true }
+ts-rs = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-context-fragments"
+version.workspace = true
+
+[lib]
+name = "dex_context_fragments"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+dex-protocol = { workspace = true }
+dex-utils-string = { workspace = true }

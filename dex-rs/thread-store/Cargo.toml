@@ -1,0 +1,43 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-thread-store"
+version.workspace = true
+
+[lib]
+name = "dex_thread_store"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono = { workspace = true, features = ["serde"] }
+dex-app-server-protocol = { workspace = true }
+dex-extension-items = { workspace = true }
+dex-git-utils = { workspace = true }
+dex-install-context = { workspace = true }
+dex-otel = { workspace = true }
+dex-protocol = { workspace = true }
+dex-rollout = { workspace = true }
+dex-state = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+dex-utils-path = { workspace = true }
+dex-utils-path-uri = { workspace = true }
+futures = { workspace = true }
+pulldown-cmark = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+dex-utils-absolute-path = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid = { workspace = true }

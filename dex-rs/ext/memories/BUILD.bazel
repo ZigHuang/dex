@@ -1,0 +1,9 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "memories",
+    compile_data = glob([
+        "templates/**",
+    ]),
+    crate_name = "dex_memories_extension",
+)

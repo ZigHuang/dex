@@ -1,0 +1,12 @@
+---
+source: tui/src/bottom_pane/list_selection_view.rs
+expression: render_lines(&view)
+---
+                                                
+  Select Approval Mode                          
+  Switch between Dex approval presets         
+                                                
+› 1. Read Only (current)  Dex can read files  
+  2. Full Access          Dex can edit files  
+                                                
+  Press enter to confirm or esc to go back

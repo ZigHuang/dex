@@ -1,0 +1,42 @@
+[package]
+name = "dex-external-agent-migration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+name = "dex_external_agent_migration"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+dex-analytics = { workspace = true }
+dex-config = { workspace = true }
+dex-core = { workspace = true }
+dex-core-plugins = { workspace = true }
+dex-hooks = { workspace = true }
+dex-login = { workspace = true }
+dex-memories-write = { workspace = true }
+dex-otel = { workspace = true }
+dex-plugin = { workspace = true }
+dex-protocol = { workspace = true }
+dex-rollout = { workspace = true }
+dex-thread-store = { workspace = true }
+dex-utils-output-truncation = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+dex-app-server-protocol = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,6 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "dex-api",
+    crate_name = "dex_api",
+)

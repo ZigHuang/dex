@@ -1,0 +1,6 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "rustls-provider",
+    crate_name = "dex_utils_rustls_provider",
+)

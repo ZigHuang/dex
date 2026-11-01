@@ -13,11 +13,11 @@ from _bootstrap import (
 
 ensure_local_sdk_src()
 
-from openai_codex import Codex, LocalImageInput, TextInput
+from openai_dex import Dex, LocalImageInput, TextInput
 
 with temporary_sample_image_path() as image_path:
-    with Codex(config=runtime_config()) as codex:
-        thread = codex.thread_start(model="gpt-5.4", config={"model_reasoning_effort": "high"})
+    with Dex(config=runtime_config()) as dex:
+        thread = dex.thread_start(model="gpt-5.4", config={"model_reasoning_effort": "high"})
 
         result = thread.turn(
             [

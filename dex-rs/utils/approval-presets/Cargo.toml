@@ -1,0 +1,15 @@
+[package]
+name = "dex-utils-approval-presets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dex-protocol = { workspace = true }
+
+[lib]
+test = false
+doctest = false

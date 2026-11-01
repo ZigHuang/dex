@@ -1,0 +1,32 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-web-search-extension"
+version.workspace = true
+
+[lib]
+name = "dex_web_search_extension"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+dex-api = { workspace = true }
+dex-core = { workspace = true }
+dex-extension-api = { workspace = true }
+dex-extension-items = { workspace = true }
+dex-login = { workspace = true }
+dex-model-provider = { workspace = true }
+dex-model-provider-info = { workspace = true }
+dex-otel = { workspace = true }
+dex-protocol = { workspace = true }
+dex-tools = { workspace = true }
+http = { workspace = true }
+schemars = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

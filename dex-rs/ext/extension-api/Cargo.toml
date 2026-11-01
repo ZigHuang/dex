@@ -1,0 +1,29 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-extension-api"
+version.workspace = true
+
+[lib]
+name = "dex_extension_api"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+dex-config = { workspace = true }
+dex-context-fragments = { workspace = true }
+dex-exec-server-protocol = { workspace = true }
+dex-mcp = { workspace = true }
+dex-protocol = { workspace = true }
+dex-tools = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+dex-utils-path-uri = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,34 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-history-notes-extension"
+version.workspace = true
+
+[lib]
+name = "dex_history_notes_extension"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+dex-api = { workspace = true }
+dex-client = { workspace = true }
+dex-core = { workspace = true }
+dex-extension-api = { workspace = true }
+dex-login = { workspace = true }
+dex-model-provider = { workspace = true }
+dex-protocol = { workspace = true }
+dex-tools = { workspace = true }
+dex-utils-output-truncation = { workspace = true }
+http = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+dex-config = { workspace = true }
+dex-model-provider-info = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock = { workspace = true }

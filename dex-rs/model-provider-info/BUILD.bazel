@@ -1,0 +1,6 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "model-provider-info",
+    crate_name = "dex_model_provider_info",
+)

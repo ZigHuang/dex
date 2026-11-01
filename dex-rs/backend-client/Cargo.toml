@@ -1,0 +1,31 @@
+[package]
+name = "dex-backend-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+http = { workspace = true }
+url = { workspace = true }
+dex-backend-openapi-models = { path = "../dex-backend-openapi-models" }
+dex-api = { workspace = true }
+dex-http-client = { workspace = true }
+dex-login = { workspace = true }
+dex-model-provider = { workspace = true }
+dex-protocol = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = "1"
+tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock = { workspace = true }

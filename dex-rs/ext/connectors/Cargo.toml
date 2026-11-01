@@ -1,0 +1,24 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-connectors-extension"
+version.workspace = true
+
+[lib]
+name = "dex_connectors_extension"
+path = "src/lib.rs"
+doctest = false
+test = false
+
+[lints]
+workspace = true
+
+[dependencies]
+dex-connectors = { workspace = true }
+dex-core-plugins = { workspace = true }
+dex-file-system = { workspace = true }
+dex-plugin = { workspace = true }
+dex-utils-path-uri = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

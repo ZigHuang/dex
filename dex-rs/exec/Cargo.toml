@@ -1,0 +1,79 @@
+[package]
+name = "dex-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+autotests = false
+
+[[bin]]
+name = "dex-exec"
+path = "src/main.rs"
+
+[lib]
+name = "dex_exec"
+path = "src/lib.rs"
+doctest = false
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+dex-arg0 = { workspace = true }
+dex-app-server-client = { workspace = true }
+dex-app-server-protocol = { workspace = true }
+dex-cloud-config = { workspace = true }
+dex-config = { workspace = true }
+dex-core = { workspace = true }
+dex-feedback = { workspace = true }
+dex-git-utils = { workspace = true }
+dex-history = { workspace = true }
+dex-login = { workspace = true }
+dex-model-provider-info = { workspace = true }
+dex-otel = { workspace = true }
+dex-protocol = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+dex-utils-cli = { workspace = true }
+dex-utils-oss = { workspace = true }
+dex-utils-sandbox-summary = { workspace = true }
+owo-colors = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+supports-color = { workspace = true }
+tokio = { workspace = true, features = [
+    "io-std",
+    "macros",
+    "process",
+    "rt-multi-thread",
+    "signal",
+] }
+tracing = { workspace = true, features = ["log"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+ts-rs = { workspace = true, features = [
+    "uuid-impl",
+    "serde-json-impl",
+    "no-serde-warnings",
+] }
+uuid = { workspace = true }
+
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+dex-apply-patch = { workspace = true }
+dex-utils-cargo-bin = { workspace = true }
+core_test_support = { workspace = true }
+libc = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+predicates = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+uuid = { workspace = true }
+walkdir = { workspace = true }
+wiremock = { workspace = true }

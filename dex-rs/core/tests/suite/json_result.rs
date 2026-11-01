@@ -1,0 +1,127 @@
+#![cfg(not(target_os = "windows"))]
+
+use core_test_support::responses;
+use core_test_support::skip_if_no_network;
+use core_test_support::test_dex::TestDex;
+use core_test_support::test_dex::local_selections;
+use core_test_support::test_dex::test_dex;
+use core_test_support::test_dex::turn_permission_fields;
+use core_test_support::wait_for_event;
+use dex_core::TurnInputRequest;
+use dex_core::TurnStartOptions;
+use dex_protocol::config_types::CollaborationMode;
+use dex_protocol::config_types::ModeKind;
+use dex_protocol::config_types::Settings;
+use dex_protocol::models::PermissionProfile;
+use dex_protocol::protocol::AskForApproval;
+use dex_protocol::protocol::EventMsg;
+use dex_protocol::protocol::ThreadSettingsOverrides;
+use dex_protocol::user_input::UserInput;
+use pretty_assertions::assert_eq;
+use responses::ev_assistant_message;
+use responses::ev_completed;
+use responses::sse;
+use responses::start_mock_server;
+
+const SCHEMA: &str = r#"
+{
+    "type": "object",
+    "properties": {
+        "explanation": { "type": "string" },
+        "final_answer": { "type": "string" }
+    },
+    "required": ["explanation", "final_answer"],
+    "additionalProperties": false
+}
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dex_returns_json_result_for_gpt5() -> anyhow::Result<()> {
+    dex_returns_json_result("gpt-5.4".to_string()).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dex_returns_json_result_for_gpt5_dex() -> anyhow::Result<()> {
+    dex_returns_json_result("gpt-5.4".to_string()).await
+}
+
+async fn dex_returns_json_result(model: String) -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+
+    let sse1 = sse(vec![
+        ev_assistant_message(
+            "m2",
+            r#"{"explanation": "explanation", "final_answer": "final_answer"}"#,
+        ),
+        ev_completed("r1"),
+    ]);
+
+    let expected_schema: serde_json::Value = serde_json::from_str(SCHEMA)?;
+    let match_json_text_param = move |req: &wiremock::Request| {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        let Some(text) = body.get("text") else {
+            return false;
+        };
+        let Some(format) = text.get("format") else {
+            return false;
+        };
+
+        format.get("name") == Some(&serde_json::Value::String("dex_output_schema".into()))
+            && format.get("type") == Some(&serde_json::Value::String("json_schema".into()))
+            && format.get("strict") == Some(&serde_json::Value::Bool(true))
+            && format.get("schema") == Some(&expected_schema)
+    };
+    responses::mount_sse_once_match(&server, match_json_text_param, sse1).await;
+
+    let TestDex { dex, config, .. } = test_dex().build(&server).await?;
+    let cwd = config.cwd.clone();
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
+
+    // 1) Normal user input – should hit server once.
+    dex.start_or_steer_turn(
+        TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello world".into(),
+            text_elements: Vec::new(),
+        }])
+        .with_thread_settings(ThreadSettingsOverrides {
+            environments: Some(local_selections(cwd)),
+            approval_policy: Some(AskForApproval::Never),
+            sandbox_policy: Some(sandbox_policy),
+            permission_profile,
+            collaboration_mode: Some(CollaborationMode {
+                mode: ModeKind::Default,
+                settings: Settings {
+                    model,
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            }),
+            ..Default::default()
+        })
+        .on_start(TurnStartOptions {
+            final_output_json_schema: Some(serde_json::from_str(SCHEMA)?),
+            ..Default::default()
+        }),
+    )
+    .await?;
+
+    let message = wait_for_event(&dex, |ev| matches!(ev, EventMsg::AgentMessage(_))).await;
+    if let EventMsg::AgentMessage(message) = message {
+        let json: serde_json::Value = serde_json::from_str(&message.message)?;
+        assert_eq!(
+            json.get("explanation"),
+            Some(&serde_json::Value::String("explanation".into()))
+        );
+        assert_eq!(
+            json.get("final_answer"),
+            Some(&serde_json::Value::String("final_answer".into()))
+        );
+    } else {
+        anyhow::bail!("expected agent message event");
+    }
+
+    Ok(())
+}

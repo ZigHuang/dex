@@ -1,0 +1,24 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-plugin"
+version.workspace = true
+
+[lib]
+doctest = false
+name = "dex_plugin"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+dex-config = { workspace = true }
+dex-protocol = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+dex-utils-path-uri = { workspace = true }
+dex-utils-plugins = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

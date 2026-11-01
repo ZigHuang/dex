@@ -1,0 +1,35 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-guardian-v2"
+version.workspace = true
+
+[lib]
+name = "dex_guardian_v2"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+dex-api = { workspace = true }
+dex-core = { workspace = true }
+dex-extension-api = { workspace = true }
+dex-features = { workspace = true }
+dex-http-client = { workspace = true }
+dex-login = { workspace = true }
+dex-model-provider = { workspace = true }
+dex-protocol = { workspace = true }
+http = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+dex-model-provider-info = { workspace = true }
+core_test_support = { workspace = true }
+pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

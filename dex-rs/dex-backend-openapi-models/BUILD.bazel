@@ -1,0 +1,6 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "dex-backend-openapi-models",
+    crate_name = "dex_backend_openapi_models",
+)

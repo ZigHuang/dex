@@ -1,0 +1,6 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "sandbox-summary",
+    crate_name = "dex_utils_sandbox_summary",
+)

@@ -1,0 +1,7 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "dex-experimental-api-macros",
+    crate_name = "dex_experimental_api_macros",
+    proc_macro = True,
+)

@@ -1,0 +1,17 @@
+[package]
+name = "dex-utils-oss"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dex-core = { workspace = true }
+dex-lmstudio = { workspace = true }
+dex-model-provider-info = { workspace = true }
+dex-ollama = { workspace = true }
+
+[lib]
+doctest = false

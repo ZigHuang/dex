@@ -1,0 +1,6 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "app-server-client",
+    crate_name = "dex_app_server_client",
+)

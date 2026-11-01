@@ -1,0 +1,148 @@
+[package]
+name = "dex-app-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dex-app-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "dex-app-server-test-notify-capture"
+path = "src/bin/notify_capture.rs"
+
+[[bin]]
+name = "exec-server"
+path = "src/bin/exec_server.rs"
+
+[lib]
+name = "dex_app_server"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+axum = { workspace = true, default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+    "ws",
+] }
+dex-analytics = { workspace = true }
+dex-agent-extension = { workspace = true }
+dex-arg0 = { workspace = true }
+dex-aws-auth = { workspace = true }
+dex-cloud-config = { workspace = true }
+dex-code-mode = { workspace = true }
+dex-config = { workspace = true }
+dex-connectors = { workspace = true }
+dex-core = { workspace = true }
+dex-core-plugins = { workspace = true }
+dex-diagnostics = { workspace = true }
+dex-home = { workspace = true }
+dex-exec-server = { workspace = true }
+dex-extension-api = { workspace = true }
+dex-external-agent-migration = { workspace = true }
+dex-features = { workspace = true }
+dex-goal-extension = { workspace = true }
+dex-git-attribution = { workspace = true }
+dex-guardian-v2 = { workspace = true }
+dex-git-utils = { workspace = true }
+dex-file-watcher = { workspace = true }
+dex-hooks = { workspace = true }
+dex-history-notes-extension = { workspace = true }
+dex-http-client = { workspace = true }
+dex-otel = { workspace = true }
+dex-plugin = { workspace = true }
+dex-shell-command = { workspace = true }
+dex-skills = { workspace = true }
+dex-skills-extension = { workspace = true }
+dex-utils-cli = { workspace = true }
+dex-utils-pty = { workspace = true }
+dex-backend-client = { workspace = true }
+dex-file-search = { workspace = true }
+dex-chatgpt = { workspace = true }
+dex-login = { workspace = true }
+dex-image-generation-extension = { workspace = true }
+dex-memories-extension = { workspace = true }
+dex-web-search-extension = { workspace = true }
+dex-memories-write = { workspace = true }
+dex-mcp = { workspace = true }
+dex-mcp-extension = { workspace = true }
+dex-model-provider = { workspace = true }
+dex-models-manager = { workspace = true }
+dex-protocol = { workspace = true }
+dex-queue-extension = { workspace = true }
+dex-app-server-protocol = { workspace = true }
+dex-app-server-transport = { workspace = true }
+dex-feedback = { workspace = true }
+dex-rmcp-client = { workspace = true }
+dex-rollout = { workspace = true }
+dex-sandboxing = { workspace = true }
+dex-state = { workspace = true }
+dex-thread-store = { workspace = true }
+dex-tools = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+dex-utils-json-to-toml = { workspace = true }
+dex-utils-path-uri = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+futures = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+tokio = { workspace = true, features = [
+    "io-std",
+    "macros",
+    "process",
+    "rt-multi-thread",
+    "signal",
+] }
+tokio-util = { workspace = true }
+tracing = { workspace = true, features = ["log"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"] }
+url = { workspace = true }
+uuid = { workspace = true, features = ["serde", "v7"] }
+
+[target.'cfg(windows)'.dependencies]
+dex-windows-sandbox = { workspace = true }
+
+[dev-dependencies]
+app_test_support = { workspace = true }
+axum = { workspace = true, default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+] }
+base64 = { workspace = true }
+dex-model-provider-info = { workspace = true }
+dex-utils-cargo-bin = { workspace = true }
+core_test_support = { workspace = true }
+flate2 = { workspace = true }
+hmac = { workspace = true }
+http = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+pretty_assertions = { workspace = true }
+rmcp = { workspace = true, default-features = false, features = [
+    "elicitation",
+    "server",
+    "transport-streamable-http-server",
+] }
+serial_test = { workspace = true }
+shlex = { workspace = true }
+tar = { workspace = true }
+test-case = "3.3.1"
+tokio-tungstenite = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+wiremock = { workspace = true }

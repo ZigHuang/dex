@@ -1,0 +1,21 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-memories-read"
+version.workspace = true
+
+[lib]
+name = "dex_memories_read"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+dex-protocol = { workspace = true }
+dex-shell-command = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

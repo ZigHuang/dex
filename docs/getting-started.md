@@ -1,3 +1,3 @@
-# Getting started with Codex CLI
+# Getting started with Dex CLI
 
-For an overview of Codex CLI features, see [this documentation](https://developers.openai.com/codex/cli/features#running-in-interactive-mode).
+For an overview of Dex CLI features, see [this documentation](https://developers.openai.com/dex/cli/features#running-in-interactive-mode).

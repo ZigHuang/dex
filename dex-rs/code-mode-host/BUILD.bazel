@@ -1,0 +1,6 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "code-mode-host",
+    crate_name = "dex_code_mode_host",
+)

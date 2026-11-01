@@ -1,0 +1,79 @@
+use std::sync::Arc;
+
+use anyhow::Result;
+use core_test_support::responses::strip_metadata;
+use core_test_support::responses::strip_response_item_id;
+use dex_core::build_prompt_input;
+use dex_core::config::ConfigBuilder;
+use dex_core::config::ConfigOverrides;
+use dex_extension_api::ExtensionRegistryBuilder;
+use dex_home::DexHomeUserInstructionsProvider;
+use dex_protocol::models::ContentItem;
+use dex_protocol::models::ResponseItem;
+use dex_protocol::user_input::UserInput;
+use pretty_assertions::assert_eq;
+use tempfile::TempDir;
+
+const TEST_INSTRUCTIONS: &str = "Global test instructions";
+
+#[tokio::test]
+async fn build_prompt_input_includes_context_and_user_message() -> Result<()> {
+    let dex_home = TempDir::new()?;
+    let cwd = TempDir::new()?;
+    std::fs::write(dex_home.path().join("AGENTS.md"), TEST_INSTRUCTIONS)?;
+    let config = ConfigBuilder::default()
+        .dex_home(dex_home.path().to_path_buf())
+        .harness_overrides(ConfigOverrides {
+            cwd: Some(cwd.path().to_path_buf()),
+            dex_self_exe: Some(std::env::current_exe()?),
+            ..ConfigOverrides::default()
+        })
+        .build()
+        .await?;
+    let user_instructions_provider = Arc::new(DexHomeUserInstructionsProvider::new(
+        config.dex_home.clone(),
+    ));
+    let input = build_prompt_input(
+        config,
+        vec![UserInput::Text {
+            text: "hello from debug prompt".to_string(),
+            text_elements: Vec::new(),
+        }],
+        /*state_db*/ None,
+        Arc::new(ExtensionRegistryBuilder::new().build()),
+        user_instructions_provider,
+    )
+    .await?;
+
+    let expected_user_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "hello from debug prompt".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    assert_eq!(
+        input
+            .last()
+            .cloned()
+            .map(strip_metadata)
+            .map(strip_response_item_id),
+        Some(expected_user_message)
+    );
+    assert!(input.iter().any(|item| {
+        let ResponseItem::Message { content, .. } = item else {
+            return false;
+        };
+
+        content.iter().any(|content_item| {
+            let (ContentItem::InputText { text } | ContentItem::OutputText { text }) = content_item
+            else {
+                return false;
+            };
+            text.contains(TEST_INSTRUCTIONS)
+        })
+    }));
+    Ok(())
+}

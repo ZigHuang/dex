@@ -1,0 +1,48 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-skills-extension"
+version.workspace = true
+
+[lib]
+name = "dex_skills_extension"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+dex-analytics = { workspace = true }
+dex-config = { workspace = true }
+dex-exec-server = { workspace = true }
+dex-extension-api = { workspace = true }
+dex-mcp = { workspace = true }
+dex-otel = { workspace = true }
+dex-protocol = { workspace = true }
+dex-skills = { workspace = true }
+dex-tools = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+dex-utils-path-uri = { workspace = true }
+dex-utils-plugins = { workspace = true }
+dex-utils-string = { workspace = true }
+dirs = { workspace = true }
+futures = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+dex-models-manager = { workspace = true }
+dex-utils-cargo-bin = { workspace = true }
+dunce = { workspace = true }
+insta = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

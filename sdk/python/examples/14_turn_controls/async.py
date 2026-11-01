@@ -11,14 +11,12 @@ ensure_local_sdk_src()
 
 import asyncio
 
-from openai_codex import AsyncCodex
+from openai_dex import AsyncDex
 
 
 async def main() -> None:
-    async with AsyncCodex(config=runtime_config()) as codex:
-        thread = await codex.thread_start(
-            model="gpt-5.4", config={"model_reasoning_effort": "high"}
-        )
+    async with AsyncDex(config=runtime_config()) as dex:
+        thread = await dex.thread_start(model="gpt-5.4", config={"model_reasoning_effort": "high"})
         steer_turn = await thread.turn("Count from 1 to 40 with commas, then one summary sentence.")
         steer_result = await steer_turn.steer("Keep it brief and stop after 10 numbers.")
 

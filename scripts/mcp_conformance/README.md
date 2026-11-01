@@ -1,6 +1,6 @@
 # MCP client conformance
 
-This directory tests the actual Codex executable against the official Model
+This directory tests the actual Dex executable against the official Model
 Context Protocol client conformance suite. It exercises the shipping legacy,
 intermediate `2025-11-25`, and modern `2026-07-28` protocols, localhost HTTP,
 stdio, OAuth, and additional transport and security regression fixtures.
@@ -11,24 +11,24 @@ Use Node.js 22 and Python 3.10 or later.
 
 ## Run the conformance gate
 
-First install the frozen workspace dependencies and build Codex:
+First install the frozen workspace dependencies and build Dex:
 
 ```bash
 pnpm install --frozen-lockfile
-cargo build --locked --manifest-path codex-rs/Cargo.toml -p codex-cli --bin codex
+cargo build --locked --manifest-path dex-rs/Cargo.toml -p dex-cli --bin dex
 ```
 
-From a published Codex checkout, run:
+From a published Dex checkout, run:
 
 ```bash
-python3 scripts/mcp_conformance/run_codex_compliance.py \
-  codex-rs/target/debug/codex \
+python3 scripts/mcp_conformance/run_dex_compliance.py \
+  dex-rs/target/debug/dex \
   --conformance-cli node_modules/@modelcontextprotocol/conformance/dist/index.js \
   --baseline-report scripts/mcp_conformance/regression-baseline-v1.json \
-  --report /tmp/codex-mcp-conformance.json
+  --report /tmp/dex-mcp-conformance.json
 ```
 
-The positional executable can also point to an already built Codex binary.
+The positional executable can also point to an already built Dex binary.
 `--conformance-cli` selects the exact, lockfile-installed upstream JavaScript
 runner instead of downloading a moving version during a test.
 
@@ -55,8 +55,8 @@ Create a compact baseline from a reviewed complete report without contacting
 the upstream suite again:
 
 ```bash
-python3 scripts/mcp_conformance/run_codex_compliance.py \
-  /absolute/path/to/codex \
+python3 scripts/mcp_conformance/run_dex_compliance.py \
+  /absolute/path/to/dex \
   --baseline-report /absolute/path/to/full-conformance-report.json \
   --extract-baseline /tmp/mcp-conformance-regression-baseline-v1.json
 ```
@@ -67,18 +67,18 @@ it to conceal a regression.
 
 ## Run the production reviewer regression gate
 
-The separate reviewer gate tests the real Codex app-server across all three
+The separate reviewer gate tests the real Dex app-server across all three
 shipping, legacy, and modern protocol modes. It covers stdio and localhost
 HTTP, exact-integer tool and elicitation schemas, bounded multi-round requests,
 malformed discovery response IDs, repeated pagination cursors, SSE framing and
-keepalives, and catalog boundaries. In a published Codex checkout, run:
+keepalives, and catalog boundaries. In a published Dex checkout, run:
 
 ```bash
 python3 scripts/mcp_conformance/review_regressions.py \
-  /absolute/path/to/codex \
+  /absolute/path/to/dex \
   --mode all \
   --baseline-report scripts/mcp_conformance/review-regression-baseline-v1.json \
-  --report /tmp/codex-mcp-review-regressions.json
+  --report /tmp/dex-mcp-review-regressions.json
 ```
 
 A complete, main-derived baseline records all 186 real check identities and all
@@ -92,7 +92,7 @@ production report without rerunning the client:
 
 ```bash
 python3 scripts/mcp_conformance/review_regressions.py \
-  /absolute/path/to/codex \
+  /absolute/path/to/dex \
   --baseline-report /absolute/path/to/full-review-regressions.json \
   --extract-baseline /tmp/review-regression-baseline-v1.json
 ```
@@ -109,13 +109,13 @@ env PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 ## Run the required SDK integration
 
 The existing required SDK workflow runs the complete Python fixture self-tests.
-Its TypeScript job builds the actual Codex executable, sets `CODEX_EXEC_PATH`,
+Its TypeScript job builds the actual Dex executable, sets `DEX_EXEC_PATH`,
 installs the pinned upstream conformance runner, and runs both the official
 authenticated suite and the separate production reviewer regression matrix.
 Neither gate can be skipped. To reproduce the focused integration locally:
 
 ```bash
-CODEX_EXEC_PATH=/absolute/path/to/codex \
-  pnpm --filter @openai/codex-sdk test -- \
+DEX_EXEC_PATH=/absolute/path/to/dex \
+  pnpm --filter @openai/dex-sdk test -- \
   --runInBand tests/mcpConformance.test.ts
 ```

@@ -1,12 +1,12 @@
 #!/usr/bin/env -S NODE_NO_WARNINGS=1 pnpm ts-node-esm --files
 
-import { Codex } from "@openai/codex-sdk";
+import { Dex } from "@openai/dex-sdk";
 
-import { codexPathOverride } from "./helpers.ts";
+import { dexPathOverride } from "./helpers.ts";
 
-const codex = new Codex({ codexPathOverride: codexPathOverride() });
+const dex = new Dex({ dexPathOverride: dexPathOverride() });
 
-const thread = codex.startThread();
+const thread = dex.startThread();
 
 const schema = {
   type: "object",

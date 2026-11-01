@@ -1,0 +1,13 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "linux-sandbox",
+    crate_name = "dex_linux_sandbox",
+    extra_binaries = [
+        "//dex-rs/bwrap:bwrap",
+    ],
+    rustc_env_files = select({
+        "@platforms//os:linux": ["//dex-rs/bwrap:bwrap-sha256-env"],
+        "//conditions:default": [],
+    }),
+)

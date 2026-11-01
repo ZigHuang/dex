@@ -3,12 +3,12 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-import { Codex } from "@openai/codex-sdk";
-import type { ThreadEvent, ThreadItem } from "@openai/codex-sdk";
-import { codexPathOverride } from "./helpers.ts";
+import { Dex } from "@openai/dex-sdk";
+import type { ThreadEvent, ThreadItem } from "@openai/dex-sdk";
+import { dexPathOverride } from "./helpers.ts";
 
-const codex = new Codex({ codexPathOverride: codexPathOverride() });
-const thread = codex.startThread();
+const dex = new Dex({ dexPathOverride: dexPathOverride() });
+const thread = dex.startThread();
 const rl = createInterface({ input, output });
 
 const handleItemCompleted = (item: ThreadItem): void => {

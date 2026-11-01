@@ -1,0 +1,129 @@
+[package]
+name = "dex-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+default-run = "dex"
+
+[[bin]]
+name = "dex"
+path = "src/main.rs"
+
+[[bin]]
+name = "logs_client"
+path = "src/bin/logs_client.rs"
+
+[lib]
+name = "dex_cli"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+clap_complete = { workspace = true }
+dex-app-server = { workspace = true }
+dex-app-server-daemon = { workspace = true }
+dex-app-server-protocol = { workspace = true }
+dex-app-server-test-client = { workspace = true }
+dex-arg0 = { workspace = true }
+dex-api = { workspace = true }
+dex-chatgpt = { workspace = true }
+dex-cloud-config = { workspace = true }
+dex-cloud-tasks = { path = "../cloud-tasks" }
+dex-utils-cli = { workspace = true }
+dex-config = { workspace = true }
+dex-core = { workspace = true }
+dex-core-plugins = { workspace = true }
+dex-history = { workspace = true }
+dex-home = { workspace = true }
+dex-http-client = { workspace = true }
+dex-exec = { workspace = true }
+dex-exec-server = { workspace = true }
+dex-execpolicy = { workspace = true }
+dex-extension-api = { workspace = true }
+dex-features = { workspace = true }
+dex-git-attribution = { workspace = true }
+dex-git-utils = { workspace = true }
+dex-install-context = { workspace = true }
+dex-login = { workspace = true }
+dex-memories-write = { workspace = true }
+dex-mcp = { workspace = true }
+dex-mcp-server = { workspace = true }
+dex-model-provider = { workspace = true }
+dex-models-manager = { workspace = true }
+dex-plugin = { workspace = true }
+dex-protocol = { workspace = true }
+dex-responses-api-proxy = { workspace = true }
+dex-rmcp-client = { workspace = true }
+dex-rollout = { workspace = true }
+dex-rollout-trace = { workspace = true }
+dex-sandboxing = { workspace = true }
+dex-skills-extension = { workspace = true }
+dex-state = { workspace = true }
+dex-stdio-to-uds = { workspace = true }
+dex-terminal-detection = { workspace = true }
+dex-thread-store = { workspace = true }
+dex-tui = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+dex-utils-path = { workspace = true }
+crossterm = { workspace = true }
+http = { workspace = true }
+libc = { workspace = true }
+os_info = { workspace = true }
+owo-colors = { workspace = true }
+regex-lite = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+supports-color = { workspace = true }
+sys-locale = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = [
+    "io-std",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "time",
+] }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+unicode-segmentation = { workspace = true }
+url = { workspace = true }
+which = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+dex_windows_sandbox = { package = "dex-windows-sandbox", path = "../windows-sandbox-rs" }
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+app_test_support = { workspace = true }
+assert_cmd = { workspace = true }
+assert_matches = { workspace = true }
+dex-utils-cargo-bin = { workspace = true }
+futures = { workspace = true }
+insta = { workspace = true }
+predicates = { workspace = true }
+pretty_assertions = { workspace = true }
+sqlx = { workspace = true }
+tokio-tungstenite = { workspace = true }
+wiremock = { workspace = true }
+zstd = { workspace = true }
+
+[package.metadata.cargo-shear]
+# These Rust sources are intentionally Bazel-only macrobenchmarks rather than
+# Cargo targets.
+ignored-paths = ["e2e_benches/*.rs"]

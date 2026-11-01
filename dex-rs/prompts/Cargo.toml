@@ -1,0 +1,25 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-prompts"
+version.workspace = true
+
+[lib]
+doctest = false
+name = "dex_prompts"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+dex-context-fragments = { workspace = true }
+dex-git-utils = { workspace = true }
+dex-execpolicy = { workspace = true }
+dex-protocol = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+dex-utils-template = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

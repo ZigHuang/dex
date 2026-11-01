@@ -1,0 +1,33 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-core-api"
+version.workspace = true
+
+[lib]
+doctest = false
+name = "dex_core_api"
+path = "src/lib.rs"
+test = false
+
+[lints]
+workspace = true
+
+[dependencies]
+dex-app-server-protocol = { workspace = true }
+dex-arg0 = { workspace = true }
+dex-analytics = { workspace = true }
+dex-config = { workspace = true }
+dex-core = { workspace = true }
+dex-extension-api = { workspace = true }
+dex-home = { workspace = true }
+dex-history = { workspace = true }
+dex-image-generation-extension = { workspace = true }
+dex-exec-server = { workspace = true }
+dex-features = { workspace = true }
+dex-login = { workspace = true }
+dex-model-provider-info = { workspace = true }
+dex-models-manager = { workspace = true }
+dex-protocol = { workspace = true }
+dex-state = { workspace = true }
+dex-utils-absolute-path = { workspace = true }

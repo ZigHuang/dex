@@ -1,0 +1,55 @@
+[package]
+name = "core_test_support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+assert_cmd = { workspace = true }
+base64 = { workspace = true }
+dex-arg0 = { workspace = true }
+dex-config = { workspace = true }
+dex-core = { workspace = true }
+dex-extension-api = { workspace = true }
+dex-exec-server = { workspace = true }
+dex-home = { workspace = true }
+dex-features = { workspace = true }
+dex-hooks = { workspace = true }
+dex-login = { workspace = true }
+dex-model-provider-info = { workspace = true }
+dex-models-manager = { workspace = true }
+dex-protocol = { workspace = true }
+dex-thread-store = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+dex-utils-cargo-bin = { workspace = true }
+dex-utils-path-uri = { workspace = true }
+ctor = { workspace = true }
+futures = { workspace = true }
+notify = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+regex-lite = { workspace = true }
+serde_json = { workspace = true }
+similar = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["net", "test-util", "time"] }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
+walkdir = { workspace = true }
+wiremock = { workspace = true }
+shlex = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+dex-http-client = { workspace = true }
+pretty_assertions = { workspace = true }

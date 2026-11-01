@@ -44,7 +44,7 @@ def rust_formatter_group(*, check: bool) -> FormatterGroup:
     args = ["cargo", "fmt", "--", "--config", "imports_granularity=Item"]
     if check:
         args.append("--check")
-    command = Command(tuple(args), REPO_ROOT / "codex-rs")
+    command = Command(tuple(args), REPO_ROOT / "dex-rs")
     return FormatterGroup("Rust", (command,))
 
 
@@ -58,6 +58,8 @@ def buildifier_formatter_group(*, check: bool) -> FormatterGroup:
         if not encoded_path:
             continue
         path = Path(os.fsdecode(encoded_path))
+        if not (REPO_ROOT / path).is_file():
+            continue
         name = path.name
         if (
             name in {"BUILD", "WORKSPACE", "MODULE.bazel"}

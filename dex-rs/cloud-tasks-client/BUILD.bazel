@@ -1,0 +1,6 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "cloud-tasks-client",
+    crate_name = "dex_cloud_tasks_client",
+)

@@ -1,0 +1,7 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "otel",
+    crate_name = "dex_otel",
+    integration_test_args = ["--test-threads=1"],
+)

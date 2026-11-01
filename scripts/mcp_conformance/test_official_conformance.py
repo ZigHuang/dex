@@ -4,11 +4,11 @@ import sys
 import urllib.parse
 from pathlib import Path
 
-import codex_conformance_adapter
+import dex_conformance_adapter
 import official_conformance
 import pytest
-import run_codex_compliance
-from codex_conformance_adapter import (
+import run_dex_compliance
+from dex_conformance_adapter import (
     CIMD_CLIENT_METADATA_URL,
     CLIENT_REGISTRATION_OVERRIDE_ENV_VAR,
     AdapterFailure,
@@ -121,7 +121,7 @@ def test_official_adapter_launcher_preserves_strict_production_auth_mode(
 ) -> None:
     adapter = tmp_path / "show_automatic_auth.py"
     adapter.write_text(
-        'import os\nprint(os.environ.get("CODEX_CONFORMANCE_REQUIRE_AUTOMATIC_AUTH", ""))\n',
+        'import os\nprint(os.environ.get("DEX_CONFORMANCE_REQUIRE_AUTOMATIC_AUTH", ""))\n',
         encoding="utf-8",
     )
     launcher = _make_adapter_launcher(adapter, require_automatic_auth=True)
@@ -164,9 +164,7 @@ def test_windows_official_adapter_launcher_quotes_checkout_paths(
     expected_auth = "1" if require_automatic_auth else "0"
     assert launcher.name == "client.cmd"
     assert contents.startswith("@echo off\n")
-    assert (
-        f'set "CODEX_CONFORMANCE_REQUIRE_AUTOMATIC_AUTH={expected_auth}"\n' in contents
-    )
+    assert f'set "DEX_CONFORMANCE_REQUIRE_AUTOMATIC_AUTH={expected_auth}"\n' in contents
     assert subprocess.list2cmdline([sys.executable, str(adapter)]) + " %*\n" in contents
 
 
@@ -229,21 +227,19 @@ def test_strict_auth_does_not_inject_a_second_login(
     manual_reauthorizations: list[object] = []
 
     monkeypatch.setattr(
-        codex_conformance_adapter,
+        dex_conformance_adapter,
         "_oauth_login",
         lambda _client, **_kwargs: (True, None),
     )
-    monkeypatch.setattr(codex_conformance_adapter, "_reload_mcp", lambda _client: None)
-    monkeypatch.setattr(
-        codex_conformance_adapter, "_auth_inventory", lambda _client: {}
-    )
+    monkeypatch.setattr(dex_conformance_adapter, "_reload_mcp", lambda _client: None)
+    monkeypatch.setattr(dex_conformance_adapter, "_auth_inventory", lambda _client: {})
 
     def fail_tool_call(_client: object, _workspace: Path) -> None:
         raise AdapterFailure("reauthorization is required")
 
-    monkeypatch.setattr(codex_conformance_adapter, "_auth_tool_call", fail_tool_call)
+    monkeypatch.setattr(dex_conformance_adapter, "_auth_tool_call", fail_tool_call)
     monkeypatch.setattr(
-        codex_conformance_adapter,
+        dex_conformance_adapter,
         "_login_reload_and_call",
         lambda *args, **kwargs: manual_reauthorizations.append((args, kwargs)),
     )
@@ -273,21 +269,19 @@ def test_strict_auth_accepts_product_owned_reauthentication(
     manual_reauthorizations: list[object] = []
 
     monkeypatch.setattr(
-        codex_conformance_adapter,
+        dex_conformance_adapter,
         "_oauth_login",
         lambda _client, **_kwargs: (True, None),
     )
-    monkeypatch.setattr(codex_conformance_adapter, "_reload_mcp", lambda _client: None)
+    monkeypatch.setattr(dex_conformance_adapter, "_reload_mcp", lambda _client: None)
+    monkeypatch.setattr(dex_conformance_adapter, "_auth_inventory", lambda _client: {})
     monkeypatch.setattr(
-        codex_conformance_adapter, "_auth_inventory", lambda _client: {}
-    )
-    monkeypatch.setattr(
-        codex_conformance_adapter,
+        dex_conformance_adapter,
         "_auth_tool_call",
         lambda _client, workspace: tool_calls.append(workspace),
     )
     monkeypatch.setattr(
-        codex_conformance_adapter,
+        dex_conformance_adapter,
         "_login_reload_and_call",
         lambda *args, **kwargs: manual_reauthorizations.append((args, kwargs)),
     )
@@ -428,9 +422,9 @@ def test_official_diagnostics_redact_oauth_secrets() -> None:
 
 
 def test_retained_artifacts_remove_oauth_credential_store(tmp_path: Path) -> None:
-    codex_home = tmp_path / "codex-home"
-    codex_home.mkdir()
-    credentials = codex_home / ".credentials.json"
+    dex_home = tmp_path / "dex-home"
+    dex_home.mkdir()
+    credentials = dex_home / ".credentials.json"
     credentials.write_text('{"client_secret":"do-not-retain"}', encoding="utf-8")
     stdout = tmp_path / "stdout.txt"
     stdout.write_text("Bearer token-value", encoding="utf-8")
@@ -532,9 +526,9 @@ def test_official_cli_rejects_an_empty_versioned_scenario_run(
     def unexpected_run(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("an incompatible selection must not execute conformance")
 
-    monkeypatch.setattr(run_codex_compliance, "run_compliance", unexpected_run)
+    monkeypatch.setattr(run_dex_compliance, "run_compliance", unexpected_run)
 
-    exit_code = run_codex_compliance.main(
+    exit_code = run_dex_compliance.main(
         [
             sys.executable,
             "--mode",
@@ -584,7 +578,7 @@ result_dir.mkdir(parents=True)
         "status": "SUCCESS",
     },
 ]))
-pathlib.Path(os.environ["CODEX_CONFORMANCE_ADAPTER_REPORT"]).write_text(
+pathlib.Path(os.environ["DEX_CONFORMANCE_ADAPTER_REPORT"]).write_text(
     json.dumps({"success": True, "steps": []})
 )
 """.lstrip(),
@@ -596,7 +590,7 @@ pathlib.Path(os.environ["CODEX_CONFORMANCE_ADAPTER_REPORT"]).write_text(
     results = run_official_mode(
         conformance_command=[sys.executable, str(fake_cli)],
         adapter_script=adapter,
-        codex_binary=Path("/opt/codex"),
+        dex_binary=Path("/opt/dex"),
         mode=MODERN_VERSION,
         scenarios=["tools_call"],
         output_dir=tmp_path / "results",
@@ -631,7 +625,7 @@ time.sleep(60)
         result = _run_scenario(
             conformance_command=[sys.executable, str(fake_cli)],
             adapter_launcher=launcher,
-            codex_binary=Path("/opt/codex"),
+            dex_binary=Path("/opt/dex"),
             mode=MODERN_VERSION,
             scenario="tools_call",
             output_dir=tmp_path / "results",
@@ -664,7 +658,7 @@ import pathlib
 import time
 
 time.sleep(0.1)
-pathlib.Path(os.environ["CODEX_CONFORMANCE_ADAPTER_REPORT"]).write_text(
+pathlib.Path(os.environ["DEX_CONFORMANCE_ADAPTER_REPORT"]).write_text(
     json.dumps({"success": True, "steps": []})
 )
 '''
@@ -680,7 +674,7 @@ sys.exit(1)
         result = _run_scenario(
             conformance_command=[sys.executable, str(fake_cli)],
             adapter_launcher=launcher,
-            codex_binary=Path("/opt/codex"),
+            dex_binary=Path("/opt/dex"),
             mode=MODERN_VERSION,
             scenario="request-metadata",
             output_dir=tmp_path / "results",

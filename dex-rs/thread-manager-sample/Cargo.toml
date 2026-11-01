@@ -1,0 +1,18 @@
+[package]
+name = "dex-thread-manager-sample"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# Keep this sample limited to a single Dex workspace dependency.
+# Add new Dex surface area to `dex-core-api` instead of depending on
+# additional `dex-*` crates here.
+dex-core-api = { workspace = true }
+tracing = { workspace = true }

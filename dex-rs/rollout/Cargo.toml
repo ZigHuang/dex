@@ -1,0 +1,52 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-rollout"
+version.workspace = true
+
+[lib]
+doctest = false
+name = "dex_rollout"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+dex-extension-items = { workspace = true }
+dex-file-search = { workspace = true }
+dex-git-utils = { workspace = true }
+dex-history = { workspace = true }
+dex-otel = { workspace = true }
+dex-protocol = { workspace = true }
+dex-state = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+dex-utils-path = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+time = { workspace = true, features = [
+    "formatting",
+    "local-offset",
+    "macros",
+    "parsing",
+] }
+tokio = { workspace = true, features = [
+    "fs",
+    "io-util",
+    "macros",
+    "process",
+    "rt",
+    "sync",
+    "time",
+] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+dex-utils-absolute-path = { workspace = true }
+pretty_assertions = { workspace = true }

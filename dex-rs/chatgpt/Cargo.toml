@@ -1,0 +1,31 @@
+[package]
+name = "dex-chatgpt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+dex-connectors = { workspace = true }
+dex-core = { workspace = true }
+dex-git-utils = { workspace = true }
+dex-http-client = { workspace = true }
+dex-login = { workspace = true }
+dex-model-provider = { workspace = true }
+dex-plugin = { workspace = true }
+dex-utils-cli = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+dex-utils-cargo-bin = { workspace = true }
+pretty_assertions = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lib]
+doctest = false

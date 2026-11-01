@@ -1,0 +1,33 @@
+[package]
+name = "dex-arg0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "dex_arg0"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+dex-apply-patch = { workspace = true }
+dex-exec-server = { workspace = true }
+dex-install-context = { workspace = true }
+dex-linux-sandbox = { workspace = true }
+dex-sandboxing = { workspace = true }
+dex-shell-escalation = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+dex-utils-home-dir = { workspace = true }
+dotenvy = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[target.'cfg(windows)'.dependencies]
+dex-windows-sandbox = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
