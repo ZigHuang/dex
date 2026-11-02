@@ -9,7 +9,9 @@ download packages from GitHub by default and verify their SHA-256 checksums.
 Install or update to the latest stable release on Linux or macOS:
 
 ```bash
-curl -fsSL https://github.com/ZigHuang/dex/releases/latest/download/install.sh | sh
+curl --http1.1 -fsSL --retry 5 --retry-all-errors --connect-timeout 10 \
+  https://github.com/ZigHuang/dex/releases/latest/download/install.sh \
+  -o /tmp/dex-install.sh && sh /tmp/dex-install.sh
 ```
 
 The command selects your operating system and architecture automatically. No
@@ -37,6 +39,22 @@ earlier attempts for that version. Use another rebuild number for further retrie
 Source changes to a published release require a new version. Missing platform
 packages may be added from the same original tag; update the checksum manifest
 when adding them and preserve the existing package archives.
+
+### GitHub API installation
+
+If GitHub's script download fails with a connection reset or curl error 56,
+retrieve the installer through the repository API:
+
+```bash
+curl --http1.1 -fsSL --retry 5 --retry-all-errors --connect-timeout 10 \
+  -H 'Accept: application/vnd.github.raw+json' \
+  'https://api.github.com/repos/ZigHuang/dex/contents/scripts/install/install.sh?ref=main' \
+  -o /tmp/dex-install.sh && sh /tmp/dex-install.sh
+```
+
+This downloads the installer from `main`; the installer still selects the latest
+stable GitHub Release. Both commands execute the script only after curl completes
+successfully.
 
 ### System requirements
 

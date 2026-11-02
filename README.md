@@ -20,7 +20,9 @@ If you want Dex in your code editor (VS Code, Cursor, Windsurf), <a href="https:
 Run the following on Mac or Linux to install Dex CLI:
 
 ```shell
-curl -fsSL https://github.com/ZigHuang/dex/releases/latest/download/install.sh | sh
+curl --http1.1 -fsSL --retry 5 --retry-all-errors --connect-timeout 10 \
+  https://github.com/ZigHuang/dex/releases/latest/download/install.sh \
+  -o /tmp/dex-install.sh && sh /tmp/dex-install.sh
 ```
 
 Run the following on Windows to install Dex CLI:
@@ -30,6 +32,8 @@ powershell -ExecutionPolicy ByPass -c "irm https://github.com/ZigHuang/dex/relea
 ```
 
 The standalone installers download complete packages from [ZigHuang/dex GitHub Releases](https://github.com/ZigHuang/dex/releases). Without `--release` or `DEX_RELEASE`, they install the latest stable release, select your operating system and architecture, and verify package checksums. Rerun the same command to upgrade to the latest version.
+
+If the script download is interrupted, use the [GitHub API installation command](./docs/install.md#github-api-installation).
 
 Dex CLI can also be installed via the following package managers:
 
