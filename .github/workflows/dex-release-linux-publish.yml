@@ -26,13 +26,15 @@ jobs:
           import os
           import urllib.request
 
-          base = "https://api.github.com/repos/ZigHuang/dex/actions/runs/41445895205"
+          base = "https://api.github.com/repos/ZigHuang/dex/actions/runs/"
           headers = {"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json"}
-          with urllib.request.urlopen(urllib.request.Request(base, headers=headers), timeout=30) as response:
-              run = json.load(response)
-          if run["status"] != "completed":
-              with urllib.request.urlopen(urllib.request.Request(base + "/cancel", data=b"", headers=headers, method="POST"), timeout=30):
-                  pass
+          for run_id in (41445895205, 41455198924):
+              url = base + str(run_id)
+              with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
+                  run = json.load(response)
+              if run["status"] != "completed":
+                  with urllib.request.urlopen(urllib.request.Request(url + "/cancel", data=b"", headers=headers, method="POST"), timeout=30):
+                      pass
           PY
   publish:
     needs: cancel_old_wait
@@ -161,7 +163,9 @@ jobs:
               result = subprocess.run(["gh", "api", endpoint], capture_output=True, text=True)
               if result.returncode:
                   if "HTTP 404" in result.stderr:
-                      return None
+                      drafts = subprocess.run(["gh", "api", "repos/" + os.environ["GH_REPO"] + "/releases?per_page=100"],
+                                              capture_output=True, text=True, check=True)
+                      return next((item for item in json.loads(drafts.stdout) if item["tag_name"] == tag), None)
                   raise SystemExit(result.stderr)
               return json.loads(result.stdout)
 
@@ -176,7 +180,9 @@ jobs:
               subprocess.run(["gh", "release", "create", tag, *map(str, files),
                               "--verify-tag", "--draft", "--generate-notes", "--title", "Dex v0.166.0"], check=True)
           elif existing["draft"]:
-              subprocess.run(["gh", "release", "upload", tag, *map(str, files), "--clobber"], check=True)
+              assets = {asset["name"]: (asset["size"], asset["digest"]) for asset in existing["assets"]}
+              if assets != expected:
+                  subprocess.run(["gh", "release", "upload", tag, *map(str, files), "--clobber"], check=True)
           uploaded = release()
           assert uploaded["tag_name"] == tag and not uploaded["prerelease"]
           assets = {asset["name"]: (asset["size"], asset["digest"]) for asset in uploaded["assets"]}
@@ -185,7 +191,8 @@ jobs:
               if name != "dex-package_SHA256SUMS" or len(assets) == 7:
                   assert assets[name] == digest, name
           if uploaded["draft"]:
-              subprocess.run(["gh", "release", "edit", tag, "--draft=false", "--prerelease=false", "--latest"], check=True)
+              subprocess.run(["gh", "api", "--method", "PATCH", "repos/" + os.environ["GH_REPO"] + "/releases/" + str(uploaded["id"]), "--input", "-"],
+                             input=json.dumps({"draft": False, "prerelease": False, "make_latest": "true"}), text=True, capture_output=True, check=True)
           published = release()
           assert not published["draft"] and not published["prerelease"]
           assert not published.get("immutable", False), "The release must support adding macOS packages later"

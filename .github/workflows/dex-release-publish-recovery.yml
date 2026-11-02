@@ -197,7 +197,9 @@ jobs:
               result = subprocess.run(["gh", "api", endpoint], capture_output=True, text=True)
               if result.returncode:
                   if "HTTP 404" in result.stderr:
-                      return None
+                      drafts = subprocess.run(["gh", "api", "repos/" + os.environ["GH_REPO"] + "/releases?per_page=100"],
+                                              capture_output=True, text=True, check=True)
+                      return next((item for item in json.loads(drafts.stdout) if item["tag_name"] == tag), None)
                   raise SystemExit(result.stderr)
               return json.loads(result.stdout)
 
@@ -228,7 +230,8 @@ jobs:
           assets = {asset["name"]: (asset["size"], asset["digest"]) for asset in uploaded["assets"]}
           assert len(expected) == 9 and assets == expected, assets
           if uploaded["draft"]:
-              subprocess.run(["gh", "release", "edit", tag, "--draft=false", "--prerelease=false", "--latest"], check=True)
+              subprocess.run(["gh", "api", "--method", "PATCH", "repos/" + os.environ["GH_REPO"] + "/releases/" + str(uploaded["id"]), "--input", "-"],
+                             input=json.dumps({"draft": False, "prerelease": False, "make_latest": "true"}), text=True, capture_output=True, check=True)
           published = release()
           assert not published["draft"] and not published["prerelease"]
           print("Published and verified:", published["html_url"])
