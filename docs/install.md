@@ -20,6 +20,12 @@ Tag builds upload all six complete packages, `dex-package_SHA256SUMS`,
 `install.sh`, and `install.ps1` to GitHub Releases. Each package includes the
 CLI, code-mode host, executor, and platform resources required for normal startup.
 
+If an unpublished release fails because of its CI configuration, fix the
+workflow on `main` and push a tag such as `rebuild-1-rust-v0.166.0`. This runs the
+updated workflow against the original `rust-v0.166.0` source commit and stops
+earlier attempts for that version. Use another rebuild number for further retries.
+Published releases require a new version.
+
 ### System requirements
 
 | Requirement                 | Details                                                         |

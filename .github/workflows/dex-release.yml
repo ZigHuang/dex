@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "rust-v*.*.*"
+      - "rebuild-*-rust-v*.*.*"
   workflow_dispatch:
 
 permissions:
@@ -13,19 +14,37 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   CARGO_BUILD_JOBS: "2"
   CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_TERM_COLOR: never
   DEX_REPO_ROOT: ${{ github.workspace }}
 
 jobs:
   metadata:
     if: github.repository == 'ZigHuang/dex'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: write
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
     steps:
+      - name: Resolve build source
+        id: source
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+
+          name = os.environ["GITHUB_REF_NAME"]
+          source = "rust-v" + name.partition("-rust-v")[2] if name.startswith("rebuild-") else os.environ["GITHUB_SHA"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"ref={source}\n")
+          PY
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+          ref: ${{ steps.source.outputs.ref }}
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version: "3.12"
@@ -36,16 +55,62 @@ jobs:
           python3 - <<'PY'
           import os
           from pathlib import Path
+          import subprocess
           import tomllib
 
           version = tomllib.loads(Path("dex-rs/Cargo.toml").read_text())["workspace"]["package"]["version"]
           tag = f"rust-v{version}"
           if version == "0.0.0":
               raise SystemExit("Set the workspace version before building a release")
-          if os.environ["GITHUB_EVENT_NAME"] == "push" and os.environ["GITHUB_REF_NAME"] != tag:
+          requested = os.environ["GITHUB_REF_NAME"]
+          if requested.startswith("rebuild-"):
+              requested = "rust-v" + requested.partition("-rust-v")[2]
+          if os.environ["GITHUB_EVENT_NAME"] == "push" and requested != tag:
               raise SystemExit(f"Release tag must match the workspace version: {tag}")
+          source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"version={version}\ntag={tag}\n")
+              output.write(f"version={version}\ntag={tag}\nsource_sha={source_sha}\n")
+          PY
+      - name: Stop earlier attempts for this release
+        if: startsWith(github.ref_name, 'rebuild-')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          base = "https://api.github.com/repos/ZigHuang/dex"
+          headers = {"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json"}
+          tag = os.environ["RELEASE_TAG"]
+          try:
+              with urllib.request.urlopen(urllib.request.Request(base + "/releases/tags/" + urllib.parse.quote(tag, safe=""), headers=headers), timeout=30) as response:
+                  release = json.load(response)
+              if not release["draft"]:
+                  raise SystemExit("This release is already published; use a new version")
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+          with urllib.request.urlopen(urllib.request.Request(base + "/actions/runs?event=push&per_page=100", headers=headers), timeout=30) as response:
+              runs = json.load(response)
+          for run in runs["workflow_runs"]:
+              branch = run["head_branch"] or ""
+              same_release = branch == tag or (branch.startswith("rebuild-") and branch.endswith("-" + tag))
+              if run["name"] != "Dex release" or not same_release or run["status"] == "completed" or str(run["id"]) == os.environ["GITHUB_RUN_ID"]:
+                  continue
+              request = urllib.request.Request(f"{base}/actions/runs/{run['id']}/cancel", data=b"", headers=headers, method="POST")
+              try:
+                  with urllib.request.urlopen(request, timeout=30):
+                      pass
+                  print("Cancelled earlier release attempt:", run["id"])
+              except urllib.error.HTTPError as error:
+                  if error.code != 409:
+                      raise
           PY
 
   build:
@@ -76,6 +141,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+          ref: ${{ needs.metadata.outputs.source_sha }}
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version: "3.12"
@@ -83,6 +149,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
         with:
           targets: ${{ matrix.target }}
+      - name: Use short Windows build paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          $cargoHome = "C:\c"
+          $cargoTarget = "C:\t"
+          New-Item -ItemType Directory -Force -Path $cargoHome, $cargoTarget | Out-Null
+          "CARGO_HOME=$cargoHome" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_TARGET_DIR=$cargoTarget" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Install Zig
         if: runner.os == 'Linux'
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
@@ -133,7 +209,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          release_dir="dex-rs/target/$TARGET/release"
+          release_dir="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/dex-rs/target}/$TARGET/release"
           executable_suffix=""
           resource_args=()
           if [[ "$TARGET" == *-pc-windows-msvc ]]; then
@@ -179,6 +255,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+          ref: ${{ needs.metadata.outputs.source_sha }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: dex-package-*
