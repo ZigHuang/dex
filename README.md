@@ -46,9 +46,9 @@ brew install --cask dex
 Then simply run `dex` to get started.
 
 <details>
-<summary>You can also go to the <a href="https://github.com/ZigHuang/dex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+<summary>You can also go to the <a href="https://github.com/ZigHuang/dex/releases/latest">latest GitHub Release</a> and download the complete package for your platform.</summary>
 
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
+Choose the complete package for your operating system and architecture:
 
 - macOS
   - Apple Silicon/arm64: `dex-package-aarch64-apple-darwin.tar.gz`
@@ -56,6 +56,9 @@ Each GitHub Release contains many executables, but in practice, you likely want 
 - Linux
   - x86_64: `dex-package-x86_64-unknown-linux-musl.tar.gz`
   - arm64: `dex-package-aarch64-unknown-linux-musl.tar.gz`
+- Windows
+  - x86_64: `dex-package-x86_64-pc-windows-msvc.tar.gz`
+  - arm64: `dex-package-aarch64-pc-windows-msvc.tar.gz`
 
 Use the standalone installer to verify checksums and select the complete package. Manual installations must keep `dex-package.json`, `bin/`, `dex-resources/`, and `dex-path/` together so the daemon and helper executables are available.
 
