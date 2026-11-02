@@ -6,6 +6,6 @@ expression: normalized_backend_snapshot(terminal.backend())
 "• Analyzing (0s • esc to interrupt)                                             "
 "                                                                                "
 "                                                                                "
-"› Ask Dex to do anything                                                      "
+"› Ask Dex to do anything                                                        "
 "                                                                                "
-"  gpt-5.6-sol default · /tmp/project                                            "
+"  GPT-5.6-Sol default · /tmp/project                                            "

@@ -1,3 +1,4 @@
+use core_test_support::test_dex::local_requests;
 use dex_core::TurnInputRequest;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +17,6 @@ use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_sandbox;
 use core_test_support::skip_if_wine_exec;
 use core_test_support::test_dex::TestDex;
-use core_test_support::test_dex::local_selections;
 use core_test_support::test_dex::test_dex;
 use core_test_support::test_dex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -24,9 +24,7 @@ use core_test_support::wait_for_event_with_timeout;
 use dex_config::test_support::CloudConfigBundleFixture;
 use dex_core::config::Constrained;
 use dex_extension_api::ApprovalReviewContributor;
-use dex_extension_api::ExtensionData;
 use dex_extension_api::ExtensionFuture;
-use dex_extension_api::ExtensionMetrics;
 use dex_extension_api::ExtensionRegistryBuilder;
 use dex_features::Feature;
 use dex_login::DexAuth;
@@ -46,7 +44,6 @@ use dex_protocol::openai_models::default_input_modalities;
 use dex_protocol::protocol::AskForApproval;
 use dex_protocol::protocol::EventMsg;
 use dex_protocol::protocol::Op;
-use dex_protocol::protocol::ReviewDecision;
 use dex_protocol::protocol::ThreadSettingsOverrides;
 use dex_protocol::request_permissions::PermissionGrantScope;
 use dex_protocol::request_permissions::RequestPermissionProfile;
@@ -62,20 +59,22 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
-struct ApprovedReviewContributor;
+struct ApprovedReviewContributor {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
 
 impl ApprovalReviewContributor for ApprovedReviewContributor {
-    fn contribute<'a>(
+    fn decide<'a>(
         &'a self,
-        _session_store: &'a ExtensionData,
-        _thread_store: &'a ExtensionData,
-        prompt: &'a str,
-        extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
-    ) -> ExtensionFuture<'a, Option<ReviewDecision>> {
+        input: &'a dex_extension_api::ApprovalDecisionInput<'_>,
+    ) -> ExtensionFuture<'a, Option<dex_extension_api::ApprovalDecision>> {
         Box::pin(async move {
-            assert!(extension_metrics.is_some());
-            assert!(prompt.contains("\"tool\":\"request_permissions\""));
-            Some(ReviewDecision::Approved)
+            self.entered.notify_one();
+            self.release.acquire().await.expect("review gate").forget();
+            assert!(input.metrics.is_some());
+            assert_eq!(input.action["tool"], "request_permissions");
+            Some(dex_extension_api::ApprovalDecision::Allow)
         })
     }
 }
@@ -83,16 +82,13 @@ impl ApprovalReviewContributor for ApprovedReviewContributor {
 struct EscalationApprovingReviewContributor;
 
 impl ApprovalReviewContributor for EscalationApprovingReviewContributor {
-    fn contribute<'a>(
+    fn decide<'a>(
         &'a self,
-        _session_store: &'a ExtensionData,
-        _thread_store: &'a ExtensionData,
-        prompt: &'a str,
-        _extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
-    ) -> ExtensionFuture<'a, Option<ReviewDecision>> {
+        input: &'a dex_extension_api::ApprovalDecisionInput<'_>,
+    ) -> ExtensionFuture<'a, Option<dex_extension_api::ApprovalDecision>> {
         Box::pin(async move {
-            assert!(prompt.contains("\"sandbox_permissions\":\"require_escalated\""));
-            Some(ReviewDecision::Approved)
+            assert_eq!(input.action["sandbox_permissions"], "require_escalated");
+            Some(dex_extension_api::ApprovalDecision::Allow)
         })
     }
 }
@@ -134,11 +130,19 @@ async fn approval_review_contributor_skips_existing_guardian_model_call() -> Res
     .await;
 
     let mut extensions = ExtensionRegistryBuilder::new();
-    extensions.approval_review_contributor(Arc::new(ApprovedReviewContributor));
+    let reviewer = Arc::new(ApprovedReviewContributor {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(/* permits */ 0),
+    });
+    extensions.approval_review_contributor(reviewer.clone());
     let mut builder = test_dex()
         .with_extensions(Arc::new(extensions.build()))
         .with_config(|config| {
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+            config
+                .features
+                .enable(Feature::CriticalPathTiming)
+                .expect("critical-path capture is configurable");
             config
                 .features
                 .enable(Feature::RequestPermissionsTool)
@@ -151,6 +155,16 @@ async fn approval_review_contributor_skips_existing_guardian_model_call() -> Res
             text_elements: Vec::new(),
         }]))
         .await?;
+
+    reviewer.entered.notified().await;
+    let observe = dex_core::test_support::observe_turn_timing(&test.dex)
+        .await
+        .expect("active turn");
+    let review_start = std::time::Instant::now();
+    tokio::task::yield_now().await;
+    let review_end = std::time::Instant::now();
+    assert!(review_end > review_start);
+    reviewer.release.add_permits(/* n */ 1);
 
     loop {
         match wait_for_event(&test.dex, |_| true).await {
@@ -165,6 +179,16 @@ async fn approval_review_contributor_skips_existing_guardian_model_call() -> Res
         }
     }
 
+    assert_eq!(
+        observe(review_start, review_end),
+        Some([
+            Duration::ZERO,
+            review_end.duration_since(review_start),
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        ])
+    );
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
     assert!(
@@ -341,7 +365,10 @@ async fn required_model_bypasses_extension_approval_when_guardian_v2_is_disabled
     let requirements =
         format!("{reviewer_requirements}[auto_review]\nrequired_on_models = [\"{model}\"]\n");
     let mut extensions = ExtensionRegistryBuilder::new();
-    extensions.approval_review_contributor(Arc::new(ApprovedReviewContributor));
+    extensions.approval_review_contributor(Arc::new(ApprovedReviewContributor {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(/* permits */ 1),
+    }));
     let mut builder = test_dex()
         .with_model(model)
         .with_extensions(Arc::new(extensions.build()))
@@ -546,7 +573,7 @@ async fn remote_model_override_uses_catalog_model_for_strict_auto_review() -> Re
             text_elements: Vec::new(),
         }])
         .with_thread_settings(ThreadSettingsOverrides {
-            environments: Some(local_selections(cwd_path)),
+            environments: Some(local_requests(cwd_path)),
             approval_policy: Some(AskForApproval::OnRequest),
             sandbox_policy: Some(sandbox_policy),
             permission_profile,
@@ -588,15 +615,14 @@ async fn remote_model_override_uses_catalog_model_for_strict_auto_review() -> Re
         .into_iter()
         .find(|request| {
             request.body_contains_text("auto-review-model-override.txt")
-                && request
-                    .instructions_text()
-                    .starts_with("You are judging one planned coding-agent action.")
+                && request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian"
         })
         .expect("expected Guardian request for apply_patch");
     assert_eq!(
         guardian_request.body_json()["model"].as_str(),
         Some(review_model)
     );
+    assert_eq!(guardian_request.path(), "/v1/responses");
 
     timeout(Duration::from_secs(10), dex.shutdown_and_wait()).await??;
 
@@ -617,19 +643,22 @@ fn remote_model_with_auto_review_override(slug: &str, review_model: &str) -> Mod
         visibility: ModelVisibility::List,
         supported_in_api: true,
         input_modalities: default_input_modalities(),
-        used_fallback_model_metadata: false,
         supports_search_tool: false,
+        supports_experimental_context: false,
         use_responses_lite: false,
+        supports_reasoning_effort_updates: false,
         node_repl_auto_review_required: false,
         node_repl_disabled: false,
         auto_review_model_override: Some(review_model.to_string()),
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
         priority: 1,
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),
         default_service_tier: None,
+        available_access_programs: None,
         upgrade: None,
         model_messages: None,
         include_skills_usage_instructions: false,
@@ -646,6 +675,7 @@ fn remote_model_with_auto_review_override(slug: &str, review_model: &str) -> Mod
         supports_image_detail_original: false,
         context_window: Some(272_000),
         max_context_window: None,
+        guardian: None,
         auto_compact_token_limit: None,
         comp_hash: None,
         effective_context_window_percent: 95,

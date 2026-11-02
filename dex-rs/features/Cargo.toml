@@ -13,8 +13,9 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
-dex-otel = { workspace = true }
+dex-network-proxy = { workspace = true }
 dex-protocol = { workspace = true }
+dex-utils-redacted-string = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }

@@ -27,6 +27,7 @@ dex-protocol = { workspace = true }
 dex-rollout = { workspace = true }
 dex-thread-store = { workspace = true }
 dex-utils-output-truncation = { workspace = true }
+linkify = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

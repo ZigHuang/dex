@@ -1,5 +1,7 @@
+#[cfg(test)]
+use dex_app_server_protocol::GeneratedImageRef;
 use dex_app_server_protocol::McpToolCallResult;
-use dex_app_server_protocol::ThreadItem;
+use dex_app_server_protocol::ThreadItemPayload;
 use dex_app_server_protocol::Turn;
 use serde_json::Value as JsonValue;
 
@@ -16,8 +18,8 @@ pub(super) fn should_redact_thread_resume_payloads(client_name: Option<&str>) ->
 
 pub(super) fn redact_thread_resume_payloads(turns: &mut [Turn]) {
     for turn in turns {
-        turn.items.retain_mut(|item| match item {
-            ThreadItem::McpToolCall {
+        turn.items.retain_mut(|entry| match &mut entry.payload {
+            ThreadItemPayload::McpToolCall {
                 arguments,
                 result,
                 error,
@@ -32,7 +34,7 @@ pub(super) fn redact_thread_resume_payloads(turns: &mut [Turn]) {
                 }
                 true
             }
-            ThreadItem::ImageGeneration(_) => false,
+            ThreadItemPayload::ImageGeneration(_) => false,
             _ => true,
         });
     }
@@ -58,6 +60,7 @@ mod tests {
     use dex_app_server_protocol::McpToolCallStatus;
     use dex_app_server_protocol::SessionSource;
     use dex_app_server_protocol::Thread;
+    use dex_app_server_protocol::ThreadItem;
     use dex_app_server_protocol::ThreadStatus;
     use dex_app_server_protocol::TurnItemsView;
     use dex_app_server_protocol::TurnStatus;
@@ -68,14 +71,15 @@ mod tests {
     #[test]
     fn redacts_mcp_success_result_and_removes_image_generation() {
         let mut thread = test_thread(vec![
-            ThreadItem::AgentMessage {
+            ThreadItemPayload::AgentMessage {
                 id: "agent-1".to_string(),
                 text: "kept".to_string(),
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             },
-            ThreadItem::McpToolCall {
+            ThreadItemPayload::McpToolCall {
                 id: "mcp-1".to_string(),
                 server: "docs".to_string(),
                 tool: "lookup".to_string(),
@@ -89,6 +93,7 @@ mod tests {
                     action_name: Some("lookup".to_string()),
                 }),
                 mcp_app_resource_uri: Some("ui://widget/lookup.html".to_string()),
+                mcp_app_ui: None,
                 plugin_id: Some("sample@test".to_string()),
                 read_only_hint: None,
                 result: Some(Box::new(McpToolCallResult {
@@ -102,33 +107,42 @@ mod tests {
                 error: None,
                 duration_ms: Some(8),
             },
-            ThreadItem::ImageGeneration(ImageGenerationItem {
+            ThreadItemPayload::ImageGeneration(ImageGenerationItem {
                 id: "ig-1".to_string(),
                 status: "completed".to_string(),
                 revised_prompt: Some("revised".to_string()),
-                result: "base64-result".to_string(),
+                image: GeneratedImageRef::Inline {
+                    result: "base64-result".to_string(),
+                },
                 transparent_background: None,
                 failure: None,
                 saved_path: Some(test_path_buf("/tmp/ig-1.png").abs()),
+                input_images: Vec::new(),
+                imagegen_request_id: None,
+                generation_id: None,
             }),
         ]);
+        thread.turns[0].items[1].started_at_ms = Some(123);
+        thread.turns[0].items[2].started_at_ms = Some(456);
 
         redact_thread_resume_payloads(&mut thread.turns);
 
         assert_eq!(thread.turns[0].items.len(), 2);
+        assert_eq!(thread.turns[0].items[1].started_at_ms, Some(123));
         assert_eq!(
-            thread.turns[0].items[0],
-            ThreadItem::AgentMessage {
+            thread.turns[0].items[0].payload,
+            ThreadItemPayload::AgentMessage {
                 id: "agent-1".to_string(),
                 text: "kept".to_string(),
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }
         );
         assert_eq!(
-            thread.turns[0].items[1],
-            ThreadItem::McpToolCall {
+            thread.turns[0].items[1].payload,
+            ThreadItemPayload::McpToolCall {
                 id: "mcp-1".to_string(),
                 server: "docs".to_string(),
                 tool: "lookup".to_string(),
@@ -142,6 +156,7 @@ mod tests {
                     action_name: Some("lookup".to_string()),
                 }),
                 mcp_app_resource_uri: Some("ui://widget/lookup.html".to_string()),
+                mcp_app_ui: None,
                 plugin_id: Some("sample@test".to_string()),
                 read_only_hint: None,
                 result: Some(Box::new(redacted_mcp_tool_call_result())),
@@ -153,7 +168,7 @@ mod tests {
 
     #[test]
     fn redacts_mcp_error_message() {
-        let mut thread = test_thread(vec![ThreadItem::McpToolCall {
+        let mut thread = test_thread(vec![ThreadItemPayload::McpToolCall {
             id: "mcp-1".to_string(),
             server: "docs".to_string(),
             tool: "lookup".to_string(),
@@ -161,6 +176,7 @@ mod tests {
             arguments: serde_json::json!({"secret":"argument"}),
             app_context: None,
             mcp_app_resource_uri: None,
+            mcp_app_ui: None,
             plugin_id: None,
             read_only_hint: None,
             result: None,
@@ -173,8 +189,8 @@ mod tests {
         redact_thread_resume_payloads(&mut thread.turns);
 
         assert_eq!(
-            thread.turns[0].items[0],
-            ThreadItem::McpToolCall {
+            thread.turns[0].items[0].payload,
+            ThreadItemPayload::McpToolCall {
                 id: "mcp-1".to_string(),
                 server: "docs".to_string(),
                 tool: "lookup".to_string(),
@@ -182,6 +198,7 @@ mod tests {
                 arguments: JsonValue::String(REDACTED_PAYLOAD.to_string()),
                 app_context: None,
                 mcp_app_resource_uri: None,
+                mcp_app_ui: None,
                 plugin_id: None,
                 read_only_hint: None,
                 result: None,
@@ -193,8 +210,10 @@ mod tests {
         );
     }
 
-    fn test_thread(items: Vec<ThreadItem>) -> Thread {
+    fn test_thread(items: Vec<ThreadItemPayload>) -> Thread {
         Thread {
+            originator: None,
+            environments: None,
             id: "thread-1".to_string(),
             extra: None,
             session_id: "session-1".to_string(),
@@ -205,8 +224,11 @@ mod tests {
             section: None,
             section_entered_at: None,
             project_id: None,
+            daybreak_enabled: None,
             history_mode: Default::default(),
             model_provider: "mock_provider".to_string(),
+            model: None,
+            reasoning_effort: None,
             created_at: 0,
             updated_at: 0,
             recency_at: Some(0),
@@ -223,7 +245,8 @@ mod tests {
             name: None,
             turns: vec![Turn {
                 id: "turn-1".to_string(),
-                items,
+                root_turn_id: None,
+                items: items.into_iter().map(ThreadItem::untimed).collect(),
                 items_view: TurnItemsView::Full,
                 status: TurnStatus::Completed,
                 error: None,

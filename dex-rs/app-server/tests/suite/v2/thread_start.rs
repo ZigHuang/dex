@@ -52,6 +52,7 @@ use serde_json::json;
 use std::path::Path;
 use std::path::PathBuf;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
@@ -109,7 +110,7 @@ model = "gpt-5.4-mini"
         })
         .await?;
 
-    assert_eq!(response.model, "openai.gpt-5.6-sol");
+    assert_eq!(response.model, "openai.gpt-6.1-sol");
     Ok(())
 }
 
@@ -238,9 +239,21 @@ async fn thread_start_provider_model_fallback_uses_bedrock_static_catalog() -> R
         /*allow_provider_model_fallback*/ true,
     )
     .await?;
+    for model in [
+        "openai.gpt-6.1-sol",
+        "openai.gpt-6.1-terra",
+        "openai.gpt-6-sol",
+        "openai.gpt-6-luna",
+        "openai.gpt-5.6-sol",
+    ] {
+        let response =
+            start_thread_with_model(&mut mcp, model, /*allow_provider_model_fallback*/ true)
+                .await?;
+        assert_eq!(response.model, model);
+    }
     let supported_with_fallback = start_thread_with_model(
         &mut mcp,
-        "openai.gpt-5.4",
+        "openai.gpt-5.5",
         /*allow_provider_model_fallback*/ true,
     )
     .await?;
@@ -257,7 +270,7 @@ async fn thread_start_provider_model_fallback_uses_bedrock_static_catalog() -> R
             supported_with_fallback.model,
             unsupported_without_fallback.model,
         ],
-        vec!["openai.gpt-5.6-sol", "openai.gpt-5.4", "gpt-5.4-mini"]
+        vec!["openai.gpt-6.1-sol", "openai.gpt-5.5", "gpt-5.4-mini"]
     );
     Ok(())
 }
@@ -275,7 +288,18 @@ async fn thread_start_bedrock_runtime_prefers_global_cross_region_models() -> Re
         .build_initialized()
         .await?;
 
-    for model in ["global.openai.gpt-5.6-sol", "us.openai.gpt-5.6-sol"] {
+    for model in [
+        "global.openai.gpt-6.1-sol",
+        "us.openai.gpt-6.1-sol",
+        "global.openai.gpt-6.1-terra",
+        "us.openai.gpt-6.1-terra",
+        "global.openai.gpt-6-sol",
+        "us.openai.gpt-6-sol",
+        "global.openai.gpt-6-luna",
+        "us.openai.gpt-6-luna",
+        "global.openai.gpt-5.6-sol",
+        "us.openai.gpt-5.6-sol",
+    ] {
         let response =
             start_thread_with_model(&mut mcp, model, /*allow_provider_model_fallback*/ true)
                 .await?;
@@ -288,7 +312,7 @@ async fn thread_start_bedrock_runtime_prefers_global_cross_region_models() -> Re
         /*allow_provider_model_fallback*/ true,
     )
     .await?;
-    assert_eq!(response.model, "global.openai.gpt-5.6-sol");
+    assert_eq!(response.model, "global.openai.gpt-6.1-sol");
 
     Ok(())
 }
@@ -320,7 +344,12 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
     let dex_home = TempDir::new()?;
-    create_config_toml_without_approval_policy(dex_home.path(), &server.uri())?;
+    create_config_toml(
+        dex_home.path(),
+        &server.uri(),
+        "sandbox_mode = \"read-only\"\nmodel_reasoning_effort = \"high\"",
+        "",
+    )?;
 
     // Start server and initialize.
     let mut mcp = TestAppServer::builder()
@@ -333,6 +362,7 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
         .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.2".to_string()),
             thread_source: Some(ThreadSource::User),
+            service_name: Some("dex_work_desktop".to_string()),
             ..Default::default()
         })
         .await?;
@@ -359,6 +389,10 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
         "new threads should start with an empty preview"
     );
     assert_eq!(model_provider, "mock_provider");
+    assert_eq!(
+        (thread.model.as_deref(), thread.reasoning_effort.clone()),
+        (Some("gpt-5.2"), Some(ReasoningEffort::High))
+    );
     assert!(
         thread.created_at > 0,
         "created_at should be a positive UNIX timestamp"
@@ -369,6 +403,7 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     );
     assert_eq!(thread.status, ThreadStatus::Idle);
     assert_eq!(thread.thread_source, Some(ThreadSource::User));
+    assert_eq!(thread.originator.as_deref(), Some("dex_work_desktop"));
     let thread_path = thread.path.clone().expect("thread path should be present");
     assert!(thread_path.is_absolute(), "thread path should be absolute");
     assert!(
@@ -403,8 +438,8 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     );
     assert_eq!(
         thread_json.get("historyMode").and_then(Value::as_str),
-        Some("legacy"),
-        "new threads should serialize `historyMode: legacy`"
+        Some("paginated"),
+        "durable threads should default to `historyMode: paginated` when supported"
     );
     assert_eq!(
         thread_json.get("threadSource").and_then(Value::as_str),
@@ -916,30 +951,6 @@ fn normalize_path_for_comparison(path: impl AsRef<Path>) -> PathBuf {
 }
 
 #[tokio::test]
-async fn thread_start_tracks_thread_initialized_analytics() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
-
-    let dex_home = TempDir::new()?;
-    create_config_toml_with_chatgpt_base_url(dex_home.path(), &server.uri(), &server.uri())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_dex_home(dex_home.path())
-        .without_managed_config()
-        .build_initialized()
-        .await?;
-
-    let ThreadStartResponse { thread: _, .. } = mcp
-        .start_thread(ThreadStartParams {
-            thread_source: Some(ThreadSource::User),
-            service_name: Some("dex_work_desktop".to_string()),
-            ..Default::default()
-        })
-        .await?;
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn thread_start_respects_project_config_from_cwd() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
@@ -1079,6 +1090,7 @@ async fn thread_start_ephemeral_remains_pathless() -> Result<()> {
         thread.ephemeral,
         "ephemeral threads should be marked explicitly"
     );
+    assert_eq!(thread.history_mode, ThreadHistoryMode::Paginated);
     assert_eq!(
         thread.path, None,
         "ephemeral threads should not expose a path"
@@ -1386,8 +1398,12 @@ async fn thread_start_does_not_wait_for_optional_http_mcp_auth_discovery() -> Re
     Ok(())
 }
 
+#[test_case("thread/start"; "thread_start")]
+#[test_case("model/list"; "model_list")]
 #[tokio::test]
-async fn thread_start_surfaces_cloud_config_bundle_load_errors() -> Result<()> {
+async fn config_requests_surface_cloud_config_bundle_load_errors(
+    request_method: &str,
+) -> Result<()> {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/backend-api/wham/config/bundle"))
@@ -1438,9 +1454,13 @@ async fn thread_start_surfaces_cloud_config_bundle_load_errors() -> Result<()> {
         .build_initialized()
         .await?;
 
-    let req_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
-        .await?;
+    let req_id = if request_method == "thread/start" {
+        mcp.send_thread_start_request_with_auto_env(ThreadStartParams::default())
+            .await?
+    } else {
+        mcp.send_raw_request(request_method, Some(json!({})))
+            .await?
+    };
 
     let err: JSONRPCError = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -1594,6 +1614,7 @@ required = true
         .request(|request_id| ClientRequest::McpServerStatusList {
             request_id,
             params: ListMcpServerStatusParams {
+                server_name: None,
                 cursor: None,
                 limit: None,
                 detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
@@ -1664,6 +1685,50 @@ async fn thread_start_with_nested_git_cwd_respects_effective_permissions_for_pro
 }
 
 #[tokio::test]
+async fn thread_start_projectless_does_not_preapprove_later_project_config() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let dex_home = TempDir::new()?;
+    create_config_toml_without_approval_policy(dex_home.path(), &server.uri())?;
+    let workspace = TempDir::new()?;
+    let config_path = dex_home.path().join("config.toml");
+    let config_before = std::fs::read_to_string(&config_path)?;
+    let mut mcp = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .build_initialized()
+        .await?;
+
+    let response = mcp
+        .start_thread(ThreadStartParams {
+            cwd: Some(workspace.path().display().to_string()),
+            sandbox: Some(SandboxMode::DangerFullAccess),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(
+        response.sandbox,
+        dex_app_server_protocol::SandboxPolicy::DangerFullAccess
+    );
+    assert_eq!(std::fs::read_to_string(&config_path)?, config_before);
+
+    let project_config_dir = workspace.path().join(".dex");
+    std::fs::create_dir(&project_config_dir)?;
+    std::fs::write(
+        project_config_dir.join("config.toml"),
+        "model_reasoning_effort = \"high\"\n",
+    )?;
+    let response = mcp
+        .start_thread(ThreadStartParams {
+            cwd: Some(workspace.path().display().to_string()),
+            sandbox: Some(SandboxMode::ReadOnly),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(response.reasoning_effort, None);
+    assert_eq!(std::fs::read_to_string(&config_path)?, config_before);
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_start_with_read_only_sandbox_does_not_persist_project_trust() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
@@ -1671,6 +1736,7 @@ async fn thread_start_with_read_only_sandbox_does_not_persist_project_trust() ->
     create_config_toml_without_approval_policy(dex_home.path(), &server.uri())?;
 
     let workspace = TempDir::new()?;
+    std::fs::create_dir(workspace.path().join(".dex"))?;
 
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
@@ -1698,6 +1764,7 @@ async fn thread_start_preserves_untrusted_project_trust() -> Result<()> {
     create_config_toml_without_approval_policy(dex_home.path(), &server.uri())?;
 
     let workspace = TempDir::new()?;
+    std::fs::create_dir(workspace.path().join(".dex"))?;
     let config_path = dex_home.path().join("config.toml");
     let workspace_key = workspace.path().display().to_string();
     let mut config_toml =

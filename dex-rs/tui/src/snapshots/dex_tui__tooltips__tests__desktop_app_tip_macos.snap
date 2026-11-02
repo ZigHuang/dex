@@ -1,0 +1,7 @@
+---
+source: tui/src/tooltips.rs
+expression: rendered
+---
+Line::from_iter([Span::from("Tip:").fg(Color::Reset).bold(), Span::from(" Use the "), Span::from("desktop app").fg(Color::Reset).bold(), Span::from(". Run "), Span::from("dex app").fg(Color::Rgb(166, 227, 161)), Span::from(" to")]) []
+Line::from("open it. It installs automatically if") []
+Line::from("needed.") []

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use dex_extension_api::ContentItemKind;
 use dex_extension_api::ContextContributor;
 use dex_extension_api::ExtensionData;
 use dex_extension_api::ExtensionRegistryBuilder;
@@ -28,6 +29,7 @@ impl ContextContributor for StyleContributor {
 
             vec![PromptFragment::developer_policy(
                 "Prefer short answers unless the user asks for detail.",
+                ContentItemKind("example.style_instructions".to_string()),
             )]
         })
     }
@@ -48,6 +50,7 @@ impl ContextContributor for UsageContributor {
 
             vec![PromptFragment::developer_capability(
                 "This extension can contribute more than one prompt fragment.",
+                ContentItemKind("example.usage_instructions".to_string()),
             )]
         })
     }

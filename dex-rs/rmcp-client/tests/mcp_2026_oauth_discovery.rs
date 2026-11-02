@@ -7,6 +7,7 @@ use dex_config::types::AuthKeyringBackendKind;
 use dex_config::types::OAuthCredentialsStoreMode;
 use dex_exec_server::Environment;
 use dex_exec_server::HttpClient;
+use dex_rmcp_client::McpOAuthCallbackMode;
 use dex_rmcp_client::McpOAuthClientRegistration;
 use dex_rmcp_client::OAuthDiscoveryTimeout;
 use dex_rmcp_client::StreamableHttpOAuthDiscovery;
@@ -192,6 +193,7 @@ async fn assert_legacy_oauth_without_starting_an_mcp_session(
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "resource": resource_url,
             "authorization_servers": [authorization_server.uri()],
+            "scopes_supported": ["mcp:read"],
         })))
         .expect(2)
         .mount(&resource_server)
@@ -200,7 +202,6 @@ async fn assert_legacy_oauth_without_starting_an_mcp_session(
     let mut metadata = json!({
         "authorization_endpoint": format!("{}/authorize", authorization_server.uri()),
         "token_endpoint": format!("{}/token", authorization_server.uri()),
-        "scopes_supported": ["mcp:read"],
         "code_challenge_methods_supported": ["S256"],
     });
     match metadata_issuer {
@@ -230,6 +231,7 @@ async fn assert_legacy_oauth_without_starting_an_mcp_session(
                     discovery?,
                     Some(StreamableHttpOAuthDiscovery {
                         scopes_supported: Some(vec!["mcp:read".to_string()]),
+                        callback_mode: McpOAuthCallbackMode::CallbackSpecific,
                     }),
                 );
             }
@@ -641,6 +643,10 @@ async fn interactive_oauth_rejects_untrusted_authorization_metadata() -> anyhow:
             .await;
 
         for oauth_client_id in [None, Some("preregistered-client")] {
+            let oauth_config = oauth_client_id.map(|client_id| dex_config::McpServerOAuthConfig {
+                client_id: Some(client_id.to_string()),
+                ..Default::default()
+            });
             let error = perform_oauth_login_return_url(
                 "untrusted-oauth-metadata",
                 &resource_url,
@@ -649,12 +655,13 @@ async fn interactive_oauth_rejects_untrusted_authorization_metadata() -> anyhow:
                 /*http_headers*/ None,
                 /*env_http_headers*/ None,
                 /*scopes*/ &[],
-                oauth_client_id,
+                oauth_config.as_ref(),
                 McpOAuthClientRegistration::Dcr,
                 /*oauth_resource*/ None,
                 Some(/*timeout_secs*/ 5),
                 /*callback_port*/ None,
                 /*callback_url*/ None,
+                /*global_callback_url*/ None,
                 local_http_client(),
                 StreamableHttpRedirectMode::Legacy,
             )

@@ -228,6 +228,16 @@ async fn consume_account_rate_limit_reset_credit_surfaces_backend_failure() -> R
 #[tokio::test]
 async fn consume_timeout_releases_account_auth_queue() -> Result<()> {
     let (dex_home, server) = chatgpt_test_context().await?;
+    Mock::given(method("GET"))
+        .and(path("/api/dex/accounts/check"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"accounts": [{
+                "id": "account-123", "workspace_backend_origin": "https://chatgpt.com",
+                "account_routing_override": "NO_CONSTRAINT"
+            }]})),
+        )
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/api/dex/rate-limit-reset-credits/consume"))
         .respond_with(

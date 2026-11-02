@@ -6,7 +6,10 @@ use dex_protocol::protocol::EventMsg;
 pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
     match msg {
         EventMsg::TurnStarted(_) => Some(AgentStatus::Running),
-        EventMsg::TurnComplete(ev) => Some(AgentStatus::Completed(ev.last_agent_message.clone())),
+        EventMsg::TurnComplete(ev) => Some(match &ev.error {
+            Some(error) => AgentStatus::Errored(error.message.clone()),
+            None => AgentStatus::Completed(ev.last_agent_message.clone()),
+        }),
         EventMsg::TurnAborted(ev) => match ev.reason {
             dex_protocol::protocol::TurnAbortReason::Interrupted
             | dex_protocol::protocol::TurnAbortReason::BudgetLimited => {

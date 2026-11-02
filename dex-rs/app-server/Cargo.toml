@@ -25,6 +25,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+dex-utils-process = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 axum = { workspace = true, default-features = false, features = [
@@ -34,12 +35,13 @@ axum = { workspace = true, default-features = false, features = [
     "ws",
 ] }
 dex-analytics = { workspace = true }
-dex-agent-extension = { workspace = true }
+dex-app-server-daemon = { workspace = true }
 dex-arg0 = { workspace = true }
 dex-aws-auth = { workspace = true }
 dex-cloud-config = { workspace = true }
 dex-code-mode = { workspace = true }
 dex-config = { workspace = true }
+dex-network-proxy = { workspace = true }
 dex-connectors = { workspace = true }
 dex-core = { workspace = true }
 dex-core-plugins = { workspace = true }
@@ -49,6 +51,7 @@ dex-exec-server = { workspace = true }
 dex-extension-api = { workspace = true }
 dex-external-agent-migration = { workspace = true }
 dex-features = { workspace = true }
+dex-multi-env-copy-file = { workspace = true }
 dex-goal-extension = { workspace = true }
 dex-git-attribution = { workspace = true }
 dex-guardian-v2 = { workspace = true }
@@ -63,6 +66,7 @@ dex-shell-command = { workspace = true }
 dex-skills = { workspace = true }
 dex-skills-extension = { workspace = true }
 dex-utils-cli = { workspace = true }
+dex-user-verification = { workspace = true }
 dex-utils-pty = { workspace = true }
 dex-backend-client = { workspace = true }
 dex-file-search = { workspace = true }
@@ -71,11 +75,14 @@ dex-login = { workspace = true }
 dex-image-generation-extension = { workspace = true }
 dex-memories-extension = { workspace = true }
 dex-web-search-extension = { workspace = true }
+dex-websocket-auth = { workspace = true }
 dex-memories-write = { workspace = true }
 dex-mcp = { workspace = true }
 dex-mcp-extension = { workspace = true }
 dex-model-provider = { workspace = true }
+dex-model-provider-info = { workspace = true }
 dex-models-manager = { workspace = true }
+dex-prompts = { workspace = true }
 dex-protocol = { workspace = true }
 dex-queue-extension = { workspace = true }
 dex-app-server-protocol = { workspace = true }
@@ -114,10 +121,18 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"
 url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v7"] }
 
+[target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 dex-windows-sandbox = { workspace = true }
 
 [dev-dependencies]
+zip = { workspace = true }
+dex-uds = { workspace = true }
 app_test_support = { workspace = true }
 axum = { workspace = true, default-features = false, features = [
     "http1",
@@ -125,15 +140,17 @@ axum = { workspace = true, default-features = false, features = [
     "tokio",
 ] }
 base64 = { workspace = true }
-dex-model-provider-info = { workspace = true }
 dex-utils-cargo-bin = { workspace = true }
 core_test_support = { workspace = true }
 flate2 = { workspace = true }
 hmac = { workspace = true }
 http = { workspace = true }
+insta = { workspace = true }
+keyring = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 pretty_assertions = { workspace = true }
+rcgen = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [
     "elicitation",
     "server",
@@ -141,8 +158,10 @@ rmcp = { workspace = true, default-features = false, features = [
 ] }
 serial_test = { workspace = true }
 shlex = { workspace = true }
+sqlx = { workspace = true }
 tar = { workspace = true }
 test-case = "3.3.1"
+tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 wiremock = { workspace = true }

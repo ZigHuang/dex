@@ -1,4 +1,5 @@
-use dex_cloud_config::cloud_config_bundle_loader_for_storage;
+use dex_app_server::in_process::EmbeddedNetworkPolicy;
+use dex_cloud_config::chatgpt_config_bundle_loader_for_storage;
 use dex_config::CloudConfigBundleLoader;
 use dex_config::ConfigLoadOptions;
 use dex_core::config::bootstrap_auth_config;
@@ -15,7 +16,7 @@ pub(super) async fn bootstrap_cloud_config_bundle(
     resolve_dex_home: impl FnOnce() -> std::io::Result<AbsolutePathBuf>,
     strict_config: bool,
 ) -> anyhow::Result<CloudConfigBundleLoader> {
-    if options.permissions_profile.is_none()
+    if options.sandbox_state.sandbox_state_json.is_some()
         || !matches!(
             options.managed_requirements_mode,
             ManagedRequirementsMode::Include
@@ -29,6 +30,7 @@ pub(super) async fn bootstrap_cloud_config_bundle(
         Some(cwd) => AbsolutePathBuf::relative_to_current_dir(cwd)?,
         None => AbsolutePathBuf::current_dir()?,
     };
+    let network_policy = EmbeddedNetworkPolicy::load(&options.loader_overrides).await;
     let bootstrap_config = load_config_toml_with_layer_stack(
         dex_home.as_path(),
         Some(&cwd),
@@ -40,8 +42,11 @@ pub(super) async fn bootstrap_cloud_config_bundle(
         },
     )
     .await?;
-    Ok(cloud_config_bundle_loader_for_storage(
-        bootstrap_auth_config(dex_home.as_path(), &bootstrap_config)?,
+    Ok(chatgpt_config_bundle_loader_for_storage(
+        network_policy.bind_bootstrap_auth(bootstrap_auth_config(
+            dex_home.as_path(),
+            &bootstrap_config,
+        )?),
         /*enable_dex_api_key_env*/ false,
     )
     .await?)

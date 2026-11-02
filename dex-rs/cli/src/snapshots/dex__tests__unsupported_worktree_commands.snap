@@ -1,0 +1,13 @@
+---
+source: cli/src/main.rs
+assertion_line: 3324
+expression: "errors.join(\"\\n\")"
+---
+dex --worktree login: `--worktree` supports new interactive sessions, `dex fork`, `dex exec`, and `dex exec fork`
+dex fork --worktree: `dex fork --worktree` requires an explicit session ID
+dex fork --worktree --last: `dex fork --worktree` requires an explicit session ID
+dex exec resume --worktree session: `--worktree` cannot resume an existing session; use `dex exec fork --worktree`
+dex exec review --worktree: `--worktree` is not supported for code review
+dex resume --worktree session: `--worktree` supports new interactive sessions, `dex fork`, `dex exec`, and `dex exec fork`
+dex archive session --worktree: `--worktree` supports new interactive sessions, `dex fork`, `dex exec`, and `dex exec fork`
+dex queue --thread session --message hi --worktree: `--worktree` supports new interactive sessions, `dex fork`, `dex exec`, and `dex exec fork`

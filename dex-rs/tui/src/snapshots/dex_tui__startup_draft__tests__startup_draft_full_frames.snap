@@ -3,12 +3,19 @@ source: tui/src/startup_draft_tests.rs
 expression: "snapshots.join(\"\\n---\\n\")"
 ---
 empty (48 columns):
-╭───────────────────────────────────────╮
-│ >_ Dex (v<VERSION>)                       │
-│                                       │
-│ model:     loading   /model to change │
-│ directory: loading                    │
-╰───────────────────────────────────────╯
+
+  >_ Dex (v<VERSION>)
+     loading
+
+
+› Ask Dex to do anything
+
+  ? for shortcuts
+---
+configured (48 columns):
+
+  >_ Dex (v<VERSION>)
+     workspace
 
 
 › Ask Dex to do anything
@@ -16,12 +23,9 @@ empty (48 columns):
   ? for shortcuts
 ---
 resuming (48 columns):
-╭───────────────────────────────────────╮
-│ >_ Dex (v<VERSION>)                       │
-│                                       │
-│ model:     loading   /model to change │
-│ directory: loading                    │
-╰───────────────────────────────────────╯
+
+  >_ Dex (v<VERSION>)
+     loading
   Resuming session…
 
 › Ask Dex to do anything
@@ -29,12 +33,9 @@ resuming (48 columns):
   ? for shortcuts
 ---
 forking (48 columns):
-╭───────────────────────────────────────╮
-│ >_ Dex (v<VERSION>)                       │
-│                                       │
-│ model:     loading   /model to change │
-│ directory: loading                    │
-╰───────────────────────────────────────╯
+
+  >_ Dex (v<VERSION>)
+     loading
   Forking session…
 
 › draft while loading
@@ -42,12 +43,9 @@ forking (48 columns):
 
 ---
 multiline (48 columns):
-╭───────────────────────────────────────╮
-│ >_ Dex (v<VERSION>)                       │
-│                                       │
-│ model:     loading   /model to change │
-│ directory: loading                    │
-╰───────────────────────────────────────╯
+
+  >_ Dex (v<VERSION>)
+     loading
 
 
 › first startup line
@@ -56,12 +54,9 @@ multiline (48 columns):
 
 ---
 narrow (18 columns):
-╭────────────────╮
-│ >_ Dex (v0.0.… │
-│                │
-│ model:     lo… │
-│ directory: …ng │
-╰────────────────╯
+
+  >_ Dex (v0.166.…
+     loading
 
 
 › first startup

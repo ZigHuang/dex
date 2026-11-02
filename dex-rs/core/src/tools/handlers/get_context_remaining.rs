@@ -6,10 +6,11 @@ use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::get_context_remaining_spec::GET_CONTEXT_REMAINING_TOOL_NAME;
-use crate::tools::handlers::get_context_remaining_spec::create_get_context_remaining_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use dex_protocol::models::ContentItem;
 use dex_protocol::models::ResponseInputItem;
+use dex_protocol::openai_models::ToolMessage;
 use dex_tools::ToolName;
 use dex_tools::ToolSpec;
 use serde_json::Value as JsonValue;
@@ -25,7 +26,7 @@ impl GetContextRemainingOutput {
         Self { tokens_left }
     }
 
-    fn fragment(&self) -> String {
+    fn fragment(&self) -> ContentItem {
         match self.tokens_left {
             Some(tokens_left) => {
                 crate::context::TokenBudgetRemainingContext::new(tokens_left).render()
@@ -37,7 +38,7 @@ impl GetContextRemainingOutput {
 
 impl ToolOutput for GetContextRemainingOutput {
     fn log_output(&self) -> String {
-        self.fragment()
+        self.fragment().into_text().unwrap_or_default()
     }
 
     fn success_for_logging(&self) -> bool {
@@ -45,7 +46,7 @@ impl ToolOutput for GetContextRemainingOutput {
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
-        FunctionToolOutput::from_text(self.fragment(), Some(true))
+        FunctionToolOutput::from_content(vec![self.fragment().into()], Some(true))
             .to_response_item(call_id, payload)
     }
 
@@ -56,18 +57,35 @@ impl ToolOutput for GetContextRemainingOutput {
     }
 }
 
-pub struct GetContextRemainingHandler;
+pub struct GetContextRemainingHandler {
+    spec: ToolSpec,
+}
+
+impl GetContextRemainingHandler {
+    pub(crate) fn new(messages: Option<&ToolMessage>) -> Self {
+        Self {
+            spec: super::get_context_remaining_spec::create_get_context_remaining_tool(messages),
+        }
+    }
+}
 
 impl ToolExecutor<ToolInvocation> for GetContextRemainingHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(GET_CONTEXT_REMAINING_TOOL_NAME)
     }
 
-    fn spec(&self) -> ToolSpec {
-        create_get_context_remaining_tool()
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> dex_tools::ToolExecutorFuture<'_> {
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> dex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             if !matches!(invocation.payload, ToolPayload::Function { .. }) {
                 return Err(FunctionCallError::RespondToModel(

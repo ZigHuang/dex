@@ -1,3 +1,4 @@
+use crate::session::turn_context::TurnContext;
 use dex_analytics::CompactionImplementation;
 use dex_analytics::CompactionReason;
 use dex_otel::SessionTelemetry;
@@ -5,18 +6,30 @@ use dex_protocol::error::DexErr;
 use dex_protocol::error::DexErrorDetails;
 use tracing::warn;
 
-/// Retries failures that may be model-specific and succeed with a different model.
-pub(crate) fn should_retry_with_current_model(error: &DexErr) -> bool {
-    matches!(
+/// Returns whether a failed compaction attempt should use the current model.
+pub(crate) fn should_retry_with_current_model(
+    error: &DexErr,
+    previous: &TurnContext,
+    current: &TurnContext,
+) -> bool {
+    if matches!(
         error.details(),
-        DexErrorDetails::InvalidRequest(_)
-            | DexErrorDetails::UnexpectedStatus(_)
-            | DexErrorDetails::ContextWindowExceeded
-            | DexErrorDetails::UsageLimitReached(_)
-            | DexErrorDetails::ServerOverloaded
-            | DexErrorDetails::InternalServerError
-            | DexErrorDetails::RetryLimit(_)
-    )
+        DexErrorDetails::TurnAborted
+            | DexErrorDetails::Interrupted
+            | DexErrorDetails::SessionBudgetExceeded
+            | DexErrorDetails::ResponseIncomplete(_)
+    ) || (previous.model_info().slug == current.model_info().slug
+        && previous.cyber_access_program == current.cyber_access_program)
+    {
+        return false;
+    }
+
+    current.provider.info().is_openai()
+        && current
+            .auth_manager
+            .as_deref()
+            .and_then(dex_login::AuthManager::auth_cached)
+            .is_some_and(|auth| auth.uses_dex_backend() || auth.is_api_key_auth())
 }
 
 pub(crate) fn record_model_fallback(
@@ -36,7 +49,6 @@ pub(crate) fn record_model_fallback(
     let implementation_tag = match implementation {
         CompactionImplementation::Responses => "responses",
         CompactionImplementation::ResponsesCompactionV2 => "responses_compaction_v2",
-        CompactionImplementation::ResponsesCompact => "responses_compact",
     };
     let outcome = if fallback_error.is_none() {
         "succeeded"

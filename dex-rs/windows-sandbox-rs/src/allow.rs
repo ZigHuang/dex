@@ -317,13 +317,15 @@ mod tests {
     }
 
     #[test]
-    fn denies_dex_and_agents_inside_writable_root() {
+    fn denies_dex_agents_and_aws_inside_writable_root() {
         let tmp = TempDir::new().expect("tempdir");
         let command_cwd = tmp.path().join("workspace");
         let dex_dir = command_cwd.join(".dex");
         let agents_dir = command_cwd.join(".agents");
+        let aws_dir = command_cwd.join(".aws");
         let _ = fs::create_dir_all(&dex_dir);
         let _ = fs::create_dir_all(&agents_dir);
+        let _ = fs::create_dir_all(&aws_dir);
 
         let permission_profile = workspace_write_profile(
             &[],
@@ -344,6 +346,7 @@ mod tests {
         let expected_deny: HashSet<PathBuf> = [
             dunce::canonicalize(&dex_dir).unwrap(),
             dunce::canonicalize(&agents_dir).unwrap(),
+            dunce::canonicalize(&aws_dir).unwrap(),
         ]
         .into_iter()
         .collect();

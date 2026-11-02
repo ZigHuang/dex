@@ -1,3 +1,16 @@
+use crate::events::AppServerRpcTransport;
+use crate::events::DexRuntimeMetadata;
+use crate::events::GuardianReviewEventParams;
+use crate::guardian_v2::GuardianV2Event;
+use dex_app_server_protocol::ClientRequest;
+use dex_app_server_protocol::ClientResponsePayload;
+use dex_app_server_protocol::InitializeParams;
+use dex_app_server_protocol::JSONRPCErrorError;
+use dex_app_server_protocol::RequestId;
+use dex_app_server_protocol::ServerNotification;
+use dex_app_server_protocol::ServerRequest;
+use dex_app_server_protocol::ServerResponse;
+use dex_plugin::PluginTelemetryMetadata;
 use dex_protocol::config_types::ApprovalsReviewer;
 use dex_protocol::config_types::ModeKind;
 use dex_protocol::config_types::Personality;
@@ -5,6 +18,7 @@ use dex_protocol::config_types::ReasoningSummary;
 use dex_protocol::config_types::ServiceTier;
 use dex_protocol::error::DexErr;
 pub use dex_protocol::error::DexErrKind;
+use dex_protocol::error::DexErrorDetails;
 use dex_protocol::models::PermissionProfile;
 use dex_protocol::openai_models::ReasoningEffort;
 use dex_protocol::protocol::AskForApproval;
@@ -16,10 +30,14 @@ use dex_protocol::protocol::HookSource;
 use dex_protocol::protocol::SessionSource;
 use dex_protocol::protocol::SkillScope;
 use dex_protocol::protocol::SubAgentSource;
+use dex_protocol::protocol::ThreadSource;
 use dex_protocol::protocol::TokenUsage;
+use dex_protocol::request_permissions::RequestPermissionsResponse;
+use dex_utils_path_uri::PathUri;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct TrackEventsContext {
@@ -27,6 +45,7 @@ pub struct TrackEventsContext {
     pub thread_id: String,
     pub turn_id: String,
     pub product_client_id: String,
+    pub turn_metadata: Option<Arc<dyn TurnAnalyticsMetadata>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -50,7 +69,7 @@ pub struct ArtifactOperation {
     pub execution_backend: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum CodeModeToolCallFact {
     CellStarted {
         thread_id: String,
@@ -78,6 +97,7 @@ pub enum CodeModeToolCallFact {
     Completed {
         thread_id: String,
         turn_id: String,
+        turn_metadata: Arc<dyn TurnAnalyticsMetadata>,
         call_id: String,
         cell_id: Option<String>,
         tool_name: String,
@@ -94,10 +114,11 @@ pub enum CodeModeToolCallStatus {
     Interrupted,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ControlToolCallFact {
     pub thread_id: String,
     pub turn_id: String,
+    pub turn_metadata: Arc<dyn TurnAnalyticsMetadata>,
     pub call_id: String,
     pub cell_id: Option<String>,
     pub tool_name: String,
@@ -119,12 +140,14 @@ pub fn build_track_events_context(
     thread_id: String,
     turn_id: String,
     product_client_id: String,
+    turn_metadata: Option<Arc<dyn TurnAnalyticsMetadata>>,
 ) -> TrackEventsContext {
     TrackEventsContext {
         model_slug,
         thread_id,
         turn_id,
         product_client_id,
+        turn_metadata,
     }
 }
 
@@ -168,6 +191,9 @@ pub enum TurnSubmissionType {
 pub struct TurnResolvedConfigFact {
     pub turn_id: String,
     pub thread_id: String,
+    pub turn_metadata: Arc<dyn TurnAnalyticsMetadata>,
+    /// Observed active plugin inventory. None is unknown; Some([]) is observed empty.
+    pub active_plugin_ids_at_turn_start: Option<Vec<String>>,
     pub num_input_images: usize,
     pub submission_type: Option<TurnSubmissionType>,
     pub ephemeral: bool,
@@ -181,11 +207,26 @@ pub struct TurnResolvedConfigFact {
     pub service_tier: Option<ServiceTier>,
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
+    pub guardian_v2_enabled: bool,
+    pub multi_agent_version: dex_protocol::protocol::MultiAgentVersion,
     pub sandbox_network_access: bool,
     pub collaboration_mode: ModeKind,
     pub personality: Option<Personality>,
     pub workspace_kind: Option<String>,
     pub is_first_turn: bool,
+}
+
+/// A live, read-only view of a turn's analytics metadata.
+///
+/// Implementations must return `None` for unknown or ambiguous roots. The reducer
+/// reads this when constructing each event because steering can invalidate a root
+/// after the turn's configuration has been resolved.
+pub trait TurnAnalyticsMetadata: Send + Sync {
+    fn root_turn_id(&self) -> Option<String>;
+    /// The caller-provided trigger recorded when this turn started.
+    fn turn_trigger(&self) -> Option<String>;
+    /// The effective Responses source at event emission, including accepted steers.
+    fn dex_turn_source(&self) -> Option<String>;
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -205,6 +246,7 @@ pub struct TurnTokenUsageFact {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct TurnProfile {
+    pub critical_path: crate::TurnCriticalPath,
     pub before_first_sampling_ms: u64,
     pub sampling_ms: u64,
     pub compaction_ms: u64,
@@ -213,6 +255,7 @@ pub struct TurnProfile {
     pub after_last_sampling_ms: u64,
     pub sampling_request_count: u32,
     pub sampling_retry_count: u32,
+    pub tools_change_count: u32,
 }
 
 #[derive(Clone)]
@@ -222,11 +265,39 @@ pub struct TurnProfileFact {
 }
 
 #[derive(Clone)]
-pub struct TurnDexErrorFact;
+pub struct TurnDexErrorFact {
+    pub(crate) turn_id: String,
+    pub(crate) thread_id: String,
+    pub(crate) error: TurnDexError,
+}
 
 impl TurnDexErrorFact {
-    pub fn from_dex_err(_thread_id: String, _turn_id: String, _error: &DexErr) -> Self {
-        Self
+    pub fn from_dex_err(thread_id: String, turn_id: String, error: &DexErr) -> Self {
+        Self {
+            turn_id,
+            thread_id,
+            error: TurnDexError::from_dex_err(error),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TurnDexError {
+    pub(crate) kind: DexErrKind,
+    pub(crate) http_status_code: Option<u16>,
+    pub(crate) usage_limit_window_minutes: Option<u16>,
+}
+
+impl TurnDexError {
+    fn from_dex_err(error: &DexErr) -> Self {
+        Self {
+            kind: error.into(),
+            http_status_code: error.http_status_code_value(),
+            usage_limit_window_minutes: match error.details() {
+                DexErrorDetails::UsageLimitReached(error) => error.limit_window_minutes,
+                _ => None,
+            },
+        }
     }
 }
 
@@ -318,7 +389,7 @@ pub struct SkillInvocation {
 #[derive(Clone, Debug)]
 pub enum SkillInvocationLocation {
     Host {
-        path: PathBuf,
+        path: PathUri,
         scope: SkillScope,
     },
     Resource {
@@ -335,10 +406,31 @@ pub enum InvocationType {
     Implicit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElicitationType {
+    /// Authentication or account linking blocked the original attempt, as reported
+    /// by trusted connector auth-failure metadata. Both are treated the same when
+    /// identifying elicitation-only usage. This does not imply that an
+    /// authentication prompt was shown or completed.
+    AuthOrLink,
+    Approval,
+}
+
 pub struct AppInvocation {
     pub connector_id: Option<String>,
     pub app_name: Option<String>,
     pub invocation_type: Option<InvocationType>,
+}
+
+/// A known classification, queued before the corresponding item completion.
+/// Ordinary calls do not send this fact; their emitted classification stays null.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpToolCallElicitation {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub elicitation_type: ElicitationType,
 }
 
 #[derive(Clone)]
@@ -348,11 +440,13 @@ pub struct SubAgentThreadStartedInput {
     pub parent_thread_id: Option<String>,
     pub forked_from_thread_id: Option<String>,
     pub product_client_id: String,
-    pub client_name: String,
-    pub client_version: String,
+    pub client_name: Option<String>,
+    pub client_version: Option<String>,
     pub model: String,
     pub ephemeral: bool,
+    pub thread_source: Option<ThreadSource>,
     pub subagent_source: SubAgentSource,
+    pub initialization_mode: ThreadInitializationMode,
     pub created_at: u64,
 }
 
@@ -377,7 +471,6 @@ pub enum CompactionReason {
 pub enum CompactionImplementation {
     Responses,
     ResponsesCompactionV2,
-    ResponsesCompact,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -386,6 +479,7 @@ pub enum CompactionPhase {
     StandaloneTurn,
     PreTurn,
     MidTurn,
+    PostTurn,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -415,6 +509,7 @@ pub struct DexCompactionEvent {
     pub status: CompactionStatus,
     pub dex_error_kind: Option<DexErrKind>,
     pub dex_error_http_status_code: Option<u16>,
+    pub usage_limit_window_minutes: Option<u16>,
     pub active_context_tokens_before: i64,
     pub active_context_tokens_after: i64,
     pub retained_image_count: Option<usize>,
@@ -447,6 +542,111 @@ pub struct DexGoalEvent {
     pub cumulative_time_accounted_seconds: Option<i64>,
 }
 
+#[allow(dead_code)]
+pub(crate) enum AnalyticsFact {
+    Initialize {
+        connection_id: u64,
+        params: InitializeParams,
+        product_client_id: String,
+        runtime: DexRuntimeMetadata,
+        rpc_transport: AppServerRpcTransport,
+    },
+    ClientRequest {
+        connection_id: u64,
+        request_id: RequestId,
+        request: Box<ClientRequest>,
+    },
+    ExplicitClientInterruptRequest {
+        connection_id: u64,
+        request_id: RequestId,
+        turn_id: String,
+        requested_at_ms: u64,
+    },
+    ClientResponse {
+        connection_id: u64,
+        request_id: RequestId,
+        response: Box<ClientResponsePayload>,
+        thread_originator: Option<String>,
+    },
+    ErrorResponse {
+        connection_id: u64,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+        error_type: Option<AnalyticsJsonRpcError>,
+    },
+    ServerRequest {
+        connection_id: u64,
+        request: Box<ServerRequest>,
+    },
+    ServerResponse {
+        completed_at_ms: u64,
+        response: Box<ServerResponse>,
+    },
+    EffectivePermissionsApprovalResponse {
+        completed_at_ms: u64,
+        request_id: RequestId,
+        response: Box<RequestPermissionsResponse>,
+    },
+    ServerRequestAborted {
+        completed_at_ms: u64,
+        request_id: RequestId,
+    },
+    RealtimeHandoffRequested {
+        thread_id: String,
+    },
+    RealtimeSessionStarted {
+        thread_id: String,
+        realtime_session_id: Option<String>,
+        started_at: u64,
+    },
+    RealtimeSessionUpdated {
+        thread_id: String,
+        realtime_session_id: String,
+    },
+    RealtimeSessionClosed {
+        thread_id: String,
+        closed_at: u64,
+    },
+    Notification(Box<ServerNotification>),
+    // Facts that do not naturally exist on the app-server protocol surface, or
+    // would require non-trivial protocol reshaping on this branch.
+    Custom(CustomAnalyticsFact),
+}
+
+pub(crate) enum CustomAnalyticsFact {
+    ArtifactOperation(ArtifactOperationInput),
+    CodeModeToolCall(CodeModeToolCallFact),
+    ControlToolCall(ControlToolCallFact),
+    SubAgentThreadStarted(SubAgentThreadStartedInput),
+    Compaction(Box<DexCompactionEvent>),
+    Goal(Box<DexGoalEvent>),
+    ThreadHintStatus(Box<crate::thread_hint::ThreadHintStatusEvent>),
+    GuardianReview(Box<GuardianReviewEventParams>),
+    GuardianV2(Box<GuardianV2Event>),
+    TurnResolvedConfig(Box<TurnResolvedConfigFact>),
+    TurnTokenUsage(Box<TurnTokenUsageFact>),
+    TurnProfile(Box<TurnProfileFact>),
+    TurnDexError(Box<TurnDexErrorFact>),
+    ImagePreparation(Box<ImagePreparationFact>),
+    SkillInvoked(SkillInvokedInput),
+    AppMentioned(AppMentionedInput),
+    AppUsed(AppUsedInput),
+    McpToolCallElicitation(McpToolCallElicitation),
+    HookRun(HookRunInput),
+    PluginUsed(PluginUsedInput),
+    PluginInstallRequested(PluginInstallRequestedInput),
+    PluginStateChanged(PluginStateChangedInput),
+    PluginInstallFailed(PluginInstallFailedInput),
+    PluginMeasurements(PluginMeasurementsInput),
+    ExternalAgentConfigImportCompleted(ExternalAgentConfigImportCompletedInput),
+    ExternalAgentConfigImportFailure(ExternalAgentConfigImportFailureInput),
+}
+
+pub(crate) struct ArtifactOperationInput {
+    pub tracking: TrackEventsContext,
+    pub operation: ArtifactOperation,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PluginMeasurementRow {
     pub measurement_name: String,
@@ -459,10 +659,34 @@ pub struct PluginMeasurementsInput {
     pub thread_id: String,
     pub turn_id: String,
     pub item_id: String,
+    pub originator: String,
+    pub model_slug: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub plugin_id: String,
     pub execution_id: String,
     pub operation: String,
     pub rows: Vec<PluginMeasurementRow>,
+}
+
+pub(crate) struct SkillInvokedInput {
+    pub tracking: TrackEventsContext,
+    pub invocations: Vec<SkillInvocation>,
+}
+
+pub(crate) struct AppMentionedInput {
+    pub tracking: TrackEventsContext,
+    pub mentions: Vec<AppInvocation>,
+}
+
+pub(crate) struct AppUsedInput {
+    pub tracking: TrackEventsContext,
+    pub app: AppInvocation,
+    pub elicitation_type: Option<ElicitationType>,
+}
+
+pub(crate) struct HookRunInput {
+    pub tracking: TrackEventsContext,
+    pub hook: HookRunFact,
 }
 
 pub struct HookRunFact {
@@ -471,6 +695,11 @@ pub struct HookRunFact {
     pub handler_type: HookHandlerType,
     pub execution_mode: HookExecutionMode,
     pub status: HookRunStatus,
+}
+
+pub(crate) struct PluginUsedInput {
+    pub tracking: TrackEventsContext,
+    pub plugin: PluginTelemetryMetadata,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -495,11 +724,28 @@ pub struct PluginInstallRequestedPlugin {
     pub connector_ids: Vec<String>,
 }
 
+pub(crate) struct PluginInstallRequestedInput {
+    pub tracking: TrackEventsContext,
+    pub request: PluginInstallRequested,
+}
+
+pub(crate) struct PluginStateChangedInput {
+    pub plugin: PluginTelemetryMetadata,
+    pub state: PluginState,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginInstallSource {
     Manual,
     ExternalAgentMigration,
+}
+
+pub(crate) struct PluginInstallFailedInput {
+    pub plugin: PluginTelemetryMetadata,
+    pub source: PluginInstallSource,
+    pub error_type: String,
+    pub sub_error_type: Option<String>,
 }
 
 pub struct ExternalAgentConfigImportCompletedInput {
@@ -519,4 +765,12 @@ pub struct ExternalAgentConfigImportFailureInput {
     pub failure_stage: String,
     pub error_type: String,
     pub sub_error_type: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum PluginState {
+    Installed,
+    Uninstalled,
+    Enabled,
+    Disabled,
 }

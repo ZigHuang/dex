@@ -3,6 +3,7 @@ use std::path::Path;
 pub async fn clear_memory_roots_contents(dex_home: &Path) -> std::io::Result<()> {
     for memory_root in [
         dex_home.join("memories"),
+        dex_home.join("memories_v2"),
         dex_home.join("memories_extensions"),
     ] {
         clear_memory_root_contents(memory_root.as_path()).await?;
@@ -23,7 +24,7 @@ pub(crate) async fn clear_memory_root_contents(memory_root: &Path) -> std::io::R
             ));
         }
         Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
     }
 

@@ -4,6 +4,7 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
 use core_test_support::skip_if_no_network;
+use core_test_support::submit_thread_settings;
 use core_test_support::test_dex::test_dex;
 use core_test_support::wait_for_event;
 use dex_core::ForkSnapshot;
@@ -13,19 +14,53 @@ use dex_core::parse_turn_item;
 use dex_history::InitialHistory;
 use dex_history::ResumedHistory;
 use dex_history::RolloutItem;
-use dex_history::RolloutLine;
+use dex_protocol::ThreadId;
 use dex_protocol::items::TurnItem;
 use dex_protocol::mcp::ClientMcpExtensions;
 use dex_protocol::protocol::EventMsg;
 use dex_protocol::protocol::ThreadHistoryMode;
 use dex_protocol::protocol::ThreadSettingsAppliedEvent;
+use dex_protocol::protocol::ThreadSettingsOverrides;
 use dex_protocol::protocol::ThreadSettingsSnapshot;
 use dex_protocol::user_input::UserInput;
+use dex_thread_store::InMemoryThreadStore;
+use pretty_assertions::assert_eq;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ephemeral_fork_skips_stored_title_lookup() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = MockServer::start().await;
+    let store = Arc::new(InMemoryThreadStore::default());
+    let test = test_dex()
+        .with_thread_store(store.clone())
+        .build_with_auto_env(&server)
+        .await?;
+    let mut config = test.config.clone();
+    config.ephemeral = true;
+    let reads_before = store.calls().await.read_thread;
+
+    test.thread_manager
+        .fork_thread_from_history(
+            ForkSnapshot::Interrupted,
+            dex_core::StartThreadOptions::new(config),
+            InitialHistory::Resumed(ResumedHistory {
+                history_revision: None,
+                conversation_id: test.session_configured.thread_id,
+                history: Arc::new(Vec::new()),
+                rollout_path: None,
+            }),
+        )
+        .await?;
+
+    assert_eq!(store.calls().await.read_thread, reads_before);
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fork_thread_twice_drops_to_first_message() {
@@ -94,20 +129,21 @@ async fn fork_thread_twice_drops_to_first_message() {
 
     // Fork once with n=1 → drops the last user input and everything after.
     let NewThread {
-        thread: dex_fork1, ..
+        thread_id: fork1_thread_id,
+        thread: dex_fork1,
+        ..
     } = thread_manager
-        .fork_thread(
+        .fork_legacy_thread(
             ForkSnapshot::TruncateBeforeNthUserMessage(1),
-            config_for_fork.clone(),
+            dex_core::StartThreadOptions::new(config_for_fork.clone()),
             base_path.clone(),
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
         )
         .await
         .expect("fork 1");
 
     let fork1_path = dex_fork1.rollout_path().expect("rollout path");
     expected_after_first.push(thread_settings_applied_item(
+        fork1_thread_id,
         dex_fork1.thread_settings_snapshot().await,
     ));
 
@@ -120,14 +156,14 @@ async fn fork_thread_twice_drops_to_first_message() {
 
     // Fork again with n=0 → drops the (new) last user message, leaving only the first.
     let NewThread {
-        thread: dex_fork2, ..
+        thread_id: fork2_thread_id,
+        thread: dex_fork2,
+        ..
     } = thread_manager
-        .fork_thread(
+        .fork_legacy_thread(
             ForkSnapshot::TruncateBeforeNthUserMessage(0),
-            config_for_fork.clone(),
+            dex_core::StartThreadOptions::new(config_for_fork.clone()),
             fork1_path.clone(),
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
         )
         .await
         .expect("fork 2");
@@ -142,6 +178,7 @@ async fn fork_thread_twice_drops_to_first_message() {
         .unwrap_or(0);
     let mut expected_after_second: Vec<RolloutItem> = fork1_items[..cut_last_on_fork1].to_vec();
     expected_after_second.push(thread_settings_applied_item(
+        fork2_thread_id,
         dex_fork2.thread_settings_snapshot().await,
     ));
     let fork2_items = read_rollout_items(&fork2_path);
@@ -151,12 +188,90 @@ async fn fork_thread_twice_drops_to_first_message() {
     );
 }
 
-fn thread_settings_applied_item(snapshot: ThreadSettingsSnapshot) -> RolloutItem {
+fn thread_settings_applied_item(
+    thread_id: ThreadId,
+    snapshot: ThreadSettingsSnapshot,
+) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
         ThreadSettingsAppliedEvent {
+            thread_id: Some(thread_id),
             thread_settings: snapshot,
         },
     ))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_thread_restores_history_selection_and_preserves_explicit_clear() -> anyhow::Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    let server = MockServer::start().await;
+    let mut builder = test_dex();
+    let test = builder.build_with_auto_env(&server).await?;
+    let selected = vec!["slack@openai".to_string()];
+    submit_thread_settings(
+        &test.dex,
+        ThreadSettingsOverrides {
+            disabled_plugin_ids: Some(selected.clone()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let history = InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
+        conversation_id: test.session_configured.thread_id,
+        history: Arc::new(vec![thread_settings_applied_item(
+            test.session_configured.thread_id,
+            test.dex.thread_settings_snapshot().await,
+        )]),
+        rollout_path: None,
+    });
+    submit_thread_settings(
+        &test.dex,
+        ThreadSettingsOverrides {
+            disabled_plugin_ids: Some(Vec::new()),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let inherited = test
+        .thread_manager
+        .fork_thread_from_history(
+            ForkSnapshot::Interrupted,
+            dex_core::StartThreadOptions::new(test.config.clone()),
+            history.clone(),
+        )
+        .await?;
+    pretty_assertions::assert_eq!(
+        inherited
+            .thread
+            .thread_settings_snapshot()
+            .await
+            .disabled_plugin_ids,
+        selected
+    );
+
+    let explicit = test
+        .thread_manager
+        .fork_thread_from_history(
+            ForkSnapshot::Interrupted,
+            dex_core::StartThreadOptions {
+                disabled_plugin_ids: Some(Vec::new()),
+                ..dex_core::StartThreadOptions::new(test.config.clone())
+            },
+            history,
+        )
+        .await?;
+    pretty_assertions::assert_eq!(
+        explicit
+            .thread
+            .thread_settings_snapshot()
+            .await
+            .disabled_plugin_ids,
+        Vec::<String>::new()
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -207,7 +322,7 @@ async fn assert_copied_fork_persists_inherited_history(history_mode: ThreadHisto
     let source_meta = dex_rollout::read_session_meta_line(source_path.as_path())
         .await
         .expect("read source session metadata");
-    let mut supplied_history = vec![RolloutItem::SessionMeta(source_meta)];
+    let mut supplied_history = vec![RolloutItem::SessionMeta(Box::new(source_meta))];
     supplied_history.extend(source_items.iter().cloned());
     let NewThread {
         thread: forked_thread,
@@ -215,16 +330,13 @@ async fn assert_copied_fork_persists_inherited_history(history_mode: ThreadHisto
     } = thread_manager
         .fork_thread_from_history(
             ForkSnapshot::Interrupted,
-            test.config.clone(),
+            dex_core::StartThreadOptions::new(test.config.clone()),
             InitialHistory::Resumed(ResumedHistory {
+                history_revision: None,
                 conversation_id: test.session_configured.thread_id,
                 history: Arc::new(supplied_history),
                 rollout_path: None,
             }),
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
-            ClientMcpExtensions::default(),
-            /*reserved_thread_id*/ None,
         )
         .await
         .expect("fork from stored history");
@@ -298,7 +410,7 @@ fn read_rollout_items(path: &std::path::Path) -> Vec<RolloutItem> {
         let parse_json_message = format!("failed to parse rollout JSON line `{line}`");
         let v: serde_json::Value = serde_json::from_str(line).expect(&parse_json_message);
         let parse_line_message = format!("failed to parse rollout line `{line}`");
-        let rl: RolloutLine = serde_json::from_value(v).expect(&parse_line_message);
+        let rl = dex_rollout::decode_rollout_line(v).expect(&parse_line_message);
         match rl.item {
             RolloutItem::SessionMeta(_) => {}
             other => items.push(other),

@@ -1,0 +1,6 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "config-schema",
+    crate_name = "dex_config_schema",
+)

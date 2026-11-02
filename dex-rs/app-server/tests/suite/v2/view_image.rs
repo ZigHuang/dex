@@ -9,7 +9,7 @@ use app_test_support::write_models_cache;
 use core_test_support::responses;
 use dex_app_server_protocol::ClientRequest;
 use dex_app_server_protocol::ItemCompletedNotification;
-use dex_app_server_protocol::ThreadItem;
+use dex_app_server_protocol::ThreadItemPayload;
 use dex_app_server_protocol::ThreadResumeParams;
 use dex_app_server_protocol::ThreadResumeResponse;
 use dex_app_server_protocol::ThreadStartParams;
@@ -41,7 +41,7 @@ async fn fresh_context_subagent_inherits_disabled_view_image_and_mcp_tools() -> 
     const MCP_CALL_ID: &str = "call-child-mcp-with-disabled-view-image";
 
     let responses_server = responses::start_mock_server().await;
-    let (mcp_server_url, mcp_server_handle) = start_mcp_server().await?;
+    let (mcp_server_url, mcp_server_handle) = start_mcp_server(/*sensitive_action*/ None).await?;
     let dex_home = TempDir::new()?;
     MockResponsesConfig::new(&responses_server.uri())
         .with_model("gpt-5.4")
@@ -50,7 +50,7 @@ async fn fresh_context_subagent_inherits_disabled_view_image_and_mcp_tools() -> 
             "[mcp_servers.{TEST_SERVER_NAME}]\nurl = \"{mcp_server_url}/mcp\"\n\n[features.multi_agent_v2]\nenabled = true"
         ))
         .write(dex_home.path())?;
-    write_models_cache(dex_home.path())?;
+    write_models_cache(dex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
@@ -143,7 +143,8 @@ async fn fresh_context_subagent_inherits_disabled_view_image_and_mcp_tools() -> 
             mcp.read_notification("item/completed"),
         )
         .await??;
-        if matches!(&completed.item, ThreadItem::McpToolCall { id, .. } if id == MCP_CALL_ID) {
+        if matches!(&completed.item.payload, ThreadItemPayload::McpToolCall { id, .. } if id == MCP_CALL_ID)
+        {
             assert_ne!(completed.thread_id, thread.id);
             break completed.thread_id;
         }

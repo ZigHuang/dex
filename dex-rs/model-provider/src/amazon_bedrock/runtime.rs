@@ -1,5 +1,5 @@
 use dex_aws_auth::AwsAuthConfig;
-use dex_login::auth::BedrockApiKeyAuth;
+use dex_login::DexAuth;
 use dex_model_provider_info::ModelProviderAwsAuthInfo;
 use dex_protocol::error::Result;
 
@@ -24,10 +24,18 @@ pub(super) fn base_url(region: &str) -> String {
 
 pub(super) async fn bedrock_runtime_base_url(
     source: BedrockAuthSource,
-    managed_auth: Option<&BedrockApiKeyAuth>,
+    managed_auth: Option<&DexAuth>,
     aws: &ModelProviderAwsAuthInfo,
+    http_client_factory: &dex_http_client::HttpClientFactory,
 ) -> Result<String> {
-    let region = resolve_region(source, managed_auth, aws, BedrockEndpoint::Runtime).await?;
+    let region = resolve_region(
+        source,
+        managed_auth,
+        aws,
+        BedrockEndpoint::Runtime,
+        http_client_factory,
+    )
+    .await?;
     Ok(base_url(&region))
 }
 

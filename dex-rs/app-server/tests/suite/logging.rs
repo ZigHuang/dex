@@ -4,33 +4,49 @@ use app_test_support::ChatGptIdTokenClaims;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::app_server_json_shutdown_event;
+use app_test_support::create_escalated_command_execution_sse_response;
 use app_test_support::create_exec_command_sse_response;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::encode_id_token;
 use app_test_support::write_models_cache;
+use core_test_support::load_default_config_for_test;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_wine_exec;
+use dex_app_server_protocol::ApprovalsReviewer;
+use dex_app_server_protocol::AskForApproval;
 use dex_app_server_protocol::ClientInfo;
 use dex_app_server_protocol::ClientRequest;
+use dex_app_server_protocol::ConfigValueWriteParams;
+use dex_app_server_protocol::ConfigWriteResponse;
 use dex_app_server_protocol::InitializeCapabilities;
 use dex_app_server_protocol::JSONRPCMessage;
 use dex_app_server_protocol::LoginAccountResponse;
+use dex_app_server_protocol::MergeStrategy;
 use dex_app_server_protocol::RequestId;
+use dex_app_server_protocol::SandboxPolicy;
 use dex_app_server_protocol::ServerRequest;
+use dex_app_server_protocol::ThreadApproveGuardianDeniedActionParams;
+use dex_app_server_protocol::ThreadApproveGuardianDeniedActionResponse;
 use dex_app_server_protocol::ThreadStartParams;
 use dex_app_server_protocol::TurnStartParams;
 use dex_app_server_protocol::TurnStartResponse;
 use dex_app_server_protocol::UserInput;
 use dex_features::Feature;
 use dex_state::LogQuery;
-use dex_state::SqliteConfig;
 use dex_state::StateRuntime;
-use dex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::BTreeMap;
 use tempfile::TempDir;
+use test_case::test_case;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::timeout;
 use wiremock::Mock;
@@ -40,6 +56,155 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[tokio::test]
+async fn submission_metadata_reaches_persisted_and_feedback_logs() -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "command approval routing requires a host-native cwd under Wine-exec"
+    );
+    skip_if_no_network!(Ok(()));
+
+    let server = create_mock_responses_server_sequence(vec![
+        create_escalated_command_execution_sse_response(
+            vec!["echo".into(), "hello".into()],
+            /*workdir*/ None,
+            /*timeout_ms*/ Some(5000),
+            "call-approval",
+        )?,
+        create_final_assistant_message_sse_response("done")?,
+    ])
+    .await;
+    let dex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_approval_policy("on-request")
+        .with_provider_config("supports_websockets = false")
+        .write(dex_home.path())?;
+    let mut app_server = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        // SQLite and feedback diagnostics must remain safe independently of stderr.
+        .with_env_overrides(&[("RUST_LOG", Some("off"))])
+        .build()
+        .await?;
+    app_server.initialize().await?;
+    let thread = app_server
+        .start_thread(ThreadStartParams::default())
+        .await?
+        .thread;
+    let _: ThreadApproveGuardianDeniedActionResponse = app_server
+        .request(
+            |request_id| ClientRequest::ThreadApproveGuardianDeniedAction {
+                request_id,
+                params: ThreadApproveGuardianDeniedActionParams {
+                    thread_id: thread.id.clone(),
+                    event: json!({
+                        "id": "guardian-review",
+                        "target_item_id": "guardian-item",
+                        "turn_id": "guardian-turn",
+                        "status": "denied",
+                        "action": {
+                            "type": "mcp_tool_call",
+                            "server": "example",
+                            "tool_name": "write",
+                        },
+                    }),
+                },
+            },
+        )
+        .await?;
+    let _: TurnStartResponse = app_server
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![UserInput::Text {
+                    text: "run echo".into(),
+                    text_elements: Vec::new(),
+                }],
+                approval_policy: Some(AskForApproval::OnRequest),
+                approvals_reviewer: Some(ApprovalsReviewer::User),
+                sandbox_policy: Some(SandboxPolicy::ReadOnly {
+                    network_access: false,
+                }),
+                ..Default::default()
+            },
+        })
+        .await?;
+    let server_request =
+        timeout(READ_TIMEOUT, app_server.read_stream_until_request_message()).await??;
+    let ServerRequest::CommandExecutionRequestApproval { request_id, params } = server_request
+    else {
+        anyhow::bail!("expected command approval request");
+    };
+    let approval_id = params.approval_id.unwrap_or(params.item_id);
+    app_server
+        .send_response(request_id, json!({ "decision": "decline" }))
+        .await?;
+    timeout(
+        READ_TIMEOUT,
+        app_server.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let state = StateRuntime::init(
+        load_default_config_for_test(&dex_home).await.sqlite,
+        "mock_provider".into(),
+    )
+    .await?;
+    // Feedback is read from SQLite, so this also verifies persistence.
+    let feedback = timeout(Duration::from_secs(/*secs*/ 60), async {
+        loop {
+            let logs =
+                String::from_utf8(state.query_feedback_logs_for_threads(&[&thread.id]).await?)?;
+            if logs
+                .lines()
+                .any(|line| line.contains("Submission") && line.contains("exec_approval"))
+            {
+                break Ok::<_, anyhow::Error>(logs);
+            }
+            tokio::time::sleep(Duration::from_millis(/*millis*/ 50)).await;
+        }
+    })
+    .await??;
+    state.close().await;
+    for (operation, fields) in [
+        (
+            "exec_approval",
+            vec![
+                format!("thread_id={}", thread.id),
+                format!("id: \"{approval_id}\""),
+                format!("turn_id: Some(\"{}\")", params.turn_id),
+                "decision: denied".into(),
+            ],
+        ),
+        (
+            "approve_guardian_denied_action",
+            vec![
+                "review_id: \"guardian-review\"".into(),
+                "target_item_id: Some(\"guardian-item\")".into(),
+                "turn_id: \"guardian-turn\"".into(),
+                "status: Denied".into(),
+            ],
+        ),
+        (
+            "turn_input",
+            vec![
+                "approval_policy: Some(OnRequest)".into(),
+                "approvals_reviewer: Some(User)".into(),
+                "sandbox_policy: Some(read-only)".into(),
+            ],
+        ),
+    ] {
+        let line = feedback
+            .lines()
+            .find(|line| line.contains("Submission") && line.contains(operation))
+            .with_context(|| format!("missing {operation} submission"))?;
+        for field in fields {
+            anyhow::ensure!(line.contains(&field), "missing {field}: {line}");
+        }
+    }
+    Ok(())
+}
 
 #[tokio::test]
 async fn credentials_stay_out_of_persisted_and_feedback_logs() -> Result<()> {
@@ -52,11 +217,13 @@ async fn credentials_stay_out_of_persisted_and_feedback_logs() -> Result<()> {
     let initial_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
             .email("initial@example.com")
+            .chatgpt_user_id("logging-user")
             .chatgpt_account_id(account_id),
     )?;
     let refreshed_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
             .email("refreshed@example.com")
+            .chatgpt_user_id("logging-user")
             .chatgpt_account_id(account_id),
     )?;
     let server = MockServer::start().await;
@@ -90,7 +257,7 @@ supports_websockets = false
 "#
         ))
         .write(dex_home.path())?;
-    write_models_cache(dex_home.path())?;
+    write_models_cache(dex_home.path()).await?;
     let mut app_server = TestAppServer::builder()
         .with_dex_home(dex_home.path())
         .with_env_overrides(&[("OPENAI_API_KEY", None)])
@@ -125,6 +292,16 @@ supports_websockets = false
 
     let mut thread_ids = Vec::new();
     for provider in ["bearer_provider", "mock_provider"] {
+        let config_id = app_server
+            .send_config_value_write_request(ConfigValueWriteParams {
+                file_path: None,
+                key_path: "model_provider".into(),
+                value: json!(provider),
+                merge_strategy: MergeStrategy::Replace,
+                expected_version: None,
+            })
+            .await?;
+        let _: ConfigWriteResponse = app_server.read_response(config_id).await?;
         let thread = app_server
             .start_thread(ThreadStartParams {
                 model_provider: Some(provider.into()),
@@ -203,7 +380,7 @@ supports_websockets = false
         .send_response(RequestId::String(barrier.into()), json!({}))
         .await?;
     let state = StateRuntime::init(
-        SqliteConfig::new_for_testing(dex_home.path().abs()),
+        load_default_config_for_test(&dex_home).await.sqlite,
         "mock_provider".into(),
     )
     .await?;
@@ -264,6 +441,307 @@ fn standalone_app_server_emits_json_info_events() -> Result<()> {
 }
 
 #[tokio::test]
+async fn sqlite_log_metrics_exports_do_not_create_log_cycles() -> Result<()> {
+    let quiet_period = dex_state::log_db::LogSinkQueueConfig::default().flush_interval
+        + Duration::from_millis(600);
+    let export_timeout = quiet_period * 3;
+
+    for status in [200, 500] {
+        let collector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/metrics"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&collector)
+            .await;
+
+        let dex_home = TempDir::new()?;
+        let endpoint = format!("{}/v1/metrics", collector.uri());
+        std::fs::write(
+            dex_home.path().join("config.toml"),
+            format!(
+                "[analytics]\nenabled = true\n\n[otel.metrics_exporter.otlp-http]\nendpoint = {endpoint:?}\nprotocol = \"json\"\n"
+            ),
+        )?;
+
+        let _app_server = TestAppServer::builder()
+            .with_dex_home(dex_home.path())
+            .with_env_overrides(&[
+                ("OTEL_METRIC_EXPORT_INTERVAL", Some("200")),
+                (
+                    dex_app_server_transport::REMOTE_CONTROL_DISABLED_ENV_VAR,
+                    Some("1"),
+                ),
+            ])
+            .build_initialized_with_timeout(export_timeout)
+            .await?;
+
+        let exports = timeout(export_timeout, async {
+            loop {
+                let requests = collector.received_requests().await.unwrap_or_default();
+                if requests.iter().any(|request| {
+                    String::from_utf8_lossy(&request.body).contains(dex_state::LOG_WRITE_METRIC)
+                }) {
+                    break requests.len();
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await?;
+
+        let requests = timeout(export_timeout, async {
+            let mut observed_exports = exports;
+            loop {
+                tokio::time::sleep(quiet_period).await;
+                let requests = collector.received_requests().await.unwrap_or_default();
+                if requests.len() == observed_exports {
+                    break requests;
+                }
+                observed_exports = requests.len();
+            }
+        })
+        .await
+        .with_context(|| {
+            format!("OTLP HTTP {status} exports did not stop after the application became idle")
+        })?;
+
+        let expected_metrics = [
+            (dex_state::LOG_WRITE_METRIC, "sum"),
+            (dex_state::LOG_WRITE_DURATION_METRIC, "histogram"),
+            (dex_state::LOG_WRITE_BYTES_METRIC, "histogram"),
+            (dex_state::LOG_WRITE_ENTRIES_METRIC, "histogram"),
+            (dex_state::LOG_WRITE_MAX_ENTRY_BYTES_METRIC, "histogram"),
+        ];
+        let payloads = requests
+            .iter()
+            .map(|request| serde_json::from_slice::<Value>(&request.body))
+            .collect::<serde_json::Result<Vec<_>>>()?;
+        let mut observed_metrics = BTreeMap::<&str, (u64, f64)>::new();
+        for (name, kind) in expected_metrics {
+            let points = payloads
+                .iter()
+                .flat_map(|payload| payload["resourceMetrics"].as_array().into_iter().flatten())
+                .flat_map(|resource| resource["scopeMetrics"].as_array().into_iter().flatten())
+                .flat_map(|scope| scope["metrics"].as_array().into_iter().flatten())
+                .filter(|metric| metric["name"].as_str() == Some(name))
+                .flat_map(|metric| metric[kind]["dataPoints"].as_array().into_iter().flatten())
+                .collect::<Vec<_>>();
+            assert!(
+                !points.is_empty(),
+                "metric {name} must reach the collector as a {kind}"
+            );
+
+            for point in points {
+                let attributes: BTreeMap<&str, &str> = point["attributes"]
+                    .as_array()
+                    .context("metric data points must include attributes")?
+                    .iter()
+                    .filter_map(|attribute| {
+                        Some((
+                            attribute["key"].as_str()?,
+                            attribute["value"]["stringValue"].as_str()?,
+                        ))
+                    })
+                    .collect();
+                assert_eq!(
+                    attributes,
+                    BTreeMap::from([
+                        ("error", "none"),
+                        ("originator", "dex-app-server"),
+                        ("status", "success"),
+                    ]),
+                    "metric {name} must preserve its production dimensions"
+                );
+
+                let count_field = if kind == "sum" { "asInt" } else { "count" };
+                let count = point[count_field]
+                    .as_u64()
+                    .or_else(|| point[count_field].as_str()?.parse().ok())
+                    .with_context(|| format!("metric {name} must include a valid {count_field}"))?;
+                let value = if kind == "sum" {
+                    count as f64
+                } else {
+                    point["sum"]
+                        .as_f64()
+                        .with_context(|| format!("metric {name} must include its sample sum"))?
+                };
+                let observed = observed_metrics.entry(name).or_default();
+                observed.0 += count;
+                observed.1 += value;
+
+                if matches!(
+                    name,
+                    dex_state::LOG_WRITE_BYTES_METRIC | dex_state::LOG_WRITE_MAX_ENTRY_BYTES_METRIC
+                ) {
+                    let bounds = point["explicitBounds"]
+                        .as_array()
+                        .context("byte histograms must export explicit bucket bounds")?;
+                    assert_eq!(bounds.first().and_then(Value::as_f64), Some(128.0));
+                    assert_eq!(bounds.last().and_then(Value::as_f64), Some(16_777_216.0));
+                }
+            }
+        }
+
+        let write_count = observed_metrics[dex_state::LOG_WRITE_METRIC].0;
+        assert!(write_count > 0, "at least one SQLite batch must be written");
+        for (name, _) in expected_metrics {
+            assert_eq!(
+                observed_metrics[name].0, write_count,
+                "metric {name} must record exactly one sample per SQLite write"
+            );
+        }
+
+        let state = dex_state::StateRuntime::init(
+            load_default_config_for_test(&dex_home).await.sqlite,
+            "test-provider".to_string(),
+        )
+        .await?;
+        let persisted_logs = state.query_logs(&dex_state::LogQuery::default()).await?;
+        assert_eq!(
+            observed_metrics[dex_state::LOG_WRITE_ENTRIES_METRIC].1,
+            persisted_logs.len() as f64,
+            "exported batch sizes must equal the number of persisted SQLite log rows"
+        );
+        assert!(
+            observed_metrics[dex_state::LOG_WRITE_BYTES_METRIC].1
+                >= observed_metrics[dex_state::LOG_WRITE_MAX_ENTRY_BYTES_METRIC].1,
+            "each batch's largest entry cannot exceed the total batch size"
+        );
+    }
+
+    Ok(())
+}
+
+/// Exporting SQLite metrics must eventually stop producing new SQLite metrics,
+/// including when the collector uses HTTP/2 or rejects the gRPC request.
+#[test_case("0"; "success")]
+#[test_case("14"; "unavailable")]
+#[tokio::test]
+async fn sqlite_log_metrics_grpc_exports_do_not_create_log_cycles(grpc_status: &str) -> Result<()> {
+    let quiet_period = dex_state::log_db::LogSinkQueueConfig::default().flush_interval
+        + Duration::from_millis(600);
+    let export_timeout = quiet_period * 3;
+    let (export_count, mut exports) = watch::channel(/*init*/ 0_usize);
+    let (ping_ack_count, mut ping_acknowledgements) = watch::channel(/*init*/ 0_usize);
+    let collector = MockServer::builder()
+        .disable_request_recording()
+        .start()
+        .await;
+    // An uncompressed gRPC frame containing an empty ExportMetricsServiceResponse.
+    // Tonic also accepts grpc-status in the initial response headers.
+    let response = ResponseTemplate::new(/*s*/ 200)
+        .set_body_raw(vec![0; 5], "application/grpc")
+        .insert_header("grpc-status", grpc_status);
+    Mock::given(method("POST"))
+        .and(path(
+            "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+        ))
+        .respond_with(move |request: &wiremock::Request| {
+            let metric_name = dex_state::LOG_WRITE_METRIC.as_bytes();
+            if request
+                .body
+                .windows(metric_name.len())
+                .any(|bytes| bytes == metric_name)
+            {
+                export_count.send_modify(|count| *count += 1);
+            }
+            response.clone()
+        })
+        .mount(&collector)
+        .await;
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", proxy.local_addr()?);
+    let collector_address = *collector.address();
+    let _proxy = tokio::spawn(async move {
+        let (downstream, _) = proxy.accept().await?;
+        let upstream = TcpStream::connect(collector_address).await?;
+        let (mut downstream_reader, mut downstream_writer) = downstream.into_split();
+        let (mut upstream_reader, mut upstream_writer) = upstream.into_split();
+
+        let requests = tokio::io::copy(&mut downstream_reader, &mut upstream_writer);
+        let responses = async move {
+            loop {
+                let mut header = [0; 9];
+                if upstream_reader.read_exact(&mut header).await.is_err() {
+                    break;
+                }
+                let length = (usize::from(header[0]) << 16)
+                    | (usize::from(header[1]) << 8)
+                    | usize::from(header[2]);
+                let mut payload = vec![0; length];
+                upstream_reader.read_exact(&mut payload).await?;
+                downstream_writer.write_all(&header).await?;
+                downstream_writer.write_all(&payload).await?;
+
+                if header[3] == 0 {
+                    // A valid but unsolicited HTTP/2 PING ACK makes h2 emit a
+                    // warning from its separate connection-driving task.
+                    downstream_writer
+                        .write_all(&[0, 0, 8, 6, 1, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8])
+                        .await?;
+                    ping_ack_count.send_modify(|count| *count += 1);
+                }
+            }
+            Ok::<(), std::io::Error>(())
+        };
+
+        tokio::try_join!(requests, responses)?;
+        Ok::<(), std::io::Error>(())
+    });
+
+    let dex_home = TempDir::new()?;
+    std::fs::write(
+        dex_home.path().join("config.toml"),
+        format!(
+            "[analytics]\nenabled = true\n\n[otel.metrics_exporter.otlp-grpc]\nendpoint = {endpoint:?}\n"
+        ),
+    )?;
+    let _app_server = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .with_env_overrides(&[
+            ("OTEL_METRIC_EXPORT_INTERVAL", Some("200")),
+            (
+                dex_app_server_transport::REMOTE_CONTROL_DISABLED_ENV_VAR,
+                Some("1"),
+            ),
+        ])
+        .build_initialized_with_timeout(export_timeout)
+        .await?;
+
+    timeout(export_timeout, exports.wait_for(|count| *count > 0))
+        .await
+        .context("collector never received a SQLite log-write metric")??;
+    timeout(
+        export_timeout,
+        ping_acknowledgements.wait_for(|count| *count > 0),
+    )
+    .await
+    .context("collector response never produced an unsolicited HTTP/2 PING acknowledgment")??;
+    let first_count = *exports.borrow_and_update();
+
+    // Allow delayed startup batches, but require silence longer than one SQLite
+    // flush interval plus one metric-export interval. Do not retain request bodies
+    // or keep resetting the overall deadline when a broken exporter feeds itself.
+    let quiescence = timeout(export_timeout, async {
+        loop {
+            match timeout(quiet_period, exports.changed()).await {
+                Err(_) => return Ok::<(), watch::error::RecvError>(()),
+                Ok(result) => result?,
+            }
+        }
+    })
+    .await;
+    let final_count = *exports.borrow();
+    quiescence.with_context(|| {
+        format!(
+            "OTLP gRPC status {grpc_status} did not become idle: SQLite log-write exports increased from {first_count} to {final_count}"
+        )
+    })??;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -313,7 +791,9 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
     )
     .await??;
 
-    let mut tool_call = app_server.wait_for_json_log_event("dex.tool_call").await?;
+    let mut tool_call = app_server
+        .wait_for_json_log_event("dex.tool_call", Duration::from_secs(/*secs*/ 10))
+        .await?;
     let tool_call_object = tool_call
         .as_object_mut()
         .context("tool call log event must be an object")?;

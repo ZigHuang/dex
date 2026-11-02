@@ -1,6 +1,0 @@
-load("//:defs.bzl", "dex_rust_crate")
-
-dex_rust_crate(
-    name = "mcp-server",
-    crate_name = "dex_mcp_server",
-)

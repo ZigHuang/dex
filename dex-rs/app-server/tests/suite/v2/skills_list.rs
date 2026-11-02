@@ -32,13 +32,16 @@ use dex_app_server_protocol::ThreadStartParams;
 use dex_app_server_protocol::ThreadStartResponse;
 use dex_config::types::AuthCredentialsStoreMode;
 use dex_core::config::set_project_trust_level;
+use dex_core_plugins::store::PluginStore;
 use dex_exec_server::CreateDirectoryOptions;
 use dex_exec_server::DEX_EXEC_SERVER_URL_ENV_VAR;
+use dex_plugin::PluginId;
 use dex_protocol::config_types::TrustLevel;
 use dex_utils_absolute_path::AbsolutePathBuf;
 use dex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::time::timeout;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -188,7 +191,7 @@ async fn skills_list_disabled_bundled_skills_preserves_shared_system_skill_cache
     assert!(
         system_skill_paths
             .iter()
-            .all(|path| path.as_path().is_file()),
+            .all(|path| std::path::Path::new(path.as_str()).is_file()),
         "disabled app-server must not remove the cache shared by other processes"
     );
 
@@ -654,10 +657,13 @@ async fn skills_list_loads_remote_installed_plugin_skills_from_cache() -> Result
         .find(|skill| skill.name == "linear:triage-issues")
         .expect("expected skill from cached remote plugin");
     assert_eq!(
-        std::fs::canonicalize(skill.path.as_path())?,
+        std::fs::canonicalize(skill.path.as_str())?,
         expected_skill_path
     );
-    assert_eq!(skill.enabled, true);
+    assert_eq!(
+        (skill.enabled, skill.plugin_id.as_deref()),
+        (true, Some("linear@openai-curated-remote")),
+    );
     Ok(())
 }
 
@@ -705,7 +711,10 @@ async fn config_reads_complete_alongside_skills_list_request() -> Result<()> {
     assert!(config.layers.is_none());
     assert_eq!(
         requirements,
-        ConfigRequirementsReadResponse { requirements: None }
+        ConfigRequirementsReadResponse {
+            supports_independent_speed_modes: Some(true),
+            requirements: None,
+        }
     );
     assert!(!permission_profiles.data.is_empty());
 
@@ -789,8 +798,10 @@ async fn skills_list_accepts_relative_cwds() -> Result<()> {
     Ok(())
 }
 
+#[test_case(false; "plugins disabled by default")]
+#[test_case(true; "plugins enabled by default")]
 #[tokio::test]
-async fn skills_list_preserves_requested_cwd_order() -> Result<()> {
+async fn skills_list_preserves_requested_cwd_order(home_plugins_enabled: bool) -> Result<()> {
     skip_if_wine_exec!(
         Ok(()),
         "skills/list currently requires host-native cwd paths for workspace config"
@@ -798,25 +809,32 @@ async fn skills_list_preserves_requested_cwd_order() -> Result<()> {
     let dex_home = TempDir::new()?;
     let first_cwd = TempDir::new()?;
     let second_cwd = TempDir::new()?;
+    let third_cwd = TempDir::new()?;
     write_skill(&dex_home, "shared-skill")?;
     write_cached_local_curated_plugin_with_skill(dex_home.path(), "openai-api-curated")?;
     std::fs::write(
         dex_home.path().join("config.toml"),
-        r#"[features]
-plugins = true
+        format!(
+            r#"[features]
+plugins = {home_plugins_enabled}
 
 [plugins."google-calendar@openai-api-curated"]
-enabled = true
-"#,
+enabled = false
+"#
+        ),
     )?;
 
-    for (cwd, plugin_enabled) in [(first_cwd.path(), true), (second_cwd.path(), false)] {
+    for (cwd, plugins_enabled, plugin_enabled) in [
+        (first_cwd.path(), true, true),
+        (second_cwd.path(), false, true),
+        (third_cwd.path(), true, false),
+    ] {
         std::fs::create_dir_all(cwd.join(".git"))?;
         std::fs::create_dir_all(cwd.join(".dex"))?;
         std::fs::write(
             cwd.join(".dex/config.toml"),
             format!(
-                "[plugins.\"google-calendar@openai-api-curated\"]\nenabled = {plugin_enabled}\n"
+                "[features]\nplugins = {plugins_enabled}\n[plugins.\"google-calendar@openai-api-curated\"]\nenabled = {plugin_enabled}\n"
             ),
         )?;
         set_project_trust_level(dex_home.path(), cwd, TrustLevel::Trusted)?;
@@ -831,6 +849,7 @@ enabled = true
     for (cwd, name) in [
         (first_cwd.path(), "first-project-skill"),
         (second_cwd.path(), "second-project-skill"),
+        (third_cwd.path(), "third-project-skill"),
     ] {
         let cwd = AbsolutePathBuf::try_from(cwd)?;
         let git_dir = PathUri::from_abs_path(&cwd.join(".git"));
@@ -857,29 +876,30 @@ enabled = true
             .await?;
     }
 
-    for (request_index, force_reload) in [false, false, true].into_iter().enumerate() {
-        if request_index == 1 {
-            write_skill(&dex_home, "new-skill")?;
-        }
-
+    for force_reload in [false, false, true] {
         let request_id = mcp
             .send_skills_list_request(SkillsListParams {
                 cwds: vec![
                     first_cwd.path().to_path_buf(),
                     second_cwd.path().to_path_buf(),
+                    third_cwd.path().to_path_buf(),
                 ],
                 force_reload,
             })
             .await?;
         let SkillsListResponse { data } =
             timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
-        assert_eq!(data.len(), 2);
-        assert_eq!(data[0].cwd, first_cwd.path());
-        assert_eq!(data[1].cwd, second_cwd.path());
-        for (entry, project_skill) in data
-            .iter()
-            .zip(["first-project-skill", "second-project-skill"])
-        {
+        assert_eq!(
+            data.iter()
+                .map(|entry| entry.cwd.as_path())
+                .collect::<Vec<_>>(),
+            vec![first_cwd.path(), second_cwd.path(), third_cwd.path()],
+        );
+        for (entry, (project_skill, plugin_enabled)) in data.iter().zip([
+            ("first-project-skill", true),
+            ("second-project-skill", false),
+            ("third-project-skill", false),
+        ]) {
             assert_eq!(entry.errors, Vec::new());
             assert!(
                 entry
@@ -887,6 +907,10 @@ enabled = true
                     .iter()
                     .any(|skill| skill.name == "shared-skill")
             );
+            let mut expected_skills = vec![project_skill];
+            if plugin_enabled {
+                expected_skills.push("google-calendar:meeting-prep");
+            }
             assert_eq!(
                 entry
                     .skills
@@ -897,15 +921,100 @@ enabled = true
                     })
                     .map(|skill| skill.name.as_str())
                     .collect::<Vec<_>>(),
-                vec![project_skill, "google-calendar:meeting-prep"]
-            );
-            assert_eq!(
-                entry.skills.iter().any(|skill| skill.name == "new-skill"),
-                force_reload
+                expected_skills
             );
         }
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn skills_list_refreshes_externally_updated_plugin_versions() -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "skills/list currently requires host-native cwd paths for workspace config"
+    );
+    let dex_home = TempDir::new()?;
+    let cwd = TempDir::new()?;
+    let source = TempDir::new()?;
+    std::fs::create_dir_all(source.path().join(".dex-plugin"))?;
+    std::fs::create_dir_all(source.path().join("skills"))?;
+    std::fs::write(
+        source.path().join(".dex-plugin/plugin.json"),
+        r#"{"name":"sample"}"#,
+    )?;
+    std::fs::write(
+        dex_home.path().join("config.toml"),
+        r#"[features]
+plugins = true
+
+[plugins."sample@test"]
+enabled = true
+"#,
+    )?;
+    let plugin_id = PluginId::parse("sample@test")?;
+    let store = PluginStore::new(dex_home.path().to_path_buf());
+    let mut mcp = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+    let file_system = mcp.auto_env()?.environment().get_filesystem();
+    file_system
+        .create_directory(
+            &PathUri::from_abs_path(&AbsolutePathBuf::try_from(cwd.path())?).join(".git")?,
+            CreateDirectoryOptions {
+                recursive: true,
+                follow_symlinks: true,
+            },
+            /*sandbox*/ None,
+        )
+        .await?;
+
+    // Mutate the shared store from outside app-server, without its cache invalidation callback.
+    for version in ["1.0.0", "2.0.0", "0.9.0"] {
+        let body = format!("---\nname: search\ndescription: version {version}\n---\n");
+        std::fs::write(source.path().join("skills/SKILL.md"), &body)?;
+        let installed = store.install_with_version(
+            AbsolutePathBuf::try_from(source.path())?,
+            plugin_id.clone(),
+            version.to_string(),
+        )?;
+        let expected_path = AbsolutePathBuf::try_from(std::fs::canonicalize(
+            installed.installed_path.join("skills/SKILL.md"),
+        )?)?;
+        // Exercise both invalidation and the subsequent warm read for the same cwd.
+        for _ in 0..2 {
+            let request_id = mcp
+                .send_skills_list_request(SkillsListParams {
+                    cwds: vec![cwd.path().to_path_buf()],
+                    force_reload: false,
+                })
+                .await?;
+            let SkillsListResponse { data } =
+                timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+            let skills = data[0]
+                .skills
+                .iter()
+                .filter(|skill| skill.name == "sample:search")
+                .map(|skill| {
+                    Ok((
+                        skill.path.clone(),
+                        skill.description.clone(),
+                        std::fs::read_to_string(skill.path.as_str())?,
+                    ))
+                })
+                .collect::<std::io::Result<Vec<_>>>()?;
+            assert_eq!(
+                skills,
+                vec![(
+                    expected_path.clone().into(),
+                    format!("version {version}"),
+                    body.clone()
+                )],
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1285,6 +1394,7 @@ async fn skills_changed_notification_is_emitted_after_skill_change() -> Result<(
             session_start_source: None,
             thread_source: None,
             project_id: None,
+            daybreak_enabled: None,
             dynamic_tools: None,
             environments: None,
             selected_capability_roots: None,

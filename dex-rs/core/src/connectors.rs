@@ -13,7 +13,7 @@ use dex_connectors::ConnectorDirectoryCacheKey;
 use dex_connectors::apps_config_from_layer_stack;
 use dex_connectors::connector_runtime_context_key;
 use dex_exec_server::EnvironmentManager;
-use dex_exec_server::ExecServerRuntimePaths;
+use dex_exec_server::ExecServerRuntimeOptions;
 use dex_tools::DiscoverableTool;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
@@ -37,11 +37,10 @@ use dex_mcp::McpRuntimeContext;
 use dex_mcp::McpRuntimeInput;
 use dex_mcp::McpStartupPolicy;
 use dex_mcp::ToolInfo;
-use dex_mcp::ToolPluginProvenance;
+use dex_mcp::ToolPluginContext;
 use dex_mcp::effective_mcp_servers;
-use dex_mcp::tool_plugin_provenance;
+use dex_mcp::tool_plugin_context;
 use dex_protocol::mcp::ClientMcpExtensions;
-use dex_protocol::models::PermissionProfile;
 
 const CONNECTORS_READY_TIMEOUT_ON_EMPTY_TOOLS: Duration = Duration::from_secs(30);
 
@@ -90,16 +89,13 @@ pub(crate) async fn list_tool_suggest_discoverable_tools_with_auth(
     loaded_plugin_app_connector_ids: &[String],
 ) -> anyhow::Result<Vec<DiscoverableTool>> {
     let connector_ids = tool_suggest_connector_ids(config, loaded_plugin_app_connector_ids);
-    let directory_connectors = dex_connectors::merge::merge_plugin_connectors(
-        cached_directory_connectors_for_tool_suggest_with_auth(config, auth).await,
-        connector_ids.iter().cloned(),
-    );
     let discoverable_connectors =
         dex_connectors::filter::filter_tool_suggest_discoverable_connectors(
-            directory_connectors,
+            cached_directory_connectors_for_tool_suggest_with_auth(config, auth),
             accessible_connectors,
-            &connector_ids,
+            connector_ids,
         )
+        .await
         .into_iter()
         .map(DiscoverableTool::from);
     let discoverable_plugins = list_tool_suggest_discoverable_plugins(
@@ -166,7 +162,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_options_and_status(
     // TODO: Wire callers that already own an EnvironmentManager into
     // list_accessible_connectors_from_mcp_tools_with_environment_manager instead
     // of constructing a temporary manager here.
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+    let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         config.dex_self_exe.clone(),
         config.dex_linux_sandbox_exe.clone(),
     )?;
@@ -224,14 +220,11 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         });
     }
     let cache_key = accessible_connectors_cache_key(config, auth.as_ref());
-    let mut mcp_config = mcp_manager.runtime_config(config).await;
-    // Discovery has no active turn or reviewer and must never inherit execution authority.
-    mcp_config.permission_profile = PermissionProfile::default();
-    let mcp_config = Arc::new(mcp_config);
-    let tool_plugin_provenance = tool_plugin_provenance(&mcp_config);
+    let mcp_config = mcp_manager.runtime_config(config).await;
+    let tool_plugin_context = tool_plugin_context(&mcp_config);
     if !force_refetch && let Some(cached_connectors) = read_cached_accessible_connectors(&cache_key)
     {
-        let cached_connectors = with_app_plugin_sources(cached_connectors, &tool_plugin_provenance);
+        let cached_connectors = with_app_plugin_sources(cached_connectors, &tool_plugin_context);
         return Ok(AccessibleConnectorsStatus {
             connectors: cached_connectors,
             dex_apps_ready: true,
@@ -240,6 +233,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
 
     let mut mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
     mcp_servers.retain(|name, _| name == DEX_APPS_MCP_SERVER_NAME);
+    let mcp_config = Arc::new(mcp_config.for_threadless_operations(&mcp_servers));
     if mcp_servers.is_empty() {
         return Ok(AccessibleConnectorsStatus {
             connectors: Vec::new(),
@@ -254,6 +248,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     let dex_apps_auth_manager = dex_mcp::host_owned_dex_apps_enabled(&mcp_config, auth.as_ref())
         .then(|| Arc::clone(&auth_manager));
     let mcp_runtime = McpRuntime::new(McpRuntimeInput {
+        network_policy_metadata: None,
         startup_policy: McpStartupPolicy::Eager,
         config: Arc::clone(&mcp_config),
         plugins_available: false,
@@ -270,7 +265,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         dex_apps_tools_cache_key: connector_runtime_context_key(auth.as_ref()),
         client_mcp_extensions: ClientMcpExtensions::default(),
         auth: auth.clone(),
-        dex_apps_auth_manager,
+        auth_manager: dex_apps_auth_manager,
         elicitation_reviewer: None,
         elicitation_lifecycle: None,
     })
@@ -333,7 +328,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         write_cached_accessible_connectors(cache_key, &accessible_connectors);
     }
     let accessible_connectors =
-        with_app_plugin_sources(accessible_connectors, &tool_plugin_provenance);
+        with_app_plugin_sources(accessible_connectors, &tool_plugin_context);
     mcp_runtime.shutdown().await;
     Ok(AccessibleConnectorsStatus {
         connectors: accessible_connectors,
@@ -421,9 +416,9 @@ fn tool_suggest_connector_ids(
 async fn cached_directory_connectors_for_tool_suggest_with_auth(
     config: &Config,
     auth: Option<&DexAuth>,
-) -> Vec<AppInfo> {
+) -> Arc<[AppInfo]> {
     if !config.features.enabled(Feature::Apps) {
-        return Vec::new();
+        return Arc::default();
     }
 
     let loaded_auth;
@@ -433,18 +428,18 @@ async fn cached_directory_connectors_for_tool_suggest_with_auth(
         let Ok(auth_manager) =
             AuthManager::shared_from_config(config, /*enable_dex_api_key_env*/ false).await
         else {
-            return Vec::new();
+            return Arc::default();
         };
         loaded_auth = auth_manager.auth().await;
         loaded_auth.as_ref()
     };
     let Some(auth) = auth.filter(|auth| auth.uses_dex_backend()) else {
-        return Vec::new();
+        return Arc::default();
     };
 
     let account_id = match auth.get_account_id() {
         Some(account_id) if !account_id.is_empty() => account_id,
-        _ => return Vec::new(),
+        _ => return Arc::default(),
     };
     let is_workspace_account = auth.is_workspace_account();
     let cache_context = ConnectorDirectoryCacheContext::new(
@@ -500,10 +495,10 @@ fn accessible_connectors_for_app_list_from_mcp_tools(mcp_tools: &[ToolInfo]) -> 
 
 pub fn with_app_plugin_sources(
     mut connectors: Vec<AppInfo>,
-    tool_plugin_provenance: &ToolPluginProvenance,
+    tool_plugin_context: &ToolPluginContext,
 ) -> Vec<AppInfo> {
     for connector in &mut connectors {
-        connector.plugin_display_names = tool_plugin_provenance
+        connector.plugin_display_names = tool_plugin_context
             .plugin_display_names_for_connector_id(connector.id.as_str())
             .to_vec();
     }
@@ -516,6 +511,7 @@ pub(crate) fn mcp_approvals_reviewer_from_layers(
     model: Option<&str>,
     server_name: &str,
     connector_id: Option<&str>,
+    link_id: Option<&str>,
 ) -> ApprovalsReviewer {
     let requirements = config_layer_stack.requirements();
     if model.is_some_and(|model| requirements.auto_review_required_for_model(model)) {
@@ -524,9 +520,11 @@ pub(crate) fn mcp_approvals_reviewer_from_layers(
 
     let app_reviewer = if server_name == DEX_APPS_MCP_SERVER_NAME {
         apps_config_from_layer_stack(config_layer_stack).and_then(|apps_config| {
-            connector_id
-                .and_then(|connector_id| apps_config.apps.get(connector_id))
-                .and_then(|app| app.approvals_reviewer)
+            let app = connector_id.and_then(|connector_id| apps_config.apps.get(connector_id));
+            link_id
+                .and_then(|link_id| app?.links.as_ref()?.links.get(link_id))
+                .and_then(|link| link.approvals_reviewer)
+                .or_else(|| app.and_then(|app| app.approvals_reviewer))
                 .or_else(|| {
                     apps_config
                         .default

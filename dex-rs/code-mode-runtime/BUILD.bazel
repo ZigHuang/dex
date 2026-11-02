@@ -2,5 +2,6 @@ load("//:defs.bzl", "dex_rust_crate")
 
 dex_rust_crate(
     name = "code-mode-runtime",
+    compile_data = ["src/runtime/settled.js"],
     crate_name = "dex_code_mode_runtime",
 )

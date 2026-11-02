@@ -5,6 +5,7 @@ use super::RawPluginManifestPaths;
 use super::UriPluginManifest;
 use super::compatibility_json_error;
 use super::parse_legacy_plugin_manifest_uri;
+use super::resolve_openai_onboarding_skill;
 use super::resolve_raw_plugin_manifest;
 use dex_utils_path_uri::PathUri;
 use dex_utils_plugins::AGENT_PLUGIN_SCHEMA_PREFIX;
@@ -91,7 +92,7 @@ pub(super) fn parse_agent_plugin_manifest_uri(
         .and_then(|extensions| extensions.get(DEX_AGENT_PLUGIN_EXTENSION_NAMESPACE))
         .and_then(|extension| {
             if extension.is_object() {
-                Some(serde_json::to_string(extension))
+                Some(extension)
             } else {
                 tracing::warn!(
                     path = %manifest_path,
@@ -100,8 +101,7 @@ pub(super) fn parse_agent_plugin_manifest_uri(
                 );
                 None
             }
-        })
-        .transpose()?;
+        });
     for field in [
         "version",
         "description",
@@ -125,6 +125,9 @@ pub(super) fn parse_agent_plugin_manifest_uri(
             }
         }
     }
+
+    let onboarding_skill = resolve_openai_onboarding_skill(plugin_root, dex_extension);
+    let dex_extension = dex_extension.map(serde_json::to_string).transpose()?;
 
     let raw = serde_json::from_value::<RawAgentPluginManifest>(JsonValue::Object(object))?;
     if !SUPPORTED_AGENT_PLUGIN_SCHEMA_URIS.contains(&raw.schema.as_str()) {
@@ -178,13 +181,9 @@ pub(super) fn parse_agent_plugin_manifest_uri(
         },
     )?;
 
-    if let Some(extension_contents) = dex_extension.as_deref() {
-        apply_dex_agent_plugin_extension(
-            &mut resolved,
-            plugin_root,
-            manifest_path,
-            extension_contents,
-        )?;
+    if let Some(extension) = dex_extension.as_deref() {
+        apply_dex_agent_plugin_extension(&mut resolved, plugin_root, manifest_path, extension)?;
+        resolved.paths.onboarding_skill = onboarding_skill;
     } else if let Some((overlay_path, overlay_contents)) = overlay {
         apply_dex_agent_plugin_extension(
             &mut resolved,
@@ -210,6 +209,7 @@ fn apply_dex_agent_plugin_extension(
     let extension = parse_legacy_plugin_manifest_uri(plugin_root, source_path, contents)?;
     resolved.paths.apps = extension.paths.apps;
     resolved.paths.hooks = extension.paths.hooks;
+    resolved.paths.onboarding_skill = extension.paths.onboarding_skill;
     if extension.interface.is_some() {
         resolved.interface = extension.interface;
     }

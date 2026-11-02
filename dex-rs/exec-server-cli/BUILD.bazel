@@ -1,0 +1,17 @@
+load("//:defs.bzl", "dex_rust_crate")
+load("//bazel/platforms:release_binaries.bzl", "multiplatform_binaries")
+load("//bazel/rules:runtime_package.bzl", "release_binary")
+
+dex_rust_crate(
+    name = "exec-server-cli",
+    binaries_with_build_commit = ["dex-exec-server"],
+    crate_name = "dex_exec_server_cli",
+    extra_binaries = ["//dex-rs/bwrap:bwrap"],
+    test_data_extra = glob(["src/**/snapshots/**"]),
+    # The standalone integration test launches native OS sandboxes itself.
+    test_tags = ["no-sandbox"],
+)
+
+release_binary(binary = ":dex-exec-server")
+
+multiplatform_binaries(name = "dex-exec-server")

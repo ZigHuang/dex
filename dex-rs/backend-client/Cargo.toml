@@ -24,6 +24,7 @@ dex-http-client = { workspace = true }
 dex-login = { workspace = true }
 dex-model-provider = { workspace = true }
 dex-protocol = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 pretty_assertions = "1"

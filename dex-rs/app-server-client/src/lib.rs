@@ -1,3 +1,7 @@
+// Release builds exceed rustc's default query depth when laying out the async
+// MessageProcessor::handle_initialized_client_request future.
+#![recursion_limit = "256"]
+
 //! Shared in-process app-server client facade for CLI surfaces.
 //!
 //! This crate wraps [`dex_app_server::in_process`] behind a single async API
@@ -16,8 +20,16 @@
 //! runtime remain bounded; the local consumer event queue is unbounded so
 //! unread notifications cannot prevent request responses from being delivered.
 
+mod cloud;
 mod path;
 mod remote;
+mod remote_websocket;
+pub use cloud::CloudClient;
+pub use cloud::CloudCommand;
+pub use cloud::CloudOperation;
+pub use cloud::CloudRequestHandle;
+mod server_request;
+pub use server_request::AppServerReplyHandle;
 
 use std::error::Error;
 use std::fmt;
@@ -29,10 +41,12 @@ use std::time::Duration;
 
 pub use dex_app_server::app_server_control_socket_path;
 pub use dex_app_server::in_process::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
+pub use dex_app_server::in_process::EmbeddedNetworkPolicy;
 pub use dex_app_server::in_process::InProcessServerEvent;
 use dex_app_server::in_process::InProcessStartArgs;
 use dex_app_server::in_process::LogDbLayer;
 pub use dex_app_server::in_process::StateDbHandle;
+pub use dex_app_server::verified_local_daemon_socket;
 use dex_app_server_protocol::ClientInfo;
 use dex_app_server_protocol::ClientNotification;
 use dex_app_server_protocol::ClientRequest;
@@ -51,7 +65,7 @@ use dex_config::NoopThreadConfigLoader;
 use dex_core::config::Config;
 pub use dex_core::otel_init::build_provider as build_otel_provider;
 pub use dex_exec_server::EnvironmentManager;
-pub use dex_exec_server::ExecServerRuntimePaths;
+pub use dex_exec_server::ExecServerRuntimeOptions;
 use dex_feedback::DexFeedback;
 use dex_protocol::protocol::SessionSource;
 use dex_utils_absolute_path::AbsolutePathBuf;
@@ -168,8 +182,33 @@ impl Error for TypedRequestError {
     }
 }
 
+// Await transport in a separate statement before calling this: dropping the
+// completed future must precede any caller-provided Deserialize implementation.
+fn decode_typed_response<T>(
+    method: &str,
+    response: IoResult<RequestResult>,
+) -> Result<T, TypedRequestError>
+where
+    T: DeserializeOwned,
+{
+    let response = response.map_err(|source| TypedRequestError::Transport {
+        method: method.to_string(),
+        source,
+    })?;
+    let result = response.map_err(|source| TypedRequestError::Server {
+        method: method.to_string(),
+        source,
+    })?;
+    serde_json::from_value(result).map_err(|source| TypedRequestError::Deserialize {
+        method: method.to_string(),
+        source,
+    })
+}
+
 #[derive(Clone)]
 pub struct InProcessClientStartArgs {
+    /// This client collects fresh human decisions for managed command checkpoints.
+    pub required_human_approval: bool,
     /// Resolved argv0 dispatch paths used by command execution internals.
     pub arg0_paths: Arg0DispatchPaths,
     /// Shared config used to initialize app-server runtime.
@@ -182,6 +221,8 @@ pub struct InProcessClientStartArgs {
     pub strict_config: bool,
     /// Preloaded cloud config bundle provider.
     pub cloud_config_bundle: CloudConfigBundleLoader,
+    /// Policy shared with transports created by the embedder before startup.
+    pub embedded_network_policy: EmbeddedNetworkPolicy,
     /// Feedback sink used by app-server/core telemetry and logs.
     pub feedback: DexFeedback,
     /// SQLite tracing layer used for local diagnostic logs.
@@ -214,6 +255,8 @@ impl InProcessClientStartArgs {
     /// Builds initialize params from caller-provided metadata.
     pub fn initialize_params(&self) -> InitializeParams {
         let capabilities = InitializeCapabilities {
+            required_human_approval: self.required_human_approval,
+            explicit_gateway_oauth: false,
             experimental_api: self.experimental_api,
             request_attestation: false,
             extensions: None,
@@ -244,6 +287,7 @@ impl InProcessClientStartArgs {
             loader_overrides: self.loader_overrides,
             strict_config: self.strict_config,
             cloud_config_bundle: self.cloud_config_bundle,
+            embedded_network_policy: self.embedded_network_policy,
             thread_config_loader: Arc::new(NoopThreadConfigLoader),
             feedback: self.feedback,
             log_db: self.log_db,
@@ -310,11 +354,13 @@ pub struct InProcessAppServerRequestHandle {
 
 #[derive(Clone)]
 pub enum AppServerRequestHandle {
+    Cloud(CloudRequestHandle),
     InProcess(InProcessAppServerRequestHandle),
     Remote(crate::remote::RemoteAppServerRequestHandle),
 }
 
 pub enum AppServerClient {
+    Cloud(CloudClient),
     InProcess(InProcessAppServerClient),
     Remote(RemoteAppServerClient),
 }
@@ -347,8 +393,20 @@ impl InProcessAppServerClient {
                                 // this loop can keep draining runtime events
                                 // while the request is blocked on client input.
                                 tokio::spawn(async move {
-                                    let result = request_sender.request(*request).await;
-                                    let _ = response_tx.send(result);
+                                    // Device ceremonies belong to the waiting UI. Preserve
+                                    // its cancellation through this buffering task.
+                                    let cancellable = matches!(*request,
+                                        ClientRequest::UserVerificationStatus { .. }
+                                        | ClientRequest::UserVerificationEnroll { .. }
+                                        | ClientRequest::UserVerificationDelete { .. }
+                                        | ClientRequest::UserVerificationVerify { .. });
+                                    let mut response_tx = response_tx;
+                                    tokio::select! {
+                                        _ = response_tx.closed(), if cancellable => {}
+                                        result = request_sender.request(*request) => {
+                                            let _ = response_tx.send(result);
+                                        }
+                                    }
                                 });
                             }
                             Some(ClientCommand::Notify {
@@ -468,21 +526,8 @@ impl InProcessAppServerClient {
         T: DeserializeOwned,
     {
         let method = request.method_name();
-        let response =
-            self.request(request)
-                .await
-                .map_err(|source| TypedRequestError::Transport {
-                    method: method.to_string(),
-                    source,
-                })?;
-        let result = response.map_err(|source| TypedRequestError::Server {
-            method: method.to_string(),
-            source,
-        })?;
-        serde_json::from_value(result).map_err(|source| TypedRequestError::Deserialize {
-            method: method.to_string(),
-            source,
-        })
+        let response = self.request(request).await;
+        decode_typed_response(method, response)
     }
 
     /// Sends a typed client notification.
@@ -517,26 +562,9 @@ impl InProcessAppServerClient {
         request_id: RequestId,
         result: JsonRpcResult,
     ) -> IoResult<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(ClientCommand::ResolveServerRequest {
-                request_id,
-                result,
-                response_tx,
-            })
+        self.request_handle()
+            .resolve_server_request(request_id, result)
             .await
-            .map_err(|_| {
-                IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "in-process app-server worker channel is closed",
-                )
-            })?;
-        response_rx.await.map_err(|_| {
-            IoError::new(
-                ErrorKind::BrokenPipe,
-                "in-process app-server resolve channel is closed",
-            )
-        })?
     }
 
     /// Rejects a pending server request with JSON-RPC error payload.
@@ -545,26 +573,9 @@ impl InProcessAppServerClient {
         request_id: RequestId,
         error: JSONRPCErrorError,
     ) -> IoResult<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(ClientCommand::RejectServerRequest {
-                request_id,
-                error,
-                response_tx,
-            })
+        self.request_handle()
+            .reject_server_request(request_id, error)
             .await
-            .map_err(|_| {
-                IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "in-process app-server worker channel is closed",
-                )
-            })?;
-        response_rx.await.map_err(|_| {
-            IoError::new(
-                ErrorKind::BrokenPipe,
-                "in-process app-server reject channel is closed",
-            )
-        })?
     }
 
     /// Returns the next in-process event, or `None` when worker exits.
@@ -611,6 +622,61 @@ impl InProcessAppServerClient {
 }
 
 impl InProcessAppServerRequestHandle {
+    pub(crate) async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ClientCommand::ResolveServerRequest {
+                request_id,
+                result,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "in-process app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "in-process app-server resolve channel is closed",
+            )
+        })?
+    }
+
+    /// Rejects a pending server request with JSON-RPC error payload.
+    pub(crate) async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ClientCommand::RejectServerRequest {
+                request_id,
+                error,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "in-process app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "in-process app-server reject channel is closed",
+            )
+        })?
+    }
+
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -638,29 +704,41 @@ impl InProcessAppServerRequestHandle {
         T: DeserializeOwned,
     {
         let method = request.method_name();
-        let response =
-            self.request(request)
-                .await
-                .map_err(|source| TypedRequestError::Transport {
-                    method: method.to_string(),
-                    source,
-                })?;
-        let result = response.map_err(|source| TypedRequestError::Server {
-            method: method.to_string(),
-            source,
-        })?;
-        serde_json::from_value(result).map_err(|source| TypedRequestError::Deserialize {
-            method: method.to_string(),
-            source,
-        })
+        let response = self.request(request).await;
+        decode_typed_response(method, response)
     }
 }
 
 impl AppServerRequestHandle {
+    pub(crate) async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
+        match self {
+            Self::InProcess(handle) => handle.resolve_server_request(request_id, result).await,
+            Self::Remote(handle) => handle.resolve_server_request(request_id, result).await,
+            Self::Cloud(handle) => handle.resolve_server_request(request_id, result).await,
+        }
+    }
+
+    pub(crate) async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        match self {
+            Self::InProcess(handle) => handle.reject_server_request(request_id, error).await,
+            Self::Remote(handle) => handle.reject_server_request(request_id, error).await,
+            Self::Cloud(handle) => handle.reject_server_request(request_id, error).await,
+        }
+    }
+
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
         match self {
             Self::InProcess(handle) => handle.request(request).await,
             Self::Remote(handle) => handle.request(request).await,
+            Self::Cloud(handle) => handle.request(request).await,
         }
     }
 
@@ -668,20 +746,39 @@ impl AppServerRequestHandle {
     where
         T: DeserializeOwned,
     {
-        match self {
-            Self::InProcess(handle) => handle.request_typed(request).await,
-            Self::Remote(handle) => handle.request_typed(request).await,
-        }
+        let method = request.method_name();
+        let response = self.request(request).await;
+        decode_typed_response(method, response)
     }
 }
 
 impl AppServerClient {
+    /// App-server platform family, which can differ from the executor's platform.
+    /// Older remote servers may omit this metadata.
+    pub fn platform_family(&self) -> Option<&str> {
+        match self {
+            Self::InProcess(_) => Some(std::env::consts::FAMILY),
+            Self::Remote(client) => client.platform_family(),
+            Self::Cloud(_) => None,
+        }
+    }
+
+    /// App-server operating system as reported at initialization, including unknown values.
+    pub fn platform_os(&self) -> Option<&str> {
+        match self {
+            Self::InProcess(_) => Some(std::env::consts::OS),
+            Self::Remote(client) => client.platform_os(),
+            Self::Cloud(_) => None,
+        }
+    }
+
     pub fn dex_home(&self, local_dex_home: &AbsolutePathBuf) -> Option<AppServerPath> {
         match self {
             Self::InProcess(_) => Some(AppServerPath::from_app_server(
                 local_dex_home.display().to_string(),
             )),
             Self::Remote(client) => client.dex_home().map(AppServerPath::from_app_server),
+            Self::Cloud(_) => None,
         }
     }
 
@@ -689,6 +786,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.request(request).await,
             Self::Remote(client) => client.request(request).await,
+            Self::Cloud(client) => client.request(request).await,
         }
     }
 
@@ -696,16 +794,16 @@ impl AppServerClient {
     where
         T: DeserializeOwned,
     {
-        match self {
-            Self::InProcess(client) => client.request_typed(request).await,
-            Self::Remote(client) => client.request_typed(request).await,
-        }
+        let method = request.method_name();
+        let response = self.request(request).await;
+        decode_typed_response(method, response)
     }
 
     pub async fn notify(&self, notification: ClientNotification) -> IoResult<()> {
         match self {
             Self::InProcess(client) => client.notify(notification).await,
             Self::Remote(client) => client.notify(notification).await,
+            Self::Cloud(client) => client.notify(notification).await,
         }
     }
 
@@ -717,6 +815,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.resolve_server_request(request_id, result).await,
             Self::Remote(client) => client.resolve_server_request(request_id, result).await,
+            Self::Cloud(client) => client.resolve_server_request(request_id, result).await,
         }
     }
 
@@ -728,6 +827,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.reject_server_request(request_id, error).await,
             Self::Remote(client) => client.reject_server_request(request_id, error).await,
+            Self::Cloud(client) => client.reject_server_request(request_id, error).await,
         }
     }
 
@@ -735,6 +835,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.next_event().await.map(Into::into),
             Self::Remote(client) => client.next_event().await,
+            Self::Cloud(client) => client.next_event().await,
         }
     }
 
@@ -742,6 +843,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.shutdown().await,
             Self::Remote(client) => client.shutdown().await,
+            Self::Cloud(client) => client.shutdown().await,
         }
     }
 
@@ -749,12 +851,15 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => AppServerRequestHandle::InProcess(client.request_handle()),
             Self::Remote(client) => AppServerRequestHandle::Remote(client.request_handle()),
+            Self::Cloud(client) => AppServerRequestHandle::Cloud(client.request_handle()),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[path = "reply_tests.rs"]
+    mod replies;
     use super::*;
     use dex_app_server_protocol::AccountUpdatedNotification;
     use dex_app_server_protocol::ConfigRequirementsReadResponse;
@@ -777,6 +882,7 @@ mod tests {
     use dex_utils_absolute_path::AbsolutePathBuf;
     use futures::SinkExt;
     use futures::StreamExt;
+    use futures::poll;
     use pretty_assertions::assert_eq;
     use std::ops::Deref;
     use std::path::Path;
@@ -845,12 +951,14 @@ mod tests {
             .await
             .expect("state db should initialize for in-process test");
         let client = InProcessAppServerClient::start(InProcessClientStartArgs {
+            required_human_approval: false,
             arg0_paths: Arg0DispatchPaths::default(),
             config,
             cli_overrides: Vec::new(),
             loader_overrides: LoaderOverrides::default(),
             strict_config: false,
             cloud_config_bundle: CloudConfigBundleLoader::default(),
+            embedded_network_policy: Default::default(),
             feedback: DexFeedback::new(),
             log_db: None,
             state_db: Some(state_db),
@@ -930,6 +1038,22 @@ mod tests {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        expect_remote_initialize_with_metadata(
+            websocket,
+            serde_json::json!({
+                "userAgent": "dex_cli_rs/9.8.7-test (Test OS; x86_64) rust",
+                "dexHome": "/server/.dex",
+            }),
+        )
+        .await;
+    }
+
+    async fn expect_remote_initialize_with_metadata<S>(
+        websocket: &mut tokio_tungstenite::WebSocketStream<S>,
+        metadata: serde_json::Value,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let JSONRPCMessage::Request(request) = read_websocket_message(websocket).await else {
             panic!("expected initialize request");
         };
@@ -938,10 +1062,7 @@ mod tests {
             websocket,
             JSONRPCMessage::Response(JSONRPCResponse {
                 id: request.id,
-                result: serde_json::json!({
-                    "userAgent": "dex_cli_rs/9.8.7-test (Test OS; x86_64) rust",
-                    "dexHome": "/server/.dex",
-                }),
+                result: metadata,
             }),
         )
         .await;
@@ -1017,18 +1138,20 @@ mod tests {
     }
 
     fn item_completed_notification(text: &str) -> ServerNotification {
-        ServerNotification::ItemCompleted(dex_app_server_protocol::ItemCompletedNotification {
-            thread_id: "thread".to_string(),
-            turn_id: "turn".to_string(),
-            completed_at_ms: 0,
-            item: dex_app_server_protocol::ThreadItem::AgentMessage {
+        ServerNotification::ItemCompleted(dex_app_server_protocol::ItemCompletedNotification::new(
+            "thread".to_string(),
+            "turn".to_string(),
+            dex_app_server_protocol::ThreadItemPayload::AgentMessage {
                 id: "item".to_string(),
                 text: text.to_string(),
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             },
-        })
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        ))
     }
 
     fn turn_completed_notification() -> ServerNotification {
@@ -1036,6 +1159,7 @@ mod tests {
             thread_id: "thread".to_string(),
             turn: dex_app_server_protocol::Turn {
                 id: "turn".to_string(),
+                root_turn_id: None,
                 items_view: dex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: dex_app_server_protocol::TurnStatus::Completed,
@@ -1049,6 +1173,7 @@ mod tests {
 
     fn test_remote_connect_args(websocket_url: String) -> RemoteAppServerConnectArgs {
         RemoteAppServerConnectArgs {
+            required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::WebSocket {
                 websocket_url,
                 auth_token: None,
@@ -1076,8 +1201,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_request_drop_cancels_waiting_send_and_reply() {
+        let (command_tx, mut commands) = mpsc::channel(/*buffer*/ 1);
+        let handle =
+            AppServerRequestHandle::InProcess(InProcessAppServerRequestHandle { command_tx });
+        let request = ClientRequest::ConfigRequirementsRead {
+            request_id: RequestId::String("typed-request".to_string()),
+            params: None,
+        };
+        let mut pending = Box::pin(handle.request_typed::<serde_json::Value>(request.clone()));
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(poll!(&mut pending).is_pending());
+        let mut blocked = Box::pin(handle.request_typed::<serde_json::Value>(request.clone()));
+        assert!(poll!(&mut blocked).is_pending());
+        drop(blocked);
+
+        let ClientCommand::Request {
+            request: sent,
+            response_tx,
+        } = commands.try_recv().expect("first request should be queued")
+        else {
+            panic!("expected request command");
+        };
+        assert_eq!(*sent, request);
+        assert!(!response_tx.is_closed());
+        drop(pending);
+        assert!(response_tx.is_closed());
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn typed_request_roundtrip_works() {
-        let client = start_test_client(SessionSource::Exec).await;
+        let TestClient { _dex_home, client } = start_test_client(SessionSource::Exec).await;
+        let client = AppServerClient::InProcess(client);
+        assert_eq!(
+            (client.platform_family(), client.platform_os()),
+            (Some(std::env::consts::FAMILY), Some(std::env::consts::OS))
+        );
         let _response: ConfigRequirementsReadResponse = client
             .request_typed(ClientRequest::ConfigRequirementsRead {
                 request_id: RequestId::Integer(1),
@@ -1254,6 +1420,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_platform_metadata_preserves_reported_and_missing_values() {
+        for (family, os) in [
+            (Some("windows"), Some("windows")),
+            (Some("unix"), Some("linux")),
+            (Some("future-family"), Some("future-os")),
+            (Some("unix"), None),
+            (None, Some("linux")),
+            (None, None),
+        ] {
+            let websocket_url = start_test_remote_server(move |mut websocket| async move {
+                let mut metadata = serde_json::json!({});
+                if let Some(family) = family {
+                    metadata["platformFamily"] = family.into();
+                }
+                if let Some(os) = os {
+                    metadata["platformOs"] = os.into();
+                }
+                expect_remote_initialize_with_metadata(&mut websocket, metadata).await;
+                websocket.close(None).await.expect("close should succeed");
+            })
+            .await;
+            let client = AppServerClient::Remote(
+                RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+                    .await
+                    .expect("remote client should connect"),
+            );
+            assert_eq!(
+                (client.platform_family(), client.platform_os()),
+                (family, os)
+            );
+            client.shutdown().await.expect("shutdown should complete");
+        }
+    }
+
+    #[tokio::test]
     async fn remote_typed_request_roundtrip_works() {
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
@@ -1267,6 +1468,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
                     })
@@ -1283,6 +1485,7 @@ mod tests {
 
         assert_eq!(client.server_version(), Some("9.8.7-test"));
         assert_eq!(client.dex_home(), Some("/server/.dex"));
+        let client = AppServerClient::Remote(client);
         let response: GetAccountResponse = client
             .request_typed(ClientRequest::GetAccount {
                 request_id: RequestId::Integer(1),
@@ -1321,6 +1524,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
                     })
@@ -1331,6 +1535,7 @@ mod tests {
             websocket.close(None).await.expect("close should succeed");
         });
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
             client_name: "dex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
@@ -1397,6 +1602,7 @@ mod tests {
         assert_eq!(
             response,
             GetAccountResponse {
+                workspace_routing: None,
                 account: None,
                 requires_openai_auth: false,
             }
@@ -1417,6 +1623,7 @@ mod tests {
         )
         .await;
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::WebSocket {
                 websocket_url,
                 auth_token: Some(auth_token),
@@ -1437,6 +1644,7 @@ mod tests {
     #[tokio::test]
     async fn remote_connect_rejects_non_loopback_ws_when_auth_configured() {
         let result = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::WebSocket {
                 websocket_url: "ws://example.com:4500".to_string(),
                 auth_token: Some("remote-bearer-token".to_string()),
@@ -1500,6 +1708,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
                     })
@@ -1553,6 +1762,7 @@ mod tests {
         assert_eq!(
             first_response,
             GetAccountResponse {
+                workspace_routing: None,
                 account: None,
                 requires_openai_auth: false,
             }
@@ -1563,24 +1773,25 @@ mod tests {
 
     #[tokio::test]
     async fn remote_notifications_arrive_over_websocket() {
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
-            write_websocket_message(
-                &mut websocket,
-                JSONRPCMessage::Notification(
-                    serde_json::from_value(
-                        serde_json::to_value(ServerNotification::AccountUpdated(
-                            AccountUpdatedNotification {
-                                auth_mode: None,
-                                plan_type: None,
-                            },
-                        ))
-                        .expect("notification should serialize"),
-                    )
-                    .expect("notification should convert to JSON-RPC"),
-                ),
-            )
-            .await;
+            let notification = JSONRPCMessage::Notification(
+                serde_json::from_value(
+                    serde_json::to_value(ServerNotification::AccountUpdated(
+                        AccountUpdatedNotification {
+                            auth_mode: None,
+                            plan_type: None,
+                        },
+                    ))
+                    .expect("notification should serialize"),
+                )
+                .expect("notification should convert to JSON-RPC"),
+            );
+            // Only the first notification is consumed; the other can arrive during shutdown.
+            write_websocket_message(&mut websocket, notification.clone()).await;
+            write_websocket_message(&mut websocket, notification).await;
+            let _ = close_tx.send(websocket.next().await);
         })
         .await;
         let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
@@ -1595,6 +1806,14 @@ mod tests {
         ));
 
         client.shutdown().await.expect("shutdown should complete");
+        assert_eq!(
+            close_rx
+                .await
+                .expect("server should observe shutdown")
+                .expect("server should receive a frame")
+                .expect("websocket should close cleanly"),
+            Message::Close(None),
+        );
     }
 
     #[tokio::test]
@@ -1669,8 +1888,8 @@ mod tests {
                     }
                     ServerNotification::ItemCompleted(notification)
                         if matches!(
-                            &notification.item,
-                            dex_app_server_protocol::ThreadItem::AgentMessage { text, .. }
+                            &notification.item.payload,
+                            dex_app_server_protocol::ThreadItemPayload::AgentMessage { text, .. }
                                 if text == "hello"
                         ) =>
                     {
@@ -1918,7 +2137,7 @@ mod tests {
 
     #[tokio::test]
     async fn next_event_surfaces_lagged_markers() {
-        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (command_tx, _) = mpsc::channel(1);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let worker_handle = tokio::spawn(async {});
         event_tx
@@ -1950,7 +2169,7 @@ mod tests {
             EnvironmentManager::create_for_tests(
                 Some("ws://127.0.0.1:8765".to_string()),
                 Some(
-                    ExecServerRuntimePaths::new(
+                    ExecServerRuntimeOptions::new(
                         std::env::current_exe().expect("current exe"),
                         /*dex_linux_sandbox_exe*/ None,
                     )
@@ -1961,12 +2180,14 @@ mod tests {
         );
 
         let runtime_args = InProcessClientStartArgs {
+            required_human_approval: false,
             arg0_paths: Arg0DispatchPaths::default(),
             config: config.clone(),
             cli_overrides: Vec::new(),
             loader_overrides: LoaderOverrides::default(),
             strict_config: false,
             cloud_config_bundle: CloudConfigBundleLoader::default(),
+            embedded_network_policy: Default::default(),
             feedback: DexFeedback::new(),
             log_db: None,
             state_db: None,

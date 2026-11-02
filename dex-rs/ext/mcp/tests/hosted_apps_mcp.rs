@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use dex_config::McpServerTransportConfig;
+use dex_config::test_support::CloudConfigBundleFixture;
 use dex_core::McpManager;
 use dex_core::config::Config;
 use dex_core::config::ConfigBuilder;
@@ -59,11 +60,28 @@ async fn runtime_overlay_preserves_disabled_server() -> TestResult {
             ),
             ("mcp_servers.dex_apps.enabled".to_string(), false.into()),
         ])
+        .cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement("[mcp_servers]"),
+        )
         .build()
         .await?;
     let auth = DexAuth::create_dummy_chatgpt_auth_for_testing();
     let manager = installed_manager(&config, Some(auth.clone()));
 
+    let configured = manager.configured_servers(&config).await;
+    // Standalone login must still reject requirements-denied, explicitly disabled entries.
+    let login_client = Arc::new(dex_exec_server::RouteAwareHttpClient::new(
+        config.http_client_factory(),
+    ));
+    assert_eq!(
+        dex_mcp::apply_http_headers_helper(
+            login_client,
+            &configured[DEX_APPS_MCP_SERVER_NAME],
+            dex_home.path().to_path_buf(),
+        )
+        .err(),
+        Some("the MCP server is disabled by managed requirements".to_string())
+    );
     let servers = manager.effective_servers(&config, Some(&auth)).await;
     let server = servers
         .get(DEX_APPS_MCP_SERVER_NAME)

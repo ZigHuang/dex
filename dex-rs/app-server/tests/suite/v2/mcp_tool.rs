@@ -30,13 +30,14 @@ use dex_app_server_protocol::McpToolCallStatus;
 use dex_app_server_protocol::RequestId;
 use dex_app_server_protocol::SelectedCapabilityRoot;
 use dex_app_server_protocol::ServerRequest;
-use dex_app_server_protocol::ThreadItem;
+use dex_app_server_protocol::ThreadItemPayload;
 use dex_app_server_protocol::ThreadReadParams;
 use dex_app_server_protocol::ThreadReadResponse;
 use dex_app_server_protocol::ThreadResumeParams;
 use dex_app_server_protocol::ThreadResumeResponse;
 use dex_app_server_protocol::ThreadStartParams;
 use dex_app_server_protocol::ThreadStartResponse;
+use dex_app_server_protocol::Turn;
 use dex_app_server_protocol::TurnEnvironmentParams;
 use dex_app_server_protocol::TurnStartParams;
 use dex_app_server_protocol::TurnStartResponse;
@@ -63,8 +64,10 @@ use rmcp::model::JsonObject;
 use rmcp::model::ListToolsResult;
 use rmcp::model::MetaObject;
 use rmcp::model::PrimitiveSchemaDefinition;
+use rmcp::model::ProtocolVersion;
+use rmcp::model::RequestMetaObject;
 use rmcp::model::ServerCapabilities;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::model::Tool;
 use rmcp::model::ToolAnnotations;
 use rmcp::service::RequestContext;
@@ -74,6 +77,7 @@ use rmcp::transport::StreamableHttpService;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use serde_json::json;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -89,6 +93,7 @@ const LARGE_OUTPUT_AUTO_COMPACT_LIMIT: i64 = 1_000_000;
 pub(super) const TEST_SERVER_NAME: &str = "tool_server";
 pub(super) const TEST_TOOL_NAME: &str = "echo_tool";
 const LARGE_RESPONSE_MESSAGE: &str = "large";
+const PROTOCOL_ERROR_MESSAGE: &str = "protocol-error";
 const ELICITATION_TRIGGER_MESSAGE: &str = "confirm";
 const ELICITATION_MESSAGE: &str = "Allow this request?";
 const URL_ELICITATION_TRIGGER_MESSAGE: &str = "auth";
@@ -99,7 +104,7 @@ const LATE_ENVIRONMENT_ID: &str = "late-environment";
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_server_tool_call_returns_tool_result() -> Result<()> {
     let responses_server = responses::start_mock_server().await;
-    let (mcp_server_url, mcp_server_handle) = start_mcp_server().await?;
+    let (mcp_server_url, mcp_server_handle) = start_mcp_server(/*sensitive_action*/ None).await?;
     let dex_home = TempDir::new()?;
     mcp_tool_config(&responses_server.uri(), &mcp_server_url, AUTO_COMPACT_LIMIT)
         .write(dex_home.path())?;
@@ -162,10 +167,77 @@ async fn mcp_server_tool_call_returns_tool_result() -> Result<()> {
     Ok(())
 }
 
+#[test_case(ProtocolVersion::V_2025_06_18; "legacy")]
+#[test_case(ProtocolVersion::V_2026_07_28; "modern")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_server_tool_call_preserves_protocol_errors(protocol: ProtocolVersion) -> Result<()> {
+    let responses_server = responses::start_mock_server().await;
+    let (mcp_server_url, mcp_server_handle) = start_mcp_server(/*sensitive_action*/ None).await?;
+    let dex_home = TempDir::new()?;
+    let config = mcp_tool_config(&responses_server.uri(), &mcp_server_url, AUTO_COMPACT_LIMIT);
+    let config = if protocol == ProtocolVersion::V_2026_07_28 {
+        config.enable_feature(Feature::Mcp20260728)
+    } else {
+        config.disable_feature(Feature::Mcp20260728)
+    };
+    config.write(dex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .build_initialized()
+        .await?;
+    let ThreadStartResponse { thread, .. } = mcp.start_thread(ThreadStartParams::default()).await?;
+
+    for (server, expected_error) in [
+        (
+            TEST_SERVER_NAME,
+            json!({
+                "code": -32043,
+                "message": "tool authorization required",
+                "data": {
+                    "tool": TEST_TOOL_NAME,
+                    "protocolVersion": protocol,
+                    "_meta": {"_dex_apps": {"connector_auth_failure": {
+                        "is_auth_failure": true,
+                        "connector_id": "calendar",
+                        "requested_scopes": ["calendar.read"],
+                    }}},
+                },
+            }),
+        ),
+        (
+            "missing",
+            json!({"code": -32603, "message": "unknown MCP server 'missing'"}),
+        ),
+    ] {
+        let request_id = mcp
+            .send_mcp_server_tool_call_request(McpServerToolCallParams {
+                thread_id: thread.id.clone(),
+                server: server.to_string(),
+                tool: TEST_TOOL_NAME.to_string(),
+                arguments: Some(json!({"message": PROTOCOL_ERROR_MESSAGE})),
+                meta: None,
+            })
+            .await?;
+        let error = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+        assert_eq!(
+            serde_json::to_value(error)?,
+            json!({"id": request_id, "error": expected_error})
+        );
+    }
+
+    mcp_server_handle.abort();
+    let _ = mcp_server_handle.await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_server_tool_call_forwards_only_server_extensions() -> Result<()> {
     let responses_server = responses::start_mock_server().await;
-    let (mcp_server_url, mcp_server_handle) = start_mcp_server().await?;
+    let (mcp_server_url, mcp_server_handle) = start_mcp_server(/*sensitive_action*/ None).await?;
     let dex_home = TempDir::new()?;
     mcp_tool_config(&responses_server.uri(), &mcp_server_url, AUTO_COMPACT_LIMIT)
         .write(dex_home.path())?;
@@ -188,6 +260,8 @@ async fn mcp_server_tool_call_forwards_only_server_extensions() -> Result<()> {
             version: "0.1.0".to_string(),
         },
         Some(InitializeCapabilities {
+            required_human_approval: false,
+            explicit_gateway_oauth: false,
             experimental_api: true,
             request_attestation: false,
             mcp_server_openai_form_elicitation: true,
@@ -260,7 +334,7 @@ async fn model_mcp_tool_call_uses_session_client_extensions() -> Result<()> {
         create_final_assistant_message_sse_response("done")?,
     ];
     let responses_server = create_mock_responses_server_sequence(responses).await;
-    let (mcp_server_url, mcp_server_handle) = start_mcp_server().await?;
+    let (mcp_server_url, mcp_server_handle) = start_mcp_server(/*sensitive_action*/ None).await?;
     let dex_home = TempDir::new()?;
     mcp_tool_config(&responses_server.uri(), &mcp_server_url, AUTO_COMPACT_LIMIT)
         .write(dex_home.path())?;
@@ -283,6 +357,8 @@ async fn model_mcp_tool_call_uses_session_client_extensions() -> Result<()> {
             version: "0.1.0".to_string(),
         },
         Some(InitializeCapabilities {
+            required_human_approval: false,
+            explicit_gateway_oauth: false,
             experimental_api: true,
             request_attestation: false,
             mcp_server_openai_form_elicitation: true,
@@ -315,10 +391,10 @@ async fn model_mcp_tool_call_uses_session_client_extensions() -> Result<()> {
     .await?;
 
     let completed = wait_for_mcp_tool_call_completed(&mut mcp, call_id).await?;
-    let ThreadItem::McpToolCall {
+    let ThreadItemPayload::McpToolCall {
         result: Some(result),
         ..
-    } = completed.item
+    } = completed.item.payload
     else {
         panic!("expected completed MCP tool call item");
     };
@@ -490,7 +566,7 @@ async fn assert_full_access_form_elicitation_is_declined(
     case: FullAccessElicitationCase,
 ) -> Result<()> {
     let responses_server = responses::start_mock_server().await;
-    let (mcp_server_url, mcp_server_handle) = start_mcp_server().await?;
+    let (mcp_server_url, mcp_server_handle) = start_mcp_server(/*sensitive_action*/ None).await?;
     let dex_home = TempDir::new()?;
     mcp_tool_config(&responses_server.uri(), &mcp_server_url, AUTO_COMPACT_LIMIT)
         .write(dex_home.path())?;
@@ -564,7 +640,7 @@ async fn mcp_server_tool_call_round_trips_elicitation_for_thread(
     mut elicitation_thread: ElicitationThread,
 ) -> Result<()> {
     let responses_server = responses::start_mock_server().await;
-    let (mcp_server_url, mcp_server_handle) = start_mcp_server().await?;
+    let (mcp_server_url, mcp_server_handle) = start_mcp_server(/*sensitive_action*/ None).await?;
     let dex_home = TempDir::new()?;
     mcp_tool_config(&responses_server.uri(), &mcp_server_url, AUTO_COMPACT_LIMIT)
         .write(dex_home.path())?;
@@ -709,6 +785,7 @@ async fn initialize_elicitation_app_server(
             version: "0.1.0".to_string(),
         },
         Some(InitializeCapabilities {
+            required_human_approval: false,
             experimental_api: true,
             extensions: client_advertises_standard_form_input.then(|| {
                 HashMap::from([(
@@ -726,7 +803,7 @@ async fn initialize_elicitation_app_server(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_server_elicitation_survives_environment_runtime_refresh() -> Result<()> {
     let responses_server = responses::start_mock_server().await;
-    let (mcp_server_url, mcp_server_handle) = start_mcp_server().await?;
+    let (mcp_server_url, mcp_server_handle) = start_mcp_server(/*sensitive_action*/ None).await?;
     let exec_listener = TcpListener::bind("127.0.0.1:0").await?;
     let exec_server_url = format!("ws://{}", exec_listener.local_addr()?);
     let dex_home = TempDir::new()?;
@@ -846,7 +923,7 @@ async fn mcp_server_elicitation_survives_environment_runtime_refresh() -> Result
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_server_tool_call_forwards_url_elicitation() -> Result<()> {
     let responses_server = responses::start_mock_server().await;
-    let (mcp_server_url, mcp_server_handle) = start_mcp_server().await?;
+    let (mcp_server_url, mcp_server_handle) = start_mcp_server(/*sensitive_action*/ None).await?;
     let dex_home = TempDir::new()?;
     mcp_tool_config(&responses_server.uri(), &mcp_server_url, AUTO_COMPACT_LIMIT)
         .write(dex_home.path())?;
@@ -925,6 +1002,7 @@ async fn mcp_server_tool_call_forwards_url_elicitation() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_tool_call_completion_notification_contains_truncated_large_result() -> Result<()> {
+    let traces = TempDir::new()?;
     let call_id = "call-large-mcp";
     let namespace = format!("mcp__{TEST_SERVER_NAME}");
     let responses = vec![
@@ -943,7 +1021,7 @@ async fn mcp_tool_call_completion_notification_contains_truncated_large_result()
         create_final_assistant_message_sse_response("done")?,
     ];
     let responses_server = create_mock_responses_server_sequence(responses).await;
-    let (mcp_server_url, mcp_server_handle) = start_mcp_server().await?;
+    let (mcp_server_url, mcp_server_handle) = start_mcp_server(/*sensitive_action*/ None).await?;
     let dex_home = TempDir::new()?;
     mcp_tool_config(
         &responses_server.uri(),
@@ -954,6 +1032,7 @@ async fn mcp_tool_call_completion_notification_contains_truncated_large_result()
 
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
+        .with_env_overrides(&[("DEX_ROLLOUT_TRACE_ROOT", traces.path().to_str())])
         .build_initialized()
         .await?;
     let ThreadStartResponse { thread, .. } = mcp
@@ -980,7 +1059,7 @@ async fn mcp_tool_call_completion_notification_contains_truncated_large_result()
     let completed = wait_for_mcp_tool_call_completed(&mut mcp, call_id).await?;
     assert_eq!(completed.turn_id, turn.id);
 
-    let ThreadItem::McpToolCall {
+    let ThreadItemPayload::McpToolCall {
         id,
         server,
         tool,
@@ -988,7 +1067,7 @@ async fn mcp_tool_call_completion_notification_contains_truncated_large_result()
         result: Some(result),
         error,
         ..
-    } = completed.item
+    } = completed.item.payload
     else {
         panic!("expected completed MCP tool call item");
     };
@@ -1008,7 +1087,7 @@ async fn mcp_tool_call_completion_notification_contains_truncated_large_result()
     assert!(text.contains("truncated"));
     assert!(text.len() < DEFAULT_OUTPUT_BYTES_CAP + 1024);
 
-    let serialized_item = serde_json::to_string(&ThreadItem::McpToolCall {
+    let serialized_item = serde_json::to_string(&ThreadItemPayload::McpToolCall {
         id,
         server,
         tool,
@@ -1016,6 +1095,7 @@ async fn mcp_tool_call_completion_notification_contains_truncated_large_result()
         arguments: json!({ "message": LARGE_RESPONSE_MESSAGE }),
         app_context: None,
         mcp_app_resource_uri: None,
+        mcp_app_ui: None,
         plugin_id: None,
         read_only_hint: None,
         result: Some(result),
@@ -1029,6 +1109,47 @@ async fn mcp_tool_call_completion_notification_contains_truncated_large_result()
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+
+    assert!(mcp.shutdown_gracefully().await?.success());
+
+    // The UI receives a truncated result, but the trace retains the original
+    // content and metadata, including audio removed during model sanitization.
+    let bundles = std::fs::read_dir(traces.path())?.collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(bundles.len(), 1);
+    let bundle = bundles[0].path();
+    let events = std::fs::read_to_string(bundle.join("trace.jsonl"))?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    let completions: Vec<_> = events
+        .iter()
+        .map(|event| &event["payload"])
+        .filter(|event| {
+            event["type"] == "tool_call_runtime_ended" && event["tool_call_id"] == call_id
+        })
+        .collect();
+    assert_eq!(completions.len(), 1);
+    let payload_path = completions[0]["runtime_payload"]["path"]
+        .as_str()
+        .expect("MCP runtime payload path");
+    let payload: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(bundle.join(payload_path))?)?;
+    let expected = json!({
+        "content": [
+            {"type": "text", "text": "large-mcp-content-".repeat(DEFAULT_OUTPUT_BYTES_CAP / 8)},
+            {"type": "audio", "data": "UklGRg==", "mimeType": "audio/wav"}
+        ],
+        "structuredContent": {"large": "structured-value-".repeat(DEFAULT_OUTPUT_BYTES_CAP / 8)},
+        "isError": false,
+        "_meta": {
+            "calledBy": "mcp-app",
+        }
+    });
+    // Avoid constructing a text diff of the intentionally oversized response.
+    assert!(
+        payload["result"]["Ok"] == expected,
+        "trace did not retain the full MCP response"
+    );
 
     mcp_server_handle.abort();
     let _ = mcp_server_handle.await;
@@ -1056,7 +1177,7 @@ async fn mcp_tool_call_hint_survives_mid_call_thread_read_and_resume() -> Result
         create_final_assistant_message_sse_response("done")?,
     ];
     let responses_server = create_mock_responses_server_sequence(responses).await;
-    let (mcp_server_url, mcp_server_handle) = start_mcp_server().await?;
+    let (mcp_server_url, mcp_server_handle) = start_mcp_server(/*sensitive_action*/ None).await?;
     let dex_home = TempDir::new()?;
     mcp_tool_config(&responses_server.uri(), &mcp_server_url, AUTO_COMPACT_LIMIT)
         .write(dex_home.path())?;
@@ -1119,7 +1240,7 @@ async fn mcp_tool_call_hint_survives_mid_call_thread_read_and_resume() -> Result
         ..
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
 
-    let expected_item = ThreadItem::McpToolCall {
+    let expected_item = ThreadItemPayload::McpToolCall {
         id: call_id.to_string(),
         server: TEST_SERVER_NAME.to_string(),
         tool: TEST_TOOL_NAME.to_string(),
@@ -1127,6 +1248,7 @@ async fn mcp_tool_call_hint_survives_mid_call_thread_read_and_resume() -> Result
         arguments: json!({ "message": ELICITATION_TRIGGER_MESSAGE }),
         app_context: None,
         mcp_app_resource_uri: None,
+        mcp_app_ui: None,
         plugin_id: None,
         read_only_hint: Some(true),
         result: None,
@@ -1136,8 +1258,8 @@ async fn mcp_tool_call_hint_survives_mid_call_thread_read_and_resume() -> Result
     let resumed_item = resumed_thread
         .turns
         .iter()
-        .flat_map(|turn| &turn.items)
-        .find(|item| matches!(item, ThreadItem::McpToolCall { id, .. } if id == call_id))
+        .flat_map(Turn::item_payloads)
+        .find(|item| matches!(item, ThreadItemPayload::McpToolCall { id, .. } if id == call_id))
         .expect("resumed thread should include the in-progress MCP tool call");
     assert_eq!(resumed_item, &expected_item);
 
@@ -1153,11 +1275,11 @@ async fn mcp_tool_call_hint_survives_mid_call_thread_read_and_resume() -> Result
 
     let completed = wait_for_mcp_tool_call_completed(&mut mcp, call_id).await?;
     assert_eq!(completed.turn_id, turn.id);
-    let ThreadItem::McpToolCall {
+    let ThreadItemPayload::McpToolCall {
         status,
         read_only_hint,
         ..
-    } = &completed.item
+    } = &completed.item.payload
     else {
         panic!("expected the completed MCP tool call item");
     };
@@ -1183,10 +1305,10 @@ async fn mcp_tool_call_hint_survives_mid_call_thread_read_and_resume() -> Result
     let persisted_item = completed_read
         .turns
         .iter()
-        .flat_map(|turn| &turn.items)
-        .find(|item| matches!(item, ThreadItem::McpToolCall { id, .. } if id == call_id))
+        .flat_map(Turn::item_payloads)
+        .find(|item| matches!(item, ThreadItemPayload::McpToolCall { id, .. } if id == call_id))
         .expect("completed thread history should include the persisted MCP tool call");
-    assert_eq!(persisted_item, &completed.item);
+    assert_eq!(persisted_item, &completed.item.payload);
 
     mcp_server_handle.abort();
     let _ = mcp_server_handle.await;
@@ -1194,8 +1316,11 @@ async fn mcp_tool_call_hint_survives_mid_call_thread_read_and_resume() -> Result
     Ok(())
 }
 
-#[derive(Clone, Default)]
-struct ToolAppsMcpServer;
+#[derive(Clone)]
+struct ToolAppsMcpServer {
+    sensitive_action: Option<bool>,
+    tool_names: &'static [&'static str],
+}
 
 impl ServerHandler for ToolAppsMcpServer {
     async fn initialize(
@@ -1207,8 +1332,8 @@ impl ServerHandler for ToolAppsMcpServer {
         Ok(self.get_info())
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn list_tools(
@@ -1227,14 +1352,22 @@ impl ServerHandler for ToolAppsMcpServer {
         }))
         .map_err(|err| rmcp::ErrorData::internal_error(err.to_string(), None))?;
 
-        let mut tool = Tool::new(
-            Cow::Borrowed(TEST_TOOL_NAME),
-            Cow::Borrowed("Echo a message."),
-            Arc::new(input_schema),
-        );
-        tool.annotations = Some(ToolAnnotations::new().read_only(true));
+        let input_schema = Arc::new(input_schema);
+        let tools = self
+            .tool_names
+            .iter()
+            .map(|&name| {
+                let mut tool = Tool::new(
+                    Cow::Borrowed(name),
+                    Cow::Borrowed("Echo a message."),
+                    Arc::clone(&input_schema),
+                );
+                tool.annotations = Some(ToolAnnotations::new().read_only(true));
+                tool
+            })
+            .collect();
 
-        Ok(ListToolsResult::with_all_items(vec![tool]))
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
@@ -1242,7 +1375,10 @@ impl ServerHandler for ToolAppsMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
-        assert_eq!(request.name.as_ref(), TEST_TOOL_NAME);
+        assert!(self.tool_names.contains(&request.name.as_ref()));
+        if matches!(request.name.as_ref(), "js_reset" | "js_add_node_module_dir") {
+            return Ok(CallToolResult::success(vec![ContentBlock::text("setup complete")]).into());
+        }
         let message = request
             .arguments
             .as_ref()
@@ -1256,21 +1392,107 @@ impl ServerHandler for ToolAppsMcpServer {
             .get("threadId")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
-        let client_capabilities = context.peer.peer_info().map(|request| {
+        let client_capabilities = context.client_capabilities().map(|capabilities| {
             json!({
-                "extensions": request.capabilities.extensions.clone().unwrap_or_default(),
+                "extensions": capabilities.extensions.unwrap_or_default(),
             })
         });
 
         let mut meta = MetaObject::new();
         meta.0.insert("calledBy".to_string(), json!("mcp-app"));
 
+        // Node REPL requests strict review inside tools/call, despite its read-only annotation.
+        let turn_metadata = context.meta.0.0.get("x-dex-turn-metadata");
+        if turn_metadata
+            .and_then(|metadata| metadata.get("node_repl_auto_review_required"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            let mut approval_meta = json!({
+                "dex_request_type": "approval_request",
+                "dex_approval_kind": "mcp_tool_call",
+                "dex_strict_auto_review": true,
+                "tool_name": request.name,
+                "tool_params": request.arguments,
+                "x-dex-turn-metadata": turn_metadata,
+            });
+            if request.name == "js" {
+                // Match the execution approval emitted by the real Node REPL server.
+                approval_meta["connector_id"] = json!("node_repl");
+            }
+            if let Some(sensitive_action) = self
+                .sensitive_action
+                .or((message == "sensitive").then_some(true))
+            {
+                approval_meta["dex_sensitive_action"] = json!(sensitive_action);
+            }
+            let result = context
+                .peer
+                .create_elicitation(ElicitRequestParams::FormElicitationParams {
+                    meta: Some(RequestMetaObject::from(
+                        approval_meta
+                            .as_object()
+                            .expect("approval metadata")
+                            .clone(),
+                    )),
+                    message: "Review tool execution".to_string(),
+                    requested_schema: ElicitationSchema::new(Default::default()),
+                })
+                .await
+                .map_err(|err| {
+                    rmcp::ErrorData::internal_error(err.to_string(), /*data*/ None)
+                })?;
+            if matches!(result.action, ElicitationAction::Decline) {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "Tool execution was declined by Guardian.",
+                )])
+                .into());
+            }
+            if matches!(result.action, ElicitationAction::Cancel) {
+                assert_eq!(
+                    serde_json::to_value(result).expect("cancelled elicitation response"),
+                    json!({ "action": "cancel", "_meta": { "approvals_reviewer": "auto_review" } }),
+                );
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "Tool execution was cancelled by Guardian.",
+                )])
+                .into());
+            }
+            assert_eq!(
+                serde_json::to_value(result).expect("elicitation response"),
+                json!({
+                    "action": "accept",
+                    "content": {},
+                    "_meta": { "approvals_reviewer": "auto_review" },
+                })
+            );
+        }
+
+        if message == PROTOCOL_ERROR_MESSAGE {
+            return Err(rmcp::ErrorData::new(
+                rmcp::model::ErrorCode(-32043),
+                "tool authorization required",
+                Some(json!({
+                    "tool": request.name,
+                    "protocolVersion": context.protocol_version(),
+                    "_meta": {"_dex_apps": {"connector_auth_failure": {
+                        "is_auth_failure": true,
+                        "connector_id": "calendar",
+                        "requested_scopes": ["calendar.read"],
+                    }}},
+                })),
+            ));
+        }
+
         if message == LARGE_RESPONSE_MESSAGE {
             let large_text = "large-mcp-content-".repeat(DEFAULT_OUTPUT_BYTES_CAP / 8);
             let mut result = CallToolResult::structured(json!({
                 "large": "structured-value-".repeat(DEFAULT_OUTPUT_BYTES_CAP / 8),
             }));
-            result.content = vec![ContentBlock::text(large_text)];
+            result.content = vec![
+                ContentBlock::text(large_text),
+                ContentBlock::audio("UklGRg==", "audio/wav"),
+            ];
             result.meta = Some(meta);
             return Ok(result.into());
         }
@@ -1356,11 +1578,25 @@ impl ServerHandler for ToolAppsMcpServer {
     }
 }
 
-pub(super) async fn start_mcp_server() -> Result<(String, JoinHandle<()>)> {
+pub(super) async fn start_mcp_server(
+    sensitive_action: Option<bool>,
+) -> Result<(String, JoinHandle<()>)> {
+    start_mcp_server_with_tools(&[TEST_TOOL_NAME], sensitive_action).await
+}
+
+pub(super) async fn start_mcp_server_with_tools(
+    tool_names: &'static [&'static str],
+    sensitive_action: Option<bool>,
+) -> Result<(String, JoinHandle<()>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let mcp_service = StreamableHttpService::new(
-        || Ok(ToolAppsMcpServer),
+        move || {
+            Ok(ToolAppsMcpServer {
+                sensitive_action,
+                tool_names,
+            })
+        },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
     );
@@ -1422,7 +1658,8 @@ async fn wait_for_mcp_tool_call_completed(
             mcp.read_notification("item/completed"),
         )
         .await??;
-        if matches!(&completed.item, ThreadItem::McpToolCall { id, .. } if id == call_id) {
+        if matches!(&completed.item.payload, ThreadItemPayload::McpToolCall { id, .. } if id == call_id)
+        {
             return Ok(completed);
         }
     }

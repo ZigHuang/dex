@@ -11,6 +11,9 @@ use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+#[path = "marketplace_policy/curated_tests.rs"]
+mod curated;
+
 fn config_layer_stack(requirements_toml: &str) -> ConfigLayerStack {
     config_layer_stack_with_user_config(requirements_toml, /*user_config*/ None)
 }
@@ -26,6 +29,25 @@ fn primary_runtime_cache_uses_user_profile_on_windows() {
         Path::new(r"\\?\c:\users\USER\.cache"),
         Path::new(r"C:\Users/user\.cache"),
     ));
+}
+
+#[cfg(windows)]
+#[test]
+fn managed_windows_root_accepts_redirected_target_but_not_unowned_alias() {
+    let temp = TempDir::new().unwrap();
+    let target = temp.path().join("redirected-cache");
+    let owned = temp.path().join(".cache");
+    let alias = temp.path().join("unowned-alias");
+    let other = temp.path().join("different-source");
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    crate::test_support::create_directory_junction(&target, &owned);
+    crate::test_support::create_directory_junction(&target, &alias);
+    let canonical = owned.canonicalize().unwrap();
+    assert!(is_expected_managed_path(&canonical, &owned));
+    assert!(is_expected_managed_path(&owned, &owned));
+    assert!(!is_expected_managed_path(&alias, &owned));
+    assert!(!is_expected_managed_path(&other, &owned));
 }
 
 fn config_layer_stack_with_user_config(
@@ -142,7 +164,13 @@ ref = "ignored"
     );
 
     for source in [
+        "http://git.example.com/team/plugins.git",
         "https://git.example.com/team/plugins.git",
+        "https://user@git.example.com:8443/team/plugins.git",
+        "https://user%5Cname@git.example.com/team/plugins.git",
+        r"http://git.example.com/team\plugins.git",
+        r"https://git.example.com/team\@plugins.git",
+        r"https://git.example.com?repository=team\@plugins.git",
         "ssh://git@git.example.com/team/plugins.git",
         "git@git.example.com:team/plugins.git",
     ] {
@@ -220,7 +248,7 @@ restrict_to_allowed_sources = {restricted}
 }
 
 #[test]
-fn strict_install_validates_configured_name_source_and_root() {
+fn system_marketplace_discovery_and_install_validate_source_and_root() {
     let dex_home = TempDir::new().expect("create Dex home");
     let configured_root = TempDir::new().expect("create configured marketplace");
     let other_root = TempDir::new().expect("create other marketplace");
@@ -256,6 +284,18 @@ source = {configured_root:?}
             config_file,
         )),
     );
+    let layer = stack.layers_low_to_high().next().expect("configured layer");
+    let stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::System {
+                file: AbsolutePathBuf::try_from(dex_home.path().join("system.toml")).unwrap(),
+            },
+            layer.config.clone(),
+        )],
+        stack.requirements().clone(),
+        stack.requirements_toml().clone(),
+    )
+    .expect("system config stack");
     let policy = MarketplacePolicy::from_requirements(stack.requirements());
     let configured_path =
         AbsolutePathBuf::try_from(configured_root.join(".agents/plugins/marketplace.json"))
@@ -263,6 +303,15 @@ source = {configured_root:?}
     let other_path = AbsolutePathBuf::try_from(other_root.join(".agents/plugins/marketplace.json"))
         .expect("other marketplace path");
 
+    fs::create_dir_all(configured_path.as_path().parent().unwrap()).unwrap();
+    fs::write(&configured_path, r#"{"name":"company","plugins":[]}"#).unwrap();
+    assert_eq!(
+        crate::installed_marketplaces::installed_marketplace_roots_from_layer_stack(
+            &stack,
+            dex_home.path()
+        ),
+        vec![AbsolutePathBuf::try_from(configured_root).unwrap()],
+    );
     assert_eq!(
         policy.validate_install(&stack, dex_home.path(), &configured_path, "company"),
         Ok(())
@@ -340,6 +389,9 @@ fn curated_marketplace_requires_its_expected_name() {
         r#"
 [marketplaces]
 restrict_to_allowed_sources = true
+[marketplaces.allowed_sources.curated]
+source = "git"
+url = "https://github.com/openai/plugins.git"
 "#,
     );
     let marketplace_path = AbsolutePathBuf::try_from(
@@ -508,7 +560,7 @@ enabled = true
     );
 
     let projected =
-        project_effective_user_config(&stack, dex_home.path()).expect("project user config");
+        policy_filtered_plugin_config(&stack, dex_home.path()).expect("project plugin config");
     assert_eq!(
         projected["marketplaces"]
             .as_table()
@@ -574,7 +626,7 @@ enabled = true
     );
 
     let projected =
-        project_effective_user_config(&stack, dex_home.path()).expect("project user config");
+        policy_filtered_plugin_config(&stack, dex_home.path()).expect("project plugin config");
 
     assert_eq!(
         projected["marketplaces"]
@@ -640,7 +692,7 @@ enabled = true
     );
 
     let projected =
-        project_effective_user_config(&stack, dex_home.path()).expect("project user config");
+        policy_filtered_plugin_config(&stack, dex_home.path()).expect("project plugin config");
     assert_eq!(
         projected["marketplaces"]
             .as_table()
@@ -663,6 +715,8 @@ enabled = true
 
 #[test]
 fn blocked_or_reserved_upgrade_is_rejected_before_marketplace_installation() {
+    let reload_config: crate::ConfigLayerReload =
+        std::sync::Arc::new(|| panic!("blocked or reserved marketplace must not reload config"));
     let dex_home = TempDir::new().expect("create Dex home");
     let config_file = AbsolutePathBuf::try_from(dex_home.path().join("config.toml"))
         .expect("absolute config path");
@@ -681,7 +735,8 @@ source = "https://github.com/example/blocked.git"
         )),
     );
 
-    let outcome = upgrade_configured_git_marketplaces(dex_home.path(), &stack, Some("debug"));
+    let outcome =
+        upgrade_configured_git_marketplaces(dex_home.path(), &stack, Some("debug"), &reload_config);
 
     assert_eq!(outcome.selected_marketplaces, vec!["debug".to_string()]);
     assert_eq!(outcome.upgraded_roots, Vec::new());
@@ -704,6 +759,7 @@ source = "https://github.com/example/blocked.git"
         dex_home.path(),
         &stack,
         Some(crate::OPENAI_BUNDLED_MARKETPLACE_NAME),
+        &reload_config,
     );
     assert!(outcome.errors[0].message.contains("is reserved"));
     assert!(!marketplace_install_root(dex_home.path()).exists());

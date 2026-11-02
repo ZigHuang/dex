@@ -7,8 +7,10 @@ use dex_rmcp_client::ElicitationAction;
 use dex_rmcp_client::ElicitationResponse;
 use dex_rmcp_client::LocalStdioServerLauncher;
 use dex_rmcp_client::RmcpClient;
+use dex_rmcp_client::mcp_error;
 use dex_utils_cargo_bin::CargoBinError;
 use futures::FutureExt as _;
+use pretty_assertions::assert_eq;
 use rmcp::model::ClientCapabilities;
 use rmcp::model::ElicitationCapability;
 use rmcp::model::FormElicitationCapability;
@@ -37,8 +39,7 @@ fn init_params() -> InitializeRequestParams {
     .with_protocol_version(ProtocolVersion::V_2025_06_18)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn rmcp_client_can_list_and_read_resources() -> anyhow::Result<()> {
+async fn resource_client() -> anyhow::Result<RmcpClient> {
     let client = RmcpClient::new_stdio_client(
         stdio_server_bin()?.into(),
         Vec::<OsString>::new(),
@@ -66,6 +67,12 @@ async fn rmcp_client_can_list_and_read_resources() -> anyhow::Result<()> {
         )
         .await?;
 
+    Ok(client)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn rmcp_client_can_list_and_read_resources() -> anyhow::Result<()> {
+    let client = resource_client().await?;
     let list = client
         .list_resources(/*params*/ None, Some(Duration::from_secs(5)))
         .await?;
@@ -110,5 +117,28 @@ async fn rmcp_client_can_list_and_read_resources() -> anyhow::Result<()> {
         }
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn rmcp_client_preserves_each_resource_error() -> anyhow::Result<()> {
+    let client = resource_client().await?;
+    for uri in ["memo://dex/missing-first", "memo://dex/missing-second"] {
+        let error = client
+            .read_resource(
+                ReadResourceRequestParams::new(uri),
+                Some(Duration::from_secs(5)),
+            )
+            .await
+            .expect_err("missing resource must return a protocol error")
+            .context("resources/read failed");
+        assert_eq!(
+            mcp_error(&error),
+            Some(&rmcp::ErrorData::resource_not_found(
+                "resource_not_found",
+                Some(json!({ "uri": uri })),
+            ))
+        );
+    }
     Ok(())
 }

@@ -2,6 +2,7 @@ use dex_code_mode::ImageDetail as CodeModeImageDetail;
 use dex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use dex_protocol::models::FunctionCallOutputContentItem;
 use dex_protocol::models::ImageDetail;
+use dex_protocol::models::ImageReference;
 
 trait IntoProtocol<T> {
     fn into_protocol(self) -> T;
@@ -34,7 +35,7 @@ impl IntoProtocol<FunctionCallOutputContentItem> for dex_code_mode::FunctionCall
             }
             dex_code_mode::FunctionCallOutputContentItem::InputImage { image_url, detail } => {
                 FunctionCallOutputContentItem::InputImage {
-                    image_url,
+                    image: ImageReference::Inline { image_url },
                     detail: detail
                         .map(IntoProtocol::into_protocol)
                         .or(Some(DEFAULT_IMAGE_DETAIL)),

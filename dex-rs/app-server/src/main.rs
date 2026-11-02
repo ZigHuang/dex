@@ -1,8 +1,9 @@
+#![recursion_limit = "256"]
+
 use clap::Parser;
 use dex_app_server::AppServerCodeModeHostArgs;
 use dex_app_server::AppServerRuntimeOptions;
 use dex_app_server::AppServerTransport;
-use dex_app_server::AppServerWebsocketAuthArgs;
 use dex_app_server::PluginStartupTasks;
 use dex_app_server::run_main_with_transport_options;
 use dex_arg0::Arg0DispatchPaths;
@@ -10,7 +11,16 @@ use dex_arg0::arg0_dispatch_or_else;
 use dex_config::LoaderOverrides;
 use dex_protocol::protocol::SessionSource;
 use dex_utils_cli::CliConfigOverrides;
+use dex_websocket_auth::WebsocketAuthArgs;
 use std::path::PathBuf;
+
+#[cfg(all(
+    target_os = "linux",
+    target_env = "musl",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 // Debug-only test hook: lets integration tests point the server at a temporary
 // managed config file without writing to /etc.
@@ -20,6 +30,9 @@ const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "DEX_APP_SERVER_DISABLE_MANAGED_CON
 #[derive(Debug, Parser)]
 #[command(version)]
 struct AppServerArgs {
+    /// Load frozen cloud skills from a JSON snapshot instead of a live skill service.
+    #[arg(long, value_name = "PATH")]
+    cloud_skills_snapshot: Option<PathBuf>,
     #[command(flatten)]
     config_overrides: CliConfigOverrides,
 
@@ -45,7 +58,7 @@ struct AppServerArgs {
     session_source: SessionSource,
 
     #[command(flatten)]
-    auth: AppServerWebsocketAuthArgs,
+    auth: WebsocketAuthArgs,
 
     /// Fail if config.toml contains unknown configuration fields.
     #[arg(long = "strict-config", default_value_t = false)]
@@ -60,12 +73,17 @@ struct AppServerArgs {
     /// Enable remote control for this app-server process without changing persistence.
     #[arg(long = "remote-control", hide = true)]
     remote_control: bool,
+
+    /// Save loaded threads during managed daemon shutdown.
+    #[arg(long, hide = true)]
+    managed_daemon: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let remote_control_disabled = dex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
         let AppServerArgs {
+            cloud_skills_snapshot,
             config_overrides,
             code_mode_host,
             listen,
@@ -75,6 +93,7 @@ fn main() -> anyhow::Result<()> {
             #[cfg(debug_assertions)]
             disable_plugin_startup_tasks_for_tests,
             remote_control,
+            managed_daemon,
         } = AppServerArgs::parse();
         let loader_overrides = if disable_managed_config_from_debug_env() {
             LoaderOverrides::without_managed_config_for_tests()
@@ -86,7 +105,9 @@ fn main() -> anyhow::Result<()> {
         let transport = listen;
         let auth = auth.try_into_settings()?;
         let mut runtime_options = AppServerRuntimeOptions {
+            cloud_skills_snapshot,
             code_mode_host_transport: code_mode_host.into(),
+            managed_daemon,
             ..Default::default()
         };
         #[cfg(debug_assertions)]
@@ -100,7 +121,7 @@ fn main() -> anyhow::Result<()> {
                 (false, false) => dex_app_server::RemoteControlStartupMode::ResolvePersisted,
             };
 
-        run_main_with_transport_options(
+        let exit = run_main_with_transport_options(
             arg0_paths,
             config_overrides,
             loader_overrides,
@@ -112,6 +133,10 @@ fn main() -> anyhow::Result<()> {
             runtime_options,
         )
         .await?;
+        if exit == dex_app_server::AppServerExit::Forced {
+            // Runtime teardown can wait forever for blocked rollout I/O.
+            std::process::exit(0);
+        }
         Ok(())
     })
 }

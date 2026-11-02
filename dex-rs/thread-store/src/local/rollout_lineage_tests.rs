@@ -15,6 +15,37 @@ use super::super::LocalThreadStore;
 use super::super::test_support::test_config;
 use super::RolloutLineageSegment;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn rejects_reference_lineage_escaping_symlinked_sessions_root() {
+    let home = TempDir::new().expect("temp dir");
+    let external = TempDir::new().expect("external temp dir");
+    let external_sessions = external.path().join("sessions");
+    fs::create_dir_all(external_sessions.as_path()).expect("create external sessions");
+    std::os::unix::fs::symlink(external_sessions.as_path(), home.path().join("sessions"))
+        .expect("symlink sessions");
+    let escaped = TempDir::new().expect("escaped temp dir");
+    let escaped_rollouts = escaped.path().join("rollouts");
+    fs::create_dir_all(escaped_rollouts.as_path()).expect("create escaped rollouts");
+    std::os::unix::fs::symlink(escaped_rollouts.as_path(), external_sessions.join("2026"))
+        .expect("symlink nested sessions directory");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let thread_id = ThreadId::default();
+    write_rollout(
+        home.path(),
+        thread_id,
+        /*history_base*/ None,
+        /*next_ordinal*/ 3,
+    );
+
+    let error = store
+        .resolve_rollout_lineage_for_reference(thread_id)
+        .await
+        .expect_err("escaping reference lineage should be rejected");
+
+    assert!(error.to_string().contains("must be in Dex home"));
+}
+
 #[tokio::test]
 async fn resolves_nested_lineage_with_empty_intermediate_segments() {
     let home = TempDir::new().expect("temp dir");
@@ -43,7 +74,7 @@ async fn resolves_nested_lineage_with_empty_intermediate_segments() {
     );
 
     let lineage = store
-        .resolve_rollout_lineage(child)
+        .resolve_rollout_lineage(child, /*initial_path*/ None)
         .await
         .expect("resolve nested lineage");
 
@@ -96,7 +127,7 @@ async fn resolves_archived_ancestors() {
     );
 
     let lineage = store
-        .resolve_rollout_lineage(child)
+        .resolve_rollout_lineage(child, /*initial_path*/ None)
         .await
         .expect("resolve archived ancestor");
 
@@ -124,7 +155,7 @@ async fn resolves_lineage_at_explicit_history_position() {
     );
 
     let lineage = store
-        .resolve_rollout_lineage(child)
+        .resolve_rollout_lineage(child, /*initial_path*/ None)
         .await
         .expect("resolve child lineage")
         .truncate_at(end)
@@ -215,7 +246,7 @@ async fn rejects_missing_cycles_and_out_of_bounds_offsets() {
 
 async fn assert_invalid_lineage(store: &LocalThreadStore, thread_id: ThreadId, detail: &str) {
     let err = store
-        .resolve_rollout_lineage(thread_id)
+        .resolve_rollout_lineage(thread_id, /*initial_path*/ None)
         .await
         .expect_err("lineage should be invalid");
     assert!(err.to_string().contains(detail), "{err}");
@@ -246,7 +277,7 @@ fn write_rollout_under(
     let initial_ordinal = history_base.map_or(0, |base| base.end_ordinal_exclusive);
     let mut lines = vec![rollout_line(
         initial_ordinal,
-        RolloutItem::SessionMeta(SessionMetaLine {
+        RolloutItem::SessionMeta(Box::new(SessionMetaLine {
             meta: SessionMeta {
                 session_id: thread_id.into(),
                 id: thread_id,
@@ -255,7 +286,7 @@ fn write_rollout_under(
                 ..SessionMeta::default()
             },
             git: None,
-        }),
+        })),
     )];
     for offset in 1..next_ordinal {
         let ordinal = initial_ordinal
@@ -296,7 +327,7 @@ fn rollout_end_byte_offset(path: &Path, end_ordinal_exclusive: u64) -> u64 {
     let end_byte_offset = bytes
         .split_inclusive(|byte| *byte == b'\n')
         .take_while(|line| {
-            serde_json::from_slice::<RolloutLine>(line)
+            dex_rollout::parse_rollout_line_bytes(line)
                 .expect("parse rollout fixture")
                 .ordinal
                 .expect("paginated rollout ordinal")

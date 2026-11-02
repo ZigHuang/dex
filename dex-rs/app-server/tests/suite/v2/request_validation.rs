@@ -14,6 +14,7 @@ use dex_app_server_protocol::ThreadStartResponse;
 use dex_protocol::models::FunctionCallOutputContentItem;
 use dex_protocol::models::FunctionCallOutputPayload;
 use dex_protocol::models::ImageDetail;
+use dex_protocol::models::ImageReference;
 use dex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -173,7 +174,9 @@ async fn request_handlers_reject_remote_image_urls() -> Result<()> {
         namespace: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::InputImage {
-                image_url: "https://example.com/tool.png".to_string(),
+                image: ImageReference::Inline {
+                    image_url: "https://example.com/tool.png".to_string(),
+                },
                 detail: Some(ImageDetail::High),
             },
         ]),

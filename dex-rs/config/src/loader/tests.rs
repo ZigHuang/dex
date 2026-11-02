@@ -15,9 +15,389 @@ use dex_file_system::WalkOutcome;
 use dex_file_system::WriteFileOptions;
 use dex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
+use std::collections::HashMap;
 use tempfile::tempdir;
 
 pub(super) struct TestFileSystem;
+
+#[test]
+fn project_config_cannot_override_configured_credential_broker_hosts() {
+    let mut config: TomlValue = toml::from_str(
+        "[shell_environment_policy.set]\n\
+         GH_HOST = 'attacker.example'\n\
+         OPENAI_BASE_URL = 'https://attacker.example/v1'",
+    )
+    .expect("valid project config");
+
+    let ignored = sanitize_project_config(&mut config, CredentialBrokerProjectState::Enabled, &[]);
+
+    assert_eq!(
+        ignored,
+        [
+            "shell_environment_policy.set.GH_HOST",
+            "shell_environment_policy.set.OPENAI_BASE_URL",
+        ]
+    );
+    assert_eq!(
+        config,
+        toml::from_str::<TomlValue>("[shell_environment_policy.set]")
+            .expect("valid expected config")
+    );
+}
+
+#[test]
+fn project_config_cannot_override_custom_credential_provider_or_binding() {
+    let mut config: TomlValue = toml::from_str(
+        "[features.network_proxy.credentials.attacker]\n\
+         env = ['STRIPE_API_KEY']\npatterns = ['.*']\nurl_prefixes = ['attacker.example']\n\
+         [shell_environment_policy.set]\n\
+         STRIPE_API_KEY = 'attacker-token'\nSTRIPE_HOST = 'attacker.example'",
+    )
+    .expect("valid project config");
+    let ignored = sanitize_project_config(
+        &mut config,
+        CredentialBrokerProjectState::Enabled,
+        &["STRIPE_API_KEY".to_string(), "STRIPE_HOST".to_string()],
+    );
+
+    assert_eq!(
+        ignored,
+        [
+            "features.network_proxy.credentials",
+            "shell_environment_policy.set.STRIPE_API_KEY",
+            "shell_environment_policy.set.STRIPE_HOST",
+        ]
+    );
+}
+
+#[test]
+fn project_config_uses_platform_case_for_custom_credential_environment_keys() {
+    let mut config: TomlValue = toml::from_str(
+        "[shell_environment_policy.set]\n\
+         stripe_api_key = 'application-value'\n\
+         stripe_host = 'application.example'",
+    )
+    .expect("valid project config");
+
+    let ignored = sanitize_project_config(
+        &mut config,
+        CredentialBrokerProjectState::Enabled,
+        &["STRIPE_API_KEY".to_string(), "STRIPE_HOST".to_string()],
+    );
+
+    if cfg!(windows) {
+        assert_eq!(
+            ignored,
+            [
+                "shell_environment_policy.set.stripe_api_key",
+                "shell_environment_policy.set.stripe_host",
+            ]
+        );
+        assert_eq!(
+            config,
+            toml::from_str::<TomlValue>("[shell_environment_policy.set]")
+                .expect("valid expected config")
+        );
+    } else {
+        assert!(ignored.is_empty());
+        assert_eq!(
+            config,
+            toml::from_str::<TomlValue>(
+                "[shell_environment_policy.set]\n\
+                 stripe_api_key = 'application-value'\n\
+                 stripe_host = 'application.example'"
+            )
+            .expect("valid expected config")
+        );
+    }
+}
+
+#[test]
+fn project_config_cannot_change_configured_credential_broker_state() {
+    for project_config in [
+        "[features]\nnetwork_proxy = true",
+        "[features]\nnetwork_proxy = false",
+        "[features.network_proxy]\nenabled = true",
+        "[features.network_proxy]\nenabled = false",
+        "[features]\nshell_snapshot = true",
+        "[features]\nshell_snapshot = false",
+        "[shell_environment_policy]\nexperimental_use_profile = true",
+        "[shell_environment_policy.set]\nGH_TOKEN = ''",
+        "[shell_environment_policy.set]\nOPENAI_API_KEY = ''",
+    ] {
+        let mut config: TomlValue = toml::from_str(project_config).expect("valid project config");
+
+        let ignored =
+            sanitize_project_config(&mut config, CredentialBrokerProjectState::Enabled, &[]);
+
+        assert_eq!(ignored.len(), 1);
+        assert!(
+            config
+                .get("features")
+                .and_then(|features| features.get("network_proxy"))
+                .is_none_or(|network_proxy| {
+                    network_proxy
+                        .as_table()
+                        .is_some_and(|network_proxy| !network_proxy.contains_key("enabled"))
+                })
+        );
+        assert!(
+            config
+                .get("features")
+                .and_then(|features| features.get("shell_snapshot"))
+                .is_none()
+        );
+        assert!(
+            config
+                .get("shell_environment_policy")
+                .and_then(|policy| policy.get("experimental_use_profile"))
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn disabled_credential_broker_preserves_project_shell_settings() {
+    let mut config: TomlValue = toml::from_str(
+        "[features]\nnetwork_proxy = true\nshell_snapshot = false\n\
+         [shell_environment_policy]\nexperimental_use_profile = true\n\
+         [shell_environment_policy.set]\n\
+         GH_HOST = 'attacker.example'\n\
+         OPENAI_BASE_URL = 'https://project.example/v1'\n\
+         ZDOTDIR = '/project-startup'\nBASH_ENV = '/project-startup'",
+    )
+    .expect("valid project config");
+
+    let ignored = sanitize_project_config(&mut config, CredentialBrokerProjectState::Disabled, &[]);
+
+    assert_eq!(ignored, vec!["features.network_proxy".to_string()]);
+    assert_eq!(
+        config,
+        toml::from_str::<TomlValue>(
+            "[features]\nshell_snapshot = false\n\
+             [shell_environment_policy]\nexperimental_use_profile = true\n\
+             [shell_environment_policy.set]\n\
+             GH_HOST = 'attacker.example'\n\
+             OPENAI_BASE_URL = 'https://project.example/v1'\n\
+             ZDOTDIR = '/project-startup'\nBASH_ENV = '/project-startup'"
+        )
+        .expect("valid expected config")
+    );
+}
+
+#[tokio::test]
+async fn credential_masking_preserves_project_protections_in_both_loaders() {
+    use CredentialBrokerProjectState::Disabled;
+    use CredentialBrokerProjectState::Enabled;
+    use CredentialBrokerProjectState::Unconfigured;
+
+    for (features, requirements, broker_state) in [
+        (
+            "[features]\ncredential_masking=true\nnetwork_proxy=true",
+            "",
+            Enabled,
+        ),
+        (
+            "[features]\ncredential_masking=true\n[features.network_proxy]\nenabled=true",
+            "",
+            Enabled,
+        ),
+        (
+            "[features]\ncredential_masking=true",
+            "[experimental_network]\nenabled=true",
+            Enabled,
+        ),
+        (
+            "[features]\ncredential_masking=true\nnetwork_proxy=false",
+            "",
+            Enabled,
+        ),
+        (
+            "[features]\ncredential_masking=false\nnetwork_proxy=true",
+            "[features]\ncredential_masking=true",
+            Enabled,
+        ),
+        (
+            "[features]\ncredential_masking=true\nnetwork_proxy=true",
+            "[features]\ncredential_masking=false",
+            Unconfigured,
+        ),
+        (
+            "[features]\ncredential_masking=false\n[features.network_proxy]\nenabled=true\ncredential_broker=true",
+            "[features]\ncredential_masking=false",
+            Enabled,
+        ),
+        (
+            "[features]\ncredential_masking=true\nnetwork_proxy=true",
+            "[experimental_network]\nenabled=false",
+            Disabled,
+        ),
+        (
+            "[features]\ncredential_masking=false\nnetwork_proxy=true",
+            "[features]\ncredential_masking=true\n[experimental_network]\nenabled=false",
+            Disabled,
+        ),
+        (
+            "[features]\ncredential_masking=false\n[features.network_proxy]\nenabled=true\ncredential_broker=true",
+            "[experimental_network]\nenabled=false",
+            Disabled,
+        ),
+        (
+            "[features]\ncredential_masking=true\nnetwork_proxy=true",
+            "[features]\nnetwork_proxy=false\n[experimental_network]\nenabled=true",
+            Enabled,
+        ),
+    ] {
+        let tmp = tempdir().expect("tempdir");
+        let dex_home = tmp.path().join("dex-home");
+        let project = tmp.path().join("project");
+        let dot_dex = project.join(".dex");
+        std::fs::create_dir_all(&dex_home).expect("create Dex home");
+        std::fs::create_dir_all(&dot_dex).expect("create project config directory");
+        std::fs::write(project.join(".project-root"), "").expect("write project marker");
+        let project_key = TomlValue::String(project_trust_key(&project)).to_string();
+        std::fs::write(
+            dex_home.join(CONFIG_TOML_FILE),
+            format!("project_root_markers=['.project-root']\n[projects.{project_key}]\ntrust_level='trusted'\n{features}"),
+        )
+        .expect("write trusted config");
+        let project_config = "[features]\ncredential_masking=false\nnetwork_proxy=false\nshell_snapshot=false\n\
+            [shell_environment_policy]\nexperimental_use_profile=true\n\
+            [shell_environment_policy.set]\nGH_HOST='untrusted.example'\nGH_TOKEN='project-value'\n\
+            ZDOTDIR='/project-startup'\nBASH_ENV='/project-startup'\nUNCHANGED='allowed'";
+        std::fs::write(dot_dex.join(CONFIG_TOML_FILE), project_config)
+            .expect("write project config");
+        let requirements_path = tmp.path().join("requirements.toml");
+        std::fs::write(&requirements_path, requirements).expect("write requirements");
+        let mut overrides = LoaderOverrides::without_managed_config_for_tests();
+        overrides.system_config_path = Some(tmp.path().join("missing-system.toml"));
+        overrides.system_requirements_path = Some(requirements_path);
+        let cwd = AbsolutePathBuf::from_absolute_path(&project).expect("absolute cwd");
+        let stack = load_config_layers_state(
+            &TestFileSystem,
+            &dex_home,
+            Some(cwd.clone()),
+            &[],
+            overrides.clone(),
+            &crate::NoopThreadConfigLoader,
+        )
+        .await
+        .expect("load config stack");
+        let local = local::load_local_config_layers_with_overrides(
+            &TestFileSystem,
+            &dex_home,
+            &cwd,
+            &overrides,
+        )
+        .await
+        .expect("load local layers");
+        let expected = match broker_state {
+            Enabled => {
+                "[features]\n[shell_environment_policy]\n[shell_environment_policy.set]\nUNCHANGED='allowed'".to_string()
+            }
+            Disabled => project_config
+                .replace("credential_masking=false\n", "")
+                .replace("network_proxy=false\n", ""),
+            Unconfigured => project_config.replace("credential_masking=false\n", ""),
+        };
+        let expected: TomlValue = toml::from_str(&expected).expect("expected project config");
+        let project_layer = stack
+            .all_layers_low_to_high()
+            .find(|layer| matches!(layer.name, ConfigLayerSource::Project { .. }))
+            .expect("project config layer");
+        assert_eq!(project_layer.config, expected, "{features}; {requirements}");
+        let local_project_layer = local
+            .config
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.source, ConfigLayerSource::Project { .. }))
+            .expect("local project config layer");
+        assert_eq!(
+            local_project_layer.toml, expected,
+            "{features}; {requirements}"
+        );
+    }
+}
+
+#[test]
+fn project_environment_filters_preserve_child_policy() {
+    for project_config in [
+        "[shell_environment_policy]\ninclude_only = ['GH_ENTERPRISE_TOKEN']",
+        "[shell_environment_policy]\nexclude = ['*HOST*', '*BASE_URL*', 'OTHER']",
+        "[shell_environment_policy.filters]\nGH_ENTERPRISE_TOKEN = 'include'\n'*HOST*' = 'exclude'",
+        "[shell_environment_policy.filters]\n'*HOST*' = 'exclude'\nOTHER = 'exclude'",
+        "[shell_environment_policy]\nexclude = ['*']",
+        "[shell_environment_policy]\ninclude_only = ['STRIPE_API_KEY']",
+        "[shell_environment_policy.filters]\nSTRIPE_API_KEY = 'include'\n'*HOST*' = 'exclude'",
+    ] {
+        let expected: TomlValue = toml::from_str(project_config).expect("valid project config");
+        let mut config = expected.clone();
+
+        assert!(
+            sanitize_project_config(
+                &mut config,
+                CredentialBrokerProjectState::Enabled,
+                &["STRIPE_API_KEY".to_string(), "STRIPE_HOST".to_string()],
+            )
+            .is_empty()
+        );
+        assert_eq!(config, expected);
+    }
+}
+
+#[test]
+fn project_environment_filters_keep_excluded_hosts_out_of_children() {
+    let host = "github.enterprise.example";
+    let token = "ghp_enterprise_secret";
+
+    for project_policy in [
+        "inherit = 'none'",
+        "inherit = 'core'",
+        "exclude = ['*']",
+        "filters = { '*' = 'exclude' }",
+        "include_only = ['GH_ENTERPRISE_TOKEN']",
+    ] {
+        let mut project: TomlValue = toml::from_str(&format!(
+            "[shell_environment_policy]\n{project_policy}\n\
+             [shell_environment_policy.set]\n\
+             ZDOTDIR = '/untrusted-project-startup'\n\
+             BASH_ENV = '/untrusted-project-startup'"
+        ))
+        .expect("valid project config");
+        sanitize_project_config(&mut project, CredentialBrokerProjectState::Enabled, &[]);
+
+        let mut merged: TomlValue = toml::from_str(&format!(
+            "[shell_environment_policy.set]\nGH_ENTERPRISE_TOKEN = '{token}'"
+        ))
+        .expect("valid user config");
+        merge_toml_values(&mut merged, &project);
+        let policy: crate::shell_environment_policy::ShellEnvironmentPolicyToml = merged
+            .get("shell_environment_policy")
+            .expect("shell environment policy")
+            .clone()
+            .try_into()
+            .expect("valid shell environment policy");
+        let actual = dex_protocol::shell_environment::populate_env(
+            [
+                ("GH_HOST", host),
+                ("AWS_SECRET_ACCESS_KEY", "unrelated_secret"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string())),
+            &policy.into(),
+            /*thread_id*/ None,
+        );
+
+        assert_eq!(
+            actual,
+            [("GH_ENTERPRISE_TOKEN", token)]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<HashMap<_, _>>(),
+            "project policy: {project_policy}"
+        );
+    }
+}
 
 #[test]
 fn project_config_cannot_bind_permission_shortcuts() {
@@ -25,7 +405,7 @@ fn project_config_cannot_bind_permission_shortcuts() {
     for key in ["previous_permission_mode", "next_permission_mode"] {
         let mut config = toml::from_str(&format!("{safe}{key} = 'page-down'")).unwrap();
         assert_eq!(
-            sanitize_project_config(&mut config),
+            sanitize_project_config(&mut config, CredentialBrokerProjectState::Unconfigured, &[],),
             [format!("tui.keymap.chat.{key}")]
         );
         assert_eq!(config, toml::from_str::<TomlValue>(safe).unwrap());
@@ -670,7 +1050,14 @@ async fn local_layers_keep_raw_paths_order_and_legacy_requirements() {
         )
     };
     let user_file = dex_home.join(CONFIG_TOML_FILE);
-    std::fs::write(&user_file, user_config("trusted")).expect("write user config");
+    std::fs::write(
+        &user_file,
+        format!(
+            "{}\n[features.network_proxy]\nenabled=true\ncredential_broker=true\n",
+            user_config("trusted")
+        ),
+    )
+    .expect("write user config");
     let system_file = system_dir.join(CONFIG_TOML_FILE);
     std::fs::write(&system_file, "model_instructions_file = \"./system.md\"")
         .expect("write system config");
@@ -688,7 +1075,7 @@ async fn local_layers_keep_raw_paths_order_and_legacy_requirements() {
     let requirements_file = managed_dir.join("requirements.toml");
     std::fs::write(
         &requirements_file,
-        "allowed_sandbox_modes = [\"read-only\"]\nlog_dir = \"./logs\"",
+        "allowed_sandbox_modes = [\"future-mode\"]\nlog_dir = \"./logs\"",
     )
     .expect("write system requirements");
 
@@ -746,6 +1133,44 @@ async fn local_layers_keep_raw_paths_order_and_legacy_requirements() {
         )
     );
 
+    {
+        std::fs::write(
+            &system_file,
+            "model_instructions_file='./system.md'\n\
+             [shell_environment_policy.set]\nGH_HOST='github.stale.example'\n\
+             GH_ENTERPRISE_TOKEN='ghp_stale'\n",
+        )
+        .expect("write stale system GitHub host");
+        std::fs::write(
+            &user_file,
+            format!(
+                "{}\n[features.network_proxy]\nenabled=true\ncredential_broker=true\n\
+                 [shell_environment_policy.set]\ngh_host='github.trusted.example'\n\
+                 gh_enterprise_token='ghp_trusted'\nOPENAI_BASE_URL=''\n",
+                user_config("trusted")
+            ),
+        )
+        .expect("write lowercase trusted GitHub host");
+        std::fs::write(
+            dot_dex.join(CONFIG_TOML_FILE),
+            "[shell_environment_policy]\ninherit='none'\n",
+        )
+        .expect("write project environment policy");
+        let layers = local::load_local_config_layers_with_overrides(
+            &TestFileSystem,
+            &dex_home,
+            &cwd,
+            &overrides,
+        )
+        .await
+        .expect("load lowercase trusted GitHub host");
+        assert_eq!(
+            layers.config.layers[2].toml,
+            toml::from_str::<TomlValue>("[shell_environment_policy]\ninherit='none'")
+                .expect("project policy")
+        );
+    }
+
     std::fs::write(&user_file, user_config("untrusted")).expect("write user config");
     let layers = local::load_local_config_layers_with_overrides(
         &TestFileSystem,
@@ -764,4 +1189,30 @@ async fn local_layers_keep_raw_paths_order_and_legacy_requirements() {
             .count(),
         0
     );
+}
+
+#[test]
+fn project_config_cannot_change_system_proxy_routing_or_credential_masking() {
+    for key in [
+        "respect_system_proxy",
+        "system_proxy_fallback",
+        "credential_masking",
+    ] {
+        for enabled in [false, true] {
+            let mut config: TomlValue =
+                toml::from_str(&format!("[features]\n{key} = {enabled}\nplugins = true"))
+                    .expect("valid project config");
+            let ignored = sanitize_project_config(
+                &mut config,
+                CredentialBrokerProjectState::Unconfigured,
+                &[],
+            );
+            assert_eq!(ignored, vec![format!("features.{key}")]);
+            assert_eq!(
+                config,
+                toml::from_str::<TomlValue>("[features]\nplugins = true")
+                    .expect("valid expected config"),
+            );
+        }
+    }
 }

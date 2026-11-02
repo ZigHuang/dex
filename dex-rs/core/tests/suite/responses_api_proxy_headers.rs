@@ -14,7 +14,7 @@ use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_dex::TestDex;
-use core_test_support::test_dex::local_selections;
+use core_test_support::test_dex::local_requests;
 use core_test_support::test_dex::test_dex;
 use core_test_support::test_dex::turn_permission_fields;
 use dex_core::TurnInputRequest;
@@ -167,7 +167,7 @@ async fn submit_turn_with_timeout(test: &TestDex, prompt: &str) -> Result<()> {
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd)),
+                environments: Some(local_requests(cwd)),
                 approval_policy: Some(AskForApproval::OnRequest),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,

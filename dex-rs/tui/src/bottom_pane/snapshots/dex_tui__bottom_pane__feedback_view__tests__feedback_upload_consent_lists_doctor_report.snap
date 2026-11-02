@@ -7,6 +7,7 @@ Upload logs?
 
 The following files will be sent:
   • dex-logs.log
+  • client-logs.txt (if available)
   • dex-doctor-report.json
   • dex-apps-tools-cache.json (if available)
   • dex-app-directory-cache.json (if available)

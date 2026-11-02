@@ -6,6 +6,8 @@ use core_test_support::skip_if_no_network;
 use dex_app_server_protocol::ClientRequest;
 use dex_app_server_protocol::DexErrorInfo;
 use dex_app_server_protocol::ErrorNotification;
+use dex_app_server_protocol::MisalignmentErrorDetails;
+use dex_app_server_protocol::MisalignmentSteer;
 use dex_app_server_protocol::ThreadStartParams;
 use dex_app_server_protocol::ThreadStartResponse;
 use dex_app_server_protocol::TurnCompletedNotification;
@@ -20,6 +22,9 @@ use tokio::time::timeout;
 use wiremock::ResponseTemplate;
 
 const MESSAGE: &str = "This request violated the misalignment policy.";
+const EXPLANATION: &str = "The agent attempted to transfer your files externally.";
+const STEER: &str = "Continue without transferring the user's files externally.";
+const REVIEW_TARGET: &str = "RB._~:-opaque";
 
 #[tokio::test]
 async fn streamed_policy_violation_completes_turn_with_typed_terminal_error() -> Result<()> {
@@ -41,7 +46,10 @@ async fn streamed_policy_violation_completes_turn_with_typed_terminal_error() ->
         }),
     ]));
 
-    assert_policy_violation_completes_turn_with_typed_terminal_error(response).await
+    assert_policy_violation_completes_turn_with_typed_terminal_error(
+        response, /*expected_misalignment*/ None,
+    )
+    .await
 }
 
 #[tokio::test]
@@ -56,7 +64,10 @@ async fn http_400_policy_violation_completes_turn_with_typed_terminal_error() ->
         }
     }));
 
-    assert_policy_violation_completes_turn_with_typed_terminal_error(response).await
+    assert_policy_violation_completes_turn_with_typed_terminal_error(
+        response, /*expected_misalignment*/ None,
+    )
+    .await
 }
 
 #[tokio::test]
@@ -71,11 +82,103 @@ async fn http_403_policy_violation_completes_turn_with_typed_terminal_error() ->
         }
     }));
 
-    assert_policy_violation_completes_turn_with_typed_terminal_error(response).await
+    assert_policy_violation_completes_turn_with_typed_terminal_error(
+        response, /*expected_misalignment*/ None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn streamed_policy_violation_exposes_resumable_misalignment_details() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let response = responses::sse_response(responses::sse(vec![
+        responses::ev_response_created("resp-misalignment"),
+        serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp-misalignment",
+                "status": "failed",
+                "error": {
+                    "code": "misalignment_policy_violation",
+                    "message": MESSAGE,
+                    "misalignment": {
+                        "error_type": "unauthorized_data_transfer",
+                        "detailed_explanation": EXPLANATION,
+                        "review_target": REVIEW_TARGET,
+                        "steer": { "message": STEER }
+                    }
+                }
+            }
+        }),
+    ]));
+
+    assert_policy_violation_completes_turn_with_typed_terminal_error(
+        response,
+        Some(resumable_misalignment()),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn http_403_policy_violation_exposes_resumable_misalignment_details() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let response = ResponseTemplate::new(403).set_body_json(serde_json::json!({
+        "error": {
+            "code": "misalignment_policy_violation",
+            "message": MESSAGE,
+            "misalignment": {
+                "error_type": "unauthorized_data_transfer",
+                "detailed_explanation": EXPLANATION,
+                "review_target": REVIEW_TARGET,
+                "steer": { "message": STEER }
+            }
+        }
+    }));
+
+    assert_policy_violation_completes_turn_with_typed_terminal_error(
+        response,
+        Some(resumable_misalignment()),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn classification_only_policy_violation_preserves_the_terminal_error() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let response = responses::sse_response(responses::sse(vec![
+        responses::ev_response_created("resp-misalignment"),
+        serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp-misalignment",
+                "status": "failed",
+                "error": {
+                    "code": "misalignment_policy_violation",
+                    "message": MESSAGE,
+                    "misalignment": { "error_type": "unsafe_activity" }
+                }
+            }
+        }),
+    ]));
+
+    assert_policy_violation_completes_turn_with_typed_terminal_error(
+        response,
+        Some(MisalignmentErrorDetails {
+            error_type: Some("unsafe_activity".to_string()),
+            review_target: None,
+            detailed_explanation: None,
+            steer: None,
+        }),
+    )
+    .await
 }
 
 async fn assert_policy_violation_completes_turn_with_typed_terminal_error(
     response: ResponseTemplate,
+    expected_misalignment: Option<MisalignmentErrorDetails>,
 ) -> Result<()> {
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_response_once(&server, response).await;
@@ -117,6 +220,7 @@ async fn assert_policy_violation_completes_turn_with_typed_terminal_error(
         error,
         ErrorNotification {
             error: TurnError {
+                misalignment: expected_misalignment.clone(),
                 message: MESSAGE.to_string(),
                 dex_error_info: Some(DexErrorInfo::MisalignmentPolicyViolation),
                 additional_details: None,
@@ -138,6 +242,7 @@ async fn assert_policy_violation_completes_turn_with_typed_terminal_error(
     assert_eq!(
         completed.turn.error,
         Some(TurnError {
+            misalignment: expected_misalignment,
             message: MESSAGE.to_string(),
             dex_error_info: Some(DexErrorInfo::MisalignmentPolicyViolation),
             additional_details: None,
@@ -145,5 +250,27 @@ async fn assert_policy_violation_completes_turn_with_typed_terminal_error(
     );
     response_mock.single_request();
 
+    let rollout = tokio::fs::read_to_string(
+        thread
+            .path
+            .as_ref()
+            .expect("non-ephemeral thread should have a rollout path"),
+    )
+    .await?;
+    assert!(!rollout.contains(EXPLANATION));
+    assert!(!rollout.contains(STEER));
+    assert!(!rollout.contains(REVIEW_TARGET));
+
     Ok(())
+}
+
+fn resumable_misalignment() -> MisalignmentErrorDetails {
+    MisalignmentErrorDetails {
+        error_type: Some("unauthorized_data_transfer".to_string()),
+        review_target: Some(REVIEW_TARGET.to_string()),
+        detailed_explanation: Some(EXPLANATION.to_string()),
+        steer: Some(MisalignmentSteer {
+            message: STEER.to_string(),
+        }),
+    }
 }

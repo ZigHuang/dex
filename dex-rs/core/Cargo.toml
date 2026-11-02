@@ -8,27 +8,25 @@ version.workspace = true
 name = "dex_core"
 path = "src/lib.rs"
 
-[[bin]]
-name = "dex-write-config-schema"
-path = "src/bin/config_schema.rs"
-
 [lints]
 workspace = true
 
 [dependencies]
+dex-utils-process = { workspace = true }
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-channel = { workspace = true }
 base64 = { workspace = true }
 bm25 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
-clap = { workspace = true, features = ["derive"] }
 dex-analytics = { workspace = true }
 dex-agent-graph-store = { workspace = true }
+dex-agent-roles = { workspace = true }
 dex-api = { workspace = true }
 dex-app-server-protocol = { workspace = true }
 dex-apply-patch = { workspace = true }
 dex-async-utils = { workspace = true }
+dex-attachment-store = { workspace = true }
 dex-client = { workspace = true }
 dex-code-mode = { workspace = true }
 dex-connectors = { workspace = true }
@@ -36,6 +34,7 @@ dex-context-fragments = { workspace = true }
 dex-config = { workspace = true }
 dex-core-plugins = { workspace = true }
 dex-diagnostics = { workspace = true }
+dex-direct-tool-timing = { workspace = true }
 dex-exec-server = { workspace = true }
 dex-extension-api = { workspace = true }
 dex-extension-items = { workspace = true }
@@ -50,6 +49,8 @@ dex-models-manager = { workspace = true }
 dex-shell-command = { workspace = true }
 dex-execpolicy = { workspace = true }
 dex-git-utils = { workspace = true }
+dex-guardian-context = { workspace = true }
+dex-guardian-reviewer = { workspace = true }
 dex-history = { workspace = true }
 dex-hooks = { workspace = true }
 dex-http-client = { workspace = true }
@@ -63,17 +64,24 @@ dex-response-debug-context = { workspace = true }
 dex-prompts = { workspace = true }
 dex-rollout = { workspace = true }
 dex-rollout-trace = { workspace = true }
+dex-runtime-agent-instance = { workspace = true }
 dex-rmcp-client = { workspace = true }
 dex-sandboxing = { workspace = true }
 dex-skills = { workspace = true }
 dex-skills-extension = { workspace = true }
 dex-state = { workspace = true }
+dex-agent-message-board-extension = { workspace = true }
+dex-message-board = { workspace = true }
+dex-agent-message-board-client = { workspace = true }
 dex-terminal-detection = { workspace = true }
 dex-thread-store = { workspace = true }
 dex-tools = { workspace = true }
 dex-utils-absolute-path = { workspace = true }
 dex-utils-audio = { workspace = true }
 dex-utils-cache = { workspace = true }
+dex-utils-critical-path = { workspace = true }
+dex-utils-git-discovery = { workspace = true }
+dex-utils-head-tail-buffer = { workspace = true }
 dex-utils-image = { workspace = true }
 dex-utils-home-dir = { workspace = true }
 dex-utils-output-truncation = { workspace = true }
@@ -89,6 +97,7 @@ dunce = { workspace = true }
 eventsource-stream = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
+hyper-util = { workspace = true }
 iana-time-zone = { workspace = true }
 image = { workspace = true, features = ["jpeg", "png", "webp"] }
 indexmap = { workspace = true }
@@ -120,6 +129,8 @@ tokio-util = { workspace = true, features = ["rt"] }
 tokio-tungstenite = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
+tonic = { workspace = true }
+tower = { version = "0.5.3", features = ["util"] }
 tracing = { workspace = true, features = ["log"] }
 url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4", "v5", "v7"] }
@@ -134,20 +145,20 @@ openssl-sys = { workspace = true, features = ["vendored"] }
 [target.aarch64-unknown-linux-musl.dependencies]
 openssl-sys = { workspace = true, features = ["vendored"] }
 
-[target.'cfg(unix)'.dependencies]
-dex-shell-escalation = { workspace = true }
-
 [dev-dependencies]
 assert_cmd = { workspace = true }
 assert_matches = { workspace = true }
 dex-exec-server-test-support = { workspace = true }
 dex-image-generation-extension = { workspace = true }
 dex-home = { workspace = true }
+dex-mcp-extension = { workspace = true }
 dex-otel = { workspace = true }
+dex-protocol-test-support = { workspace = true }
 dex-test-binary-support = { workspace = true }
 dex-utils-cargo-bin = { workspace = true }
 dex-utils-redacted-string = { workspace = true }
 dex-web-search-extension = { workspace = true }
+dex-windows-sandbox-test-support = { workspace = true }
 core_test_support = { workspace = true }
 ctor = { workspace = true }
 insta = { workspace = true }
@@ -169,6 +180,9 @@ tracing-test = { workspace = true, features = ["no-env-filter"] }
 walkdir = { workspace = true }
 wiremock = { workspace = true }
 zstd = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [package.metadata.cargo-shear]
 ignored = ["openssl-sys"]

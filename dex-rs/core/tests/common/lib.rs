@@ -25,16 +25,19 @@ use std::path::Path;
 use std::path::PathBuf;
 
 pub mod apps_test_server;
+#[cfg(unix)]
+pub mod code_mode_host;
 pub mod context_snapshot;
+pub mod exec_server;
 pub mod hooks;
 pub mod process;
 pub mod responses;
+pub mod startup;
 pub mod streaming_sse;
 pub mod test_dex;
 pub mod test_dex_exec;
 mod test_environment;
 pub mod tracing;
-pub mod zsh_fork;
 
 pub(crate) use test_environment::TestEnvironment;
 pub use test_environment::TestTargetOs;
@@ -267,6 +270,16 @@ where
     wait_for_event_with_timeout(dex, predicate, Duration::from_secs(1)).await
 }
 
+pub async fn wait_for_successful_turn(dex: &DexThread) {
+    use dex_protocol::protocol::EventMsg;
+
+    let event = wait_for_event(dex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    assert!(
+        matches!(&event, EventMsg::TurnComplete(completed) if completed.error.is_none()),
+        "turn failed: {event:?}"
+    );
+}
+
 /// Waits for a configured MCP server to finish startup and requires it to be ready.
 pub async fn wait_for_mcp_server(dex: &DexThread, server_name: &str) -> anyhow::Result<()> {
     use dex_protocol::protocol::EventMsg;
@@ -309,7 +322,12 @@ pub async fn submit_thread_settings(
     use tokio::time::Duration;
     use tokio::time::timeout;
 
-    let submission_id = dex.submit(Op::ThreadSettings { thread_settings }).await?;
+    let submission_id = dex
+        .submit(Op::ThreadSettings {
+            thread_settings,
+            reply: None,
+        })
+        .await?;
     loop {
         let ev = timeout(Duration::from_secs(10), dex.next_event())
             .await
@@ -322,6 +340,40 @@ pub async fn submit_thread_settings(
                 other => panic!("unexpected thread settings update event: {other:?}"),
             }
         }
+    }
+}
+
+/// For sequential tests, register this contributor and wait once after every completed turn.
+/// Notifications are thread-scoped so a child or sibling cannot satisfy the wait.
+pub struct ThreadIdle;
+
+#[derive(Default)]
+struct ThreadIdleNotification(tokio::sync::Notify);
+
+impl dex_extension_api::ThreadLifecycleContributor<Config> for ThreadIdle {
+    fn on_thread_idle<'a>(
+        &'a self,
+        input: dex_extension_api::ThreadIdleInput<'a>,
+    ) -> dex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            input
+                .thread_store
+                .get_or_init(ThreadIdleNotification::default)
+                .0
+                .notify_one();
+        })
+    }
+}
+
+impl ThreadIdle {
+    pub async fn wait(thread: &DexThread) {
+        // TurnComplete is sent before active-turn cleanup. Rollback requires the later idle signal.
+        let idle = thread
+            .thread_extension_data()
+            .get_or_init(ThreadIdleNotification::default);
+        tokio::time::timeout(std::time::Duration::from_secs(10), idle.0.notified())
+            .await
+            .expect("thread should become idle after turn completion");
     }
 }
 

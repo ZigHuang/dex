@@ -8,7 +8,7 @@ use dex_config::test_support::CloudConfigBundleFixture;
 use dex_features::Feature;
 use dex_login::DexAuth;
 use dex_login::auth::BedrockApiKeyAuth;
-use dex_model_provider_info::AMAZON_BEDROCK_GPT_5_4_MODEL_ID;
+use dex_model_provider_info::AMAZON_BEDROCK_GPT_5_5_MODEL_ID;
 use dex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use dex_model_provider_info::AMAZON_BEDROCK_RUNTIME_PROVIDER_ID;
 use dex_model_provider_info::ModelProviderInfo;
@@ -106,8 +106,8 @@ async fn amazon_bedrock_web_search_uses_text_only_hosted_tools() {
         });
         let mut builder = test_dex().with_auth(auth);
         builder = match model_catalog {
-            ModelCatalog::BuiltIn => builder.with_model(AMAZON_BEDROCK_GPT_5_4_MODEL_ID),
-            ModelCatalog::Configured => builder.with_model_info_override("gpt-5.4", |model_info| {
+            ModelCatalog::BuiltIn => builder.with_model(AMAZON_BEDROCK_GPT_5_5_MODEL_ID),
+            ModelCatalog::Configured => builder.with_model_info_override("gpt-5.5", |model_info| {
                 model_info.web_search_tool_type = WebSearchToolType::TextAndImage;
             }),
         };
@@ -232,7 +232,7 @@ async fn amazon_bedrock_web_search_is_disabled_when_managed_requirements_prohibi
         });
         let mut builder = test_dex()
             .with_auth(auth)
-            .with_model(AMAZON_BEDROCK_GPT_5_4_MODEL_ID)
+            .with_model(AMAZON_BEDROCK_GPT_5_5_MODEL_ID)
             .with_cloud_config_bundle(
                 CloudConfigBundleFixture::loader_with_enterprise_requirement(format!(
                     r#"allowed_web_search_modes = ["{allowed_mode}"]"#

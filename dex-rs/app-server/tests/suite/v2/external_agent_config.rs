@@ -35,7 +35,7 @@ use dex_app_server_protocol::MergeStrategy;
 use dex_app_server_protocol::PluginListParams;
 use dex_app_server_protocol::PluginListResponse;
 use dex_app_server_protocol::RequestId;
-use dex_app_server_protocol::ThreadItem;
+use dex_app_server_protocol::ThreadItemPayload;
 use dex_app_server_protocol::ThreadListParams;
 use dex_app_server_protocol::ThreadListResponse;
 use dex_app_server_protocol::ThreadReadParams;
@@ -48,6 +48,7 @@ use dex_app_server_protocol::UserInput;
 #[cfg(unix)]
 use dex_app_server_protocol::WriteStatus;
 use dex_config::types::AuthCredentialsStoreMode;
+use dex_protocol::MemoryVersion;
 use pretty_assertions::assert_eq;
 use std::path::Path;
 use std::path::PathBuf;
@@ -399,7 +400,10 @@ async fn external_agent_config_import_source_remains_attribution_only() -> Resul
     let dex_home = TempDir::new()?;
     let source_home = external_agent_home(dex_home.path());
     std::fs::create_dir_all(&source_home)?;
-    std::fs::write(source_home.join("CLAUDE.md"), "Claude guidance")?;
+    std::fs::write(
+        source_home.join("CLAUDE.md"),
+        "Claude guidance: [Claude](https://claude.ai/CLAUDE.md)",
+    )?;
     let home_dir = dex_home.path().display().to_string();
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
@@ -445,7 +449,7 @@ async fn external_agent_config_import_source_remains_attribution_only() -> Resul
     assert_eq!(completed.item_type_results[0].failures, Vec::new());
     assert_eq!(
         std::fs::read_to_string(dex_home.path().join("AGENTS.md"))?,
-        "Dex guidance"
+        "Dex guidance: [Dex](https://claude.ai/CLAUDE.md)"
     );
 
     Ok(())
@@ -604,6 +608,9 @@ source = {:?}
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            excluded_thread_ids: None,
+            attached_to_thread_id: None,
+            originators: None,
             cursor: None,
             limit: None,
             sort_key: None,
@@ -636,10 +643,10 @@ source = {:?}
     let response: ThreadReadResponse =
         timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(response.thread.turns.len(), 1);
-    let imported_items = &response.thread.turns[0].items;
+    let mut imported_items = response.thread.turns[0].item_payloads();
     assert_eq!(imported_items.len(), 3);
-    match &imported_items[0] {
-        ThreadItem::UserMessage { content, .. } => assert_eq!(
+    match imported_items.next() {
+        Some(ThreadItemPayload::UserMessage { content, .. }) => assert_eq!(
             content,
             &vec![UserInput::Text {
                 text: "first request".to_string(),
@@ -648,8 +655,8 @@ source = {:?}
         ),
         other => panic!("expected user message item, got {other:?}"),
     }
-    match &imported_items[1] {
-        ThreadItem::AgentMessage { text, .. } => assert_eq!(text, "first answer"),
+    match imported_items.next() {
+        Some(ThreadItemPayload::AgentMessage { text, .. }) => assert_eq!(text, "first answer"),
         other => panic!("expected agent message item, got {other:?}"),
     }
 
@@ -913,7 +920,7 @@ async fn external_agent_memory_import_requires_feature_config() -> Result<()> {
     assert!(
         !dex_home
             .path()
-            .join("memories/extensions/external_agent_import")
+            .join("memories_v2/extensions/external_agent_import")
             .exists()
     );
 
@@ -958,8 +965,22 @@ async fn external_agent_config_detects_non_memory_items_when_config_reload_fails
     Ok(())
 }
 
+#[test_case::test_case(false, Some(MemoryVersion::V2); "new_v2_user")]
+#[test_case::test_case(true, Some(MemoryVersion::V2); "v2_with_legacy_workspace")]
+#[test_case::test_case(false, Some(MemoryVersion::V1); "new_transition_opt_out")]
+#[test_case::test_case(false, None; "default_profile")]
+#[test_case::test_case(true, None; "legacy_unscoped_cleanup")]
 #[tokio::test]
-async fn external_agent_config_detects_and_imports_project_memory_files() -> Result<()> {
+async fn external_agent_config_detects_and_imports_project_memory_files(
+    legacy_workspace: bool,
+    configured_version: Option<MemoryVersion>,
+) -> Result<()> {
+    let expect_legacy = legacy_workspace || configured_version != Some(MemoryVersion::V2);
+    let memory_config = match configured_version {
+        Some(MemoryVersion::V1) => "version = \"v1\"\ndual_write = false",
+        Some(MemoryVersion::V2) => "version = \"v2\"",
+        None => "",
+    };
     let dex_home = TempDir::new()?;
     let source_home = external_agent_home(dex_home.path());
     let source_project = source_home.join("projects/project-a");
@@ -982,9 +1003,15 @@ async fn external_agent_config_detects_and_imports_project_memory_files() -> Res
         })
         .to_string(),
     )?;
+    if legacy_workspace {
+        std::fs::create_dir_all(dex_home.path().join("memories"))?;
+    }
+    let unscoped_memory = source_home.join("projects/unscoped-project/memory");
+    std::fs::create_dir_all(&unscoped_memory)?;
+    std::fs::write(unscoped_memory.join("MEMORY.md"), "memory without a cwd")?;
     std::fs::write(
         dex_home.path().join("config.toml"),
-        "[features]\nexternal_agent_memory_import = true\n",
+        format!("[features]\nexternal_agent_memory_import = true\n[memories]\n{memory_config}\n"),
     )?;
     let home_dir = dex_home.path().display().to_string();
     let mut mcp = TestAppServer::builder()
@@ -1053,7 +1080,10 @@ async fn external_agent_config_detects_and_imports_project_memory_files() -> Res
         .as_mut()
         .expect("memory details")
         .memory
-        .push("missing-project".to_string());
+        .extend([
+            "missing-project".to_string(),
+            "unscoped-project".to_string(),
+        ]);
 
     let request_id = mcp
         .send_raw_request(
@@ -1076,10 +1106,15 @@ async fn external_agent_config_detects_and_imports_project_memory_files() -> Res
         memory_result.item_type,
         ExternalAgentConfigMigrationItemType::Memory
     );
-    assert_eq!(memory_result.failures.len(), 1);
+    let mut failed_projects = memory_result
+        .failures
+        .iter()
+        .map(|failure| failure.source.as_deref())
+        .collect::<Vec<_>>();
+    failed_projects.sort_unstable();
     assert_eq!(
-        memory_result.failures[0].source.as_deref(),
-        Some("missing-project")
+        failed_projects,
+        vec![Some("missing-project"), Some("unscoped-project")]
     );
     assert_eq!(memory_result.failures[0].failure_stage, "memory_import");
     assert_eq!(memory_result.successes.len(), 1);
@@ -1096,7 +1131,8 @@ async fn external_agent_config_detects_and_imports_project_memory_files() -> Res
     );
     let expected_resources_root = dex_home
         .path()
-        .join("memories/extensions/external_agent_import/resources");
+        .join(MemoryVersion::V2.directory_name())
+        .join("extensions/external_agent_import/resources");
     assert_eq!(
         std::fs::canonicalize(&imported_resources_root)?,
         std::fs::canonicalize(expected_resources_root)?,
@@ -1117,7 +1153,7 @@ async fn external_agent_config_detects_and_imports_project_memory_files() -> Res
         imported_resources_root.join("project-a/scope.json"),
     )?)?;
     assert_eq!(imported_scope, serde_json::json!({ "cwd": project_cwd }));
-    let memory_root = dex_home.path().join("memories");
+    let memory_root = dex_home.path().join(MemoryVersion::V2.directory_name());
     let memory_diff = dex_git_utils::diff_since_latest_init(&memory_root).await?;
     for relative_path in [
         "extensions/external_agent_import/resources/project-a/MEMORY.md",
@@ -1132,8 +1168,67 @@ async fn external_agent_config_detects_and_imports_project_memory_files() -> Res
         );
     }
 
+    let legacy_resources = dex_home
+        .path()
+        .join("memories/extensions/external_agent_import/resources");
+    if expect_legacy {
+        for file in ["MEMORY.md", "release-process.md", "scope.json"] {
+            assert_eq!(
+                std::fs::read(legacy_resources.join("project-a").join(file))?,
+                std::fs::read(imported_resources_root.join("project-a").join(file))?
+            );
+        }
+    } else {
+        assert!(!dex_home.path().join("memories").exists());
+    }
+    assert!(!legacy_resources.join("unscoped-project").exists());
+    assert!(!imported_resources_root.join("unscoped-project").exists());
+    let db = super::memory_reset::init_state_db(dex_home.path()).await?;
+    for version in [MemoryVersion::V1, MemoryVersion::V2] {
+        let store = db.memories_for_version(version).await?;
+        let dex_state::Phase2JobClaimOutcome::Claimed {
+            input_watermark, ..
+        } = store
+            .try_claim_global_phase2_job(dex_protocol::ThreadId::new(), /*lease_seconds*/ 60)
+            .await?
+        else {
+            anyhow::bail!("claim imported memory consolidation");
+        };
+        assert_eq!(
+            input_watermark > 0,
+            expect_legacy || version == MemoryVersion::V2
+        );
+    }
+
+    let request_id = mcp
+        .send_raw_request(
+            "externalAgentConfig/detect",
+            Some(serde_json::json!({ "includeHome": true })),
+        )
+        .await?;
+    let detected: ExternalAgentConfigDetectResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert!(
+        !detected
+            .items
+            .iter()
+            .any(|item| { item.item_type == ExternalAgentConfigMigrationItemType::Memory })
+    );
+
+    let memory_root = dex_home.path().join(if legacy_workspace {
+        "memories"
+    } else {
+        "memories_v2"
+    });
     dex_memories_write::workspace::reset_memory_workspace_baseline(&memory_root).await?;
-    std::fs::remove_dir_all(&source_project)?;
+    if legacy_workspace {
+        // Legacy unscoped resources need cleanup, even with no copy in v2.
+        std::fs::remove_dir_all(imported_resources_root.join("project-a"))?;
+        std::fs::remove_file(legacy_resources.join("project-a/scope.json"))?;
+        std::fs::remove_file(source_project.join("session.jsonl"))?;
+    } else {
+        std::fs::remove_dir_all(&source_project)?;
+    }
     let request_id = mcp
         .send_raw_request(
             "externalAgentConfig/detect",
@@ -1180,6 +1275,7 @@ async fn external_agent_config_detects_and_imports_project_memory_files() -> Res
         Some("project-a")
     );
     assert!(!imported_resources_root.join("project-a").exists());
+    assert!(!legacy_resources.join("project-a").exists());
 
     let memory_diff = dex_git_utils::diff_since_latest_init(&memory_root).await?;
     assert_eq!(
@@ -1841,6 +1937,9 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            excluded_thread_ids: None,
+            attached_to_thread_id: None,
+            originators: None,
             cursor: None,
             limit: None,
             sort_key: None,
@@ -1880,10 +1979,10 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
     let response: ThreadReadResponse =
         timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(response.thread.turns.len(), 2);
-    let control_items = &response.thread.turns[0].items;
+    let mut control_items = response.thread.turns[0].item_payloads();
     assert_eq!(control_items.len(), 1);
-    match &control_items[0] {
-        ThreadItem::UserMessage { content, .. } => {
+    match control_items.next() {
+        Some(ThreadItemPayload::UserMessage { content, .. }) => {
             assert_eq!(
                 content,
                 &vec![UserInput::Text {
@@ -1894,10 +1993,10 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
         }
         other => panic!("expected user message item, got {other:?}"),
     }
-    let imported_items = &response.thread.turns[1].items;
+    let mut imported_items = response.thread.turns[1].item_payloads();
     assert_eq!(imported_items.len(), 3);
-    match &imported_items[0] {
-        ThreadItem::UserMessage { content, .. } => {
+    match imported_items.next() {
+        Some(ThreadItemPayload::UserMessage { content, .. }) => {
             assert_eq!(
                 content,
                 &vec![UserInput::Text {
@@ -1909,13 +2008,14 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
         other => panic!("expected user message item, got {other:?}"),
     }
     assert_eq!(
-        imported_items.last(),
-        Some(&ThreadItem::AgentMessage {
+        imported_items.next_back(),
+        Some(&ThreadItemPayload::AgentMessage {
             id: "item-4".into(),
             text: "<EXTERNAL SESSION IMPORTED>".into(),
             phase: None,
             memory_citation: None,
             delivery: None,
+            questions: None,
         })
     );
 
@@ -1954,8 +2054,8 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
     let response: ThreadReadResponse =
         timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(response.thread.turns.len(), 3);
-    match &response.thread.turns[2].items[1] {
-        ThreadItem::AgentMessage { text, .. } => assert_eq!(text, "follow-up answer"),
+    match response.thread.turns[2].item_payloads().nth(/*n*/ 1) {
+        Some(ThreadItemPayload::AgentMessage { text, .. }) => assert_eq!(text, "follow-up answer"),
         other => panic!("expected agent message item, got {other:?}"),
     }
 
@@ -2030,6 +2130,9 @@ required = true
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            excluded_thread_ids: None,
+            attached_to_thread_id: None,
+            originators: None,
             cursor: None,
             limit: None,
             sort_key: None,
@@ -2115,6 +2218,9 @@ async fn external_agent_config_import_accepts_detected_session_payload_after_res
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            excluded_thread_ids: None,
+            attached_to_thread_id: None,
+            originators: None,
             cursor: None,
             limit: None,
             sort_key: None,
@@ -2197,6 +2303,9 @@ async fn external_agent_config_import_skips_already_imported_session_versions() 
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            excluded_thread_ids: None,
+            attached_to_thread_id: None,
+            originators: None,
             cursor: None,
             limit: None,
             sort_key: None,
@@ -2325,6 +2434,9 @@ async fn external_agent_config_import_returns_before_background_session_import_f
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            excluded_thread_ids: None,
+            attached_to_thread_id: None,
+            originators: None,
             cursor: None,
             limit: None,
             sort_key: None,
@@ -2441,6 +2553,9 @@ async fn external_agent_config_import_compacts_huge_session_before_first_follow_
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            excluded_thread_ids: None,
+            attached_to_thread_id: None,
+            originators: None,
             cursor: None,
             limit: None,
             sort_key: None,

@@ -1,20 +1,15 @@
 use super::*;
+use crate::plugin_config_reload;
 
 #[derive(Clone)]
 pub(crate) struct MarketplaceRequestProcessor {
-    config: Arc<Config>,
     config_manager: ConfigManager,
     thread_manager: Arc<ThreadManager>,
 }
 
 impl MarketplaceRequestProcessor {
-    pub(crate) fn new(
-        config: Arc<Config>,
-        config_manager: ConfigManager,
-        thread_manager: Arc<ThreadManager>,
-    ) -> Self {
+    pub(crate) fn new(config_manager: ConfigManager, thread_manager: Arc<ThreadManager>) -> Self {
         Self {
-            config,
             config_manager,
             thread_manager,
         }
@@ -51,8 +46,10 @@ impl MarketplaceRequestProcessor {
         &self,
         params: MarketplaceRemoveParams,
     ) -> Result<MarketplaceRemoveResponse, JSONRPCErrorError> {
+        let config = self.load_global_config().await?;
         remove_marketplace(
-            self.config.dex_home.to_path_buf(),
+            config.dex_home.to_path_buf(),
+            config.config_layer_stack,
             CoreMarketplaceRemoveRequest {
                 marketplace_name: params.marketplace_name,
             },
@@ -72,15 +69,17 @@ impl MarketplaceRequestProcessor {
         &self,
         params: MarketplaceUpgradeParams,
     ) -> Result<MarketplaceUpgradeResponse, JSONRPCErrorError> {
-        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        let config = self.load_global_config().await?;
         let plugins_manager = self.thread_manager.plugins_manager();
         let MarketplaceUpgradeParams { marketplace_name } = params;
         let plugins_input = config.plugins_config_input();
+        let reload_config = plugin_config_reload::global(self.config_manager.clone());
 
         let outcome = tokio::task::spawn_blocking(move || {
             plugins_manager.upgrade_configured_marketplaces_for_config(
                 &plugins_input,
                 marketplace_name.as_deref(),
+                &reload_config,
             )
         })
         .await
@@ -112,9 +111,9 @@ impl MarketplaceRequestProcessor {
         &self,
         params: MarketplaceAddParams,
     ) -> Result<MarketplaceAddResponse, JSONRPCErrorError> {
-        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        let config = self.load_global_config().await?;
         add_marketplace_to_dex_home(
-            self.config.dex_home.to_path_buf(),
+            config.dex_home.to_path_buf(),
             config.config_layer_stack.requirements().clone(),
             MarketplaceAddRequest {
                 source: params.source,
@@ -134,12 +133,9 @@ impl MarketplaceRequestProcessor {
         })
     }
 
-    async fn load_latest_config(
-        &self,
-        fallback_cwd: Option<PathBuf>,
-    ) -> Result<Config, JSONRPCErrorError> {
+    async fn load_global_config(&self) -> Result<Config, JSONRPCErrorError> {
         self.config_manager
-            .load_latest_config(fallback_cwd)
+            .load_non_project_config()
             .await
             .map_err(|err| internal_error(format!("failed to reload config: {err}")))
     }

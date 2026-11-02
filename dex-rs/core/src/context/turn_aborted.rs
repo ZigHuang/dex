@@ -1,4 +1,7 @@
 use super::ContextualUserFragment;
+use dex_protocol::models::ContentItem;
+use dex_protocol::models::ContentItemKind;
+use dex_protocol::models::input_text;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TurnAborted {
@@ -17,6 +20,10 @@ impl TurnAborted {
 }
 
 impl ContextualUserFragment for TurnAborted {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("generic.turn_aborted".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "user"
     }
@@ -29,7 +36,7 @@ impl ContextualUserFragment for TurnAborted {
         ("<turn_aborted>", "</turn_aborted>")
     }
 
-    fn body(&self) -> String {
-        format!("\n{}\n", self.guidance)
+    fn body(&self) -> ContentItem {
+        input_text(format!("\n{}\n", self.guidance))
     }
 }

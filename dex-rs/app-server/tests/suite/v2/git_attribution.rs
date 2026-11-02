@@ -16,10 +16,9 @@ use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use dex_app_server_protocol::LoginAccountResponse;
 use dex_app_server_protocol::RequestId;
+use dex_app_server_protocol::ThreadHistoryMode;
 use dex_app_server_protocol::ThreadResumeParams;
 use dex_app_server_protocol::ThreadResumeResponse;
-use dex_app_server_protocol::ThreadRollbackParams;
-use dex_app_server_protocol::ThreadRollbackResponse;
 use dex_app_server_protocol::ThreadStartParams;
 use dex_app_server_protocol::ThreadStartResponse;
 use dex_app_server_protocol::TurnStartParams;
@@ -28,7 +27,6 @@ use dex_config::types::AuthCredentialsStoreMode;
 use dex_protocol::models::ContentItem;
 use dex_protocol::models::ResponseItem;
 use dex_rollout::RolloutItem;
-use dex_rollout::RolloutLine;
 use pretty_assertions::assert_eq;
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -79,7 +77,7 @@ async fn git_attribution_follows_authenticated_workspace_policy() -> Result<()> 
             "Recovered",
             "Cached",
             "After switch",
-            "After rollback",
+            "After switching back",
         ]
         .into_iter()
         .map(create_final_assistant_message_sse_response)
@@ -147,6 +145,7 @@ async fn git_attribution_follows_authenticated_workspace_policy() -> Result<()> 
                 "chatgpt_base_url".to_string(),
                 json!(format!("{}/backend-api", settings_server.uri())),
             )])),
+            history_mode: Some(ThreadHistoryMode::Legacy),
             ..Default::default()
         })
         .await?;
@@ -166,14 +165,6 @@ async fn git_attribution_follows_authenticated_workspace_policy() -> Result<()> 
     run_turn(&mut app_server, &thread.id, "Turn after workspace switch").await?;
 
     let request_id = app_server
-        .send_thread_rollback_request(ThreadRollbackParams {
-            thread_id: thread.id.clone(),
-            num_turns: 1,
-        })
-        .await?;
-    let _: ThreadRollbackResponse = read_response(&mut app_server, request_id).await?;
-
-    let request_id = app_server
         .send_chatgpt_auth_tokens_login_request(
             "e30.e30.c2ln".to_string(),
             "workspace-enabled".to_string(),
@@ -181,13 +172,13 @@ async fn git_attribution_follows_authenticated_workspace_policy() -> Result<()> 
         )
         .await?;
     let _: LoginAccountResponse = read_response(&mut app_server, request_id).await?;
-    run_turn(&mut app_server, &thread.id, "Turn after rollback").await?;
+    run_turn(&mut app_server, &thread.id, "Turn after switching back").await?;
 
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 5);
     for (request, expected) in requests
         .into_iter()
-        .zip([(0, 0), (1, 0), (1, 0), (1, 1), (1, 0)])
+        .zip([(0, 0), (1, 0), (1, 0), (1, 1), (2, 1)])
     {
         let developer_text = request.message_input_texts("developer").join("\n");
         assert_eq!(
@@ -332,7 +323,7 @@ fn replace_attribution_fragment_with_legacy(
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            let mut line = serde_json::from_str::<RolloutLine>(line)?;
+            let mut line = dex_rollout::parse_rollout_line(line)?;
             if let RolloutItem::ResponseItem(response_item) = &mut line.item
                 && let ResponseItem::Message { role, content, .. } = &mut response_item.item
                 && role == "developer"

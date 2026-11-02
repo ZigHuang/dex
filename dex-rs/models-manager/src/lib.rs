@@ -1,13 +1,18 @@
 pub mod cache;
+mod catalog;
 pub mod collaboration_mode_presets;
 pub(crate) mod config;
 pub mod manager;
 pub mod model_info;
 pub mod model_presets;
+mod originator;
 pub mod test_support;
 
+pub use catalog::CatalogModel;
+pub use catalog::ModelOrigin;
 pub use config::ModelsManagerConfig;
 pub use dex_protocol::auth::AuthMode;
+pub use originator::ModelCatalogOriginator;
 
 /// Load the bundled model catalog shipped with `dex-models-manager`.
 pub fn bundled_models_response()

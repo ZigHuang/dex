@@ -7,34 +7,51 @@ license.workspace = true
 [lib]
 doctest = false
 
+# cargo-shear 1.11.2 misresolves these #[path] modules containing parent directories.
+# Both modules are compiled and exercised by the exec-server unit test target.
+[package.metadata.cargo-shear]
+ignored-paths = [
+    "tests/unit/client_provisioning_tests.rs",
+    "src/discoverV2/tests/capability_watchers_tests.rs",
+]
+
 [lints]
 workspace = true
 
 [dependencies]
+dex-utils-process = { workspace = true }
 arc-swap = { workspace = true }
 axum = { workspace = true, features = ["http1", "tokio", "ws"] }
 base64 = { workspace = true }
 bytes = { workspace = true }
 clatter = { workspace = true }
 dex-api = { workspace = true }
+dex-build-info = { workspace = true }
 dex-config = { workspace = true }
+dex-core-plugin-common = { workspace = true }
 dex-http-client = { workspace = true }
 dex-exec-server-protocol = { workspace = true }
 dex-file-system = { workspace = true }
+dex-file-watcher = { workspace = true }
 dex-network-proxy = { workspace = true }
 dex-otel = { workspace = true }
 dex-protocol = { workspace = true }
 dex-sandboxing = { workspace = true }
 dex-shell-command = { workspace = true }
+dex-skills = { workspace = true }
 dex-utils-absolute-path = { workspace = true }
 dex-utils-home-dir = { workspace = true }
 dex-utils-path-uri = { workspace = true }
 dex-utils-pty = { workspace = true }
+dex-utils-redacted-string = { workspace = true }
 dex-utils-rustls-provider = { workspace = true }
+dex-websocket-auth = { workspace = true }
 dex-websocket-client = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
+notify = { workspace = true }
+opentelemetry = { workspace = true }
 prost = "0.14.3"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -57,17 +74,23 @@ tracing = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+dex-linux-sandbox = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
+dex-uds = { workspace = true }
 libc = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
+tempfile = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = [
+dex-mxc-sandbox = { workspace = true }
+which = { workspace = true }
+windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
-    "Win32_System_Kernel",
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
@@ -76,9 +99,10 @@ windows-sys = { version = "0.52", features = [
 anyhow = { workspace = true }
 dex-exec-server-test-support = { workspace = true }
 dex-test-binary-support = { workspace = true }
+dex-utils-cargo-bin = { workspace = true }
+dex-windows-sandbox-test-support = { workspace = true }
 ctor = { workspace = true }
 http = { workspace = true }
-opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 pretty_assertions = { workspace = true }
 rcgen = { workspace = true }

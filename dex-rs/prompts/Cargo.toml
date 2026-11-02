@@ -14,12 +14,16 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+dex-collaboration-mode-templates = { workspace = true }
 dex-context-fragments = { workspace = true }
-dex-git-utils = { workspace = true }
 dex-execpolicy = { workspace = true }
+dex-git-utils = { workspace = true }
+dex-guardian-context = { workspace = true }
 dex-protocol = { workspace = true }
 dex-utils-absolute-path = { workspace = true }
 dex-utils-template = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
+dex-protocol-test-support = { workspace = true }
 pretty_assertions = { workspace = true }

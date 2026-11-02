@@ -1,14 +1,17 @@
+use dex_code_mode_protocol::CodeModeOutputTruncation;
 use dex_code_mode_protocol::CodeModeSessionCellExecutionLimits;
 use dex_code_mode_protocol::CodeModeToolKind;
 use dex_code_mode_protocol::ExecuteRequest;
 use dex_code_mode_protocol::FunctionCallOutputContentItem;
 use dex_code_mode_protocol::ImageDetail;
+use dex_code_mode_protocol::MissingCodeModeHostDuration;
 use dex_code_mode_protocol::RuntimeResponse;
 use dex_code_mode_protocol::ToolDefinition;
 use dex_code_mode_protocol::WaitOutcome;
 use dex_code_mode_protocol::grpc as proto;
 use dex_protocol::ToolName;
 use serde_json::Value as JsonValue;
+use tonic::Response;
 use tonic::Status;
 
 use super::validation;
@@ -25,6 +28,21 @@ pub(super) fn session_limits(
             .transpose()
             .map_err(|_| Status::invalid_argument("maximum heap size exceeds this platform"))?,
     })
+}
+
+pub(super) fn observation_budget(
+    max_output_tokens: Option<u64>,
+    output_truncation: CodeModeOutputTruncation,
+) -> Result<Option<usize>, Status> {
+    if output_truncation == CodeModeOutputTruncation::Client {
+        return Ok(None);
+    }
+    max_output_tokens
+        .map(|value| {
+            usize::try_from(value)
+                .map_err(|_| Status::invalid_argument("output budget is too large"))
+        })
+        .transpose()
 }
 
 pub(super) fn execute_request(request: proto::ExecuteRequest) -> Result<ExecuteRequest, Status> {
@@ -66,6 +84,7 @@ fn tool_definition(definition: proto::ToolDefinition) -> Result<ToolDefinition, 
             }
         },
         input_schema: json_field(definition.input_schema_json, "input schema")?,
+        input_schema_max_bytes: None,
         output_schema: json_field(definition.output_schema_json, "output schema")?,
     })
 }
@@ -79,51 +98,74 @@ fn json_field(value: Option<Vec<u8>>, field: &str) -> Result<Option<JsonValue>, 
         .transpose()
 }
 
-pub(super) fn execution_outcome(response: RuntimeResponse) -> proto::ExecutionOutcome {
-    let (cell_id, content_items, outcome) = match response {
+/// Preserves the response's timing; the host handler must record it first.
+pub(super) fn execution_outcome(
+    response: RuntimeResponse,
+) -> Result<proto::ExecutionOutcome, MissingCodeModeHostDuration> {
+    let (cell_id, content_items, outcome, code_mode_host_duration) = match response {
         RuntimeResponse::Yielded {
             cell_id,
             content_items,
+            code_mode_host_duration,
         } => (
             cell_id,
             content_items,
             proto::execution_outcome::Outcome::Yielded(proto::ExecutionYielded {}),
+            code_mode_host_duration,
         ),
         RuntimeResponse::Terminated {
             cell_id,
             content_items,
+            code_mode_host_duration,
         } => (
             cell_id,
             content_items,
             proto::execution_outcome::Outcome::Terminated(proto::ExecutionTerminated {}),
+            code_mode_host_duration,
         ),
         RuntimeResponse::Result {
             cell_id,
             content_items,
             error_text,
+            code_mode_host_duration,
+            ..
         } => (
             cell_id,
             content_items,
             proto::execution_outcome::Outcome::Completed(proto::ExecutionCompleted { error_text }),
+            code_mode_host_duration,
         ),
     };
-    proto::ExecutionOutcome {
+    let code_mode_host_duration = code_mode_host_duration.ok_or(MissingCodeModeHostDuration)?;
+    Ok(proto::ExecutionOutcome {
         cell_id: cell_id.to_string(),
         content_items: content_items.into_iter().map(content_item).collect(),
         outcome: Some(outcome),
-    }
+        code_mode_host_duration_ns: u64::try_from(code_mode_host_duration.as_nanos())
+            .unwrap_or(u64::MAX),
+    })
 }
 
-pub(super) fn wait_response(outcome: WaitOutcome) -> proto::WaitResponse {
+pub(super) fn wait_response(
+    outcome: WaitOutcome,
+) -> Result<Response<proto::WaitResponse>, MissingCodeModeHostDuration> {
+    let buffered = outcome.result_buffered_for();
     let state = match outcome {
         WaitOutcome::LiveCell(response) => {
-            proto::wait_response::State::LiveCell(execution_outcome(response))
+            proto::wait_response::State::LiveCell(execution_outcome(response)?)
         }
         WaitOutcome::MissingCell(response) => {
-            proto::wait_response::State::MissingCell(execution_outcome(response))
+            proto::wait_response::State::MissingCell(execution_outcome(response)?)
         }
     };
-    proto::WaitResponse { state: Some(state) }
+    let mut response = Response::new(proto::WaitResponse { state: Some(state) });
+    if let Some(buffered) = buffered {
+        let nanos = u64::try_from(buffered.as_nanos()).unwrap_or(u64::MAX);
+        response
+            .metadata_mut()
+            .insert(proto::RESULT_BUFFERED_FOR_NS_METADATA, nanos.into());
+    }
+    Ok(response)
 }
 
 fn content_item(item: FunctionCallOutputContentItem) -> proto::ContentItem {

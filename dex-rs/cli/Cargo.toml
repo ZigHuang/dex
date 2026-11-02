@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "logs_client"
 path = "src/bin/logs_client.rs"
 
+[[test]]
+name = "app_server_daemon_package"
+path = "tests/app_server_daemon/package.rs"
+
 [lib]
 name = "dex_cli"
 path = "src/lib.rs"
@@ -23,6 +27,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+dex-utils-process = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
@@ -32,6 +37,7 @@ dex-app-server-daemon = { workspace = true }
 dex-app-server-protocol = { workspace = true }
 dex-app-server-test-client = { workspace = true }
 dex-arg0 = { workspace = true }
+dex-build-info = { workspace = true }
 dex-api = { workspace = true }
 dex-chatgpt = { workspace = true }
 dex-cloud-config = { workspace = true }
@@ -45,21 +51,23 @@ dex-home = { workspace = true }
 dex-http-client = { workspace = true }
 dex-exec = { workspace = true }
 dex-exec-server = { workspace = true }
+dex-exec-server-cli = { workspace = true }
 dex-execpolicy = { workspace = true }
 dex-extension-api = { workspace = true }
 dex-features = { workspace = true }
+dex-multi-env-copy-file = { workspace = true }
 dex-git-attribution = { workspace = true }
 dex-git-utils = { workspace = true }
 dex-install-context = { workspace = true }
 dex-login = { workspace = true }
 dex-memories-write = { workspace = true }
 dex-mcp = { workspace = true }
-dex-mcp-server = { workspace = true }
 dex-model-provider = { workspace = true }
 dex-models-manager = { workspace = true }
 dex-plugin = { workspace = true }
 dex-protocol = { workspace = true }
 dex-responses-api-proxy = { workspace = true }
+dex-tcp-tunnel = { workspace = true }
 dex-rmcp-client = { workspace = true }
 dex-rollout = { workspace = true }
 dex-rollout-trace = { workspace = true }
@@ -72,7 +80,11 @@ dex-thread-store = { workspace = true }
 dex-tui = { workspace = true }
 dex-utils-absolute-path = { workspace = true }
 dex-utils-path = { workspace = true }
-crossterm = { workspace = true }
+dex-utils-path-uri = { workspace = true }
+dex-utils-redacted-string = { workspace = true }
+dex-websocket-auth = { workspace = true }
+crossterm = { workspace = true, features = ["event-stream"] }
+futures = { workspace = true }
 http = { workspace = true }
 libc = { workspace = true }
 os_info = { workspace = true }
@@ -80,6 +92,7 @@ owo-colors = { workspace = true }
 regex-lite = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sqlx = { workspace = true }
 supports-color = { workspace = true }
 sys-locale = { workspace = true }
 tempfile = { workspace = true }
@@ -100,9 +113,12 @@ unicode-segmentation = { workspace = true }
 url = { workspace = true }
 which = { workspace = true }
 
+[target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 dex_windows_sandbox = { package = "dex-windows-sandbox", path = "../windows-sandbox-rs" }
-windows-sys = { version = "0.52", features = [
+windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Storage_Packaging_Appx",
     "Win32_System_Console",
@@ -113,13 +129,19 @@ windows-sys = { version = "0.52", features = [
 app_test_support = { workspace = true }
 assert_cmd = { workspace = true }
 assert_matches = { workspace = true }
+dex-app-server-client = { workspace = true }
 dex-utils-cargo-bin = { workspace = true }
-futures = { workspace = true }
+dex-utils-pty = { workspace = true }
+core_test_support = { workspace = true }
+flate2 = { workspace = true }
 insta = { workspace = true }
+jsonwebtoken = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
-sqlx = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
 tokio-tungstenite = { workspace = true }
+vt100 = { workspace = true }
 wiremock = { workspace = true }
 zstd = { workspace = true }
 

@@ -1,0 +1,48 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-guardian-reviewer"
+version.workspace = true
+
+[lib]
+doctest = false
+name = "dex_guardian_reviewer"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+dex-analytics = { workspace = true }
+dex-context-fragments = { workspace = true }
+dex-extension-api = { workspace = true }
+dex-features = { workspace = true }
+dex-feedback = { workspace = true }
+dex-guardian-context = { workspace = true }
+dex-history = { workspace = true }
+dex-mcp = { workspace = true }
+dex-otel = { workspace = true }
+dex-prompts = { workspace = true }
+dex-protocol = { workspace = true }
+dex-rmcp-client = { workspace = true }
+dex-shell-command = { workspace = true }
+dex-utils-path-uri = { workspace = true }
+dex-utils-output-truncation = { workspace = true }
+dex-utils-string = { workspace = true }
+rand = { workspace = true }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+dex-models-manager = { workspace = true }
+dex-context-fragments = { workspace = true }
+dex-protocol-test-support = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["experimental_metrics_custom_reader", "metrics"] }
+test-case = "3.3.1"
+pretty_assertions = { workspace = true }

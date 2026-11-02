@@ -1,4 +1,7 @@
 use super::ContextualUserFragment;
+use dex_protocol::models::ContentItem;
+use dex_protocol::models::ContentItemKind;
+use dex_protocol::models::input_text;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImageResizeNoticeSource {
@@ -32,12 +35,12 @@ impl ImageResizeNotice {
 }
 
 impl ContextualUserFragment for ImageResizeNotice {
-    fn role(&self) -> &'static str {
-        "developer"
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("images.resize_notice".to_string())
     }
 
-    fn requires_separate_message(&self) -> bool {
-        true
+    fn role(&self) -> &'static str {
+        "developer"
     }
 
     fn markers(&self) -> (&'static str, &'static str) {
@@ -48,7 +51,7 @@ impl ContextualUserFragment for ImageResizeNotice {
         ("<image_resize_notice>", "</image_resize_notice>")
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let source = match self.source {
             ImageResizeNoticeSource::UserMessage => "user message",
             ImageResizeNoticeSource::ToolOutput => "tool output",
@@ -69,6 +72,6 @@ impl ContextualUserFragment for ImageResizeNotice {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        format!("\n{notices}\n")
+        input_text(format!("\n{notices}\n"))
     }
 }

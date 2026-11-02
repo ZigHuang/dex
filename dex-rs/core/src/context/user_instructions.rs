@@ -1,4 +1,8 @@
 use super::ContextualUserFragment;
+use dex_protocol::models::ContentItem;
+use dex_protocol::models::ContentItemKind;
+use dex_protocol::models::ContentItemMetadata;
+use dex_protocol::models::input_text;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UserInstructions {
@@ -7,6 +11,14 @@ pub(crate) struct UserInstructions {
 }
 
 impl ContextualUserFragment for UserInstructions {
+    fn content_metadata(&self) -> ContentItemMetadata {
+        ContentItemMetadata::agents_md()
+    }
+
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("agents_md.instructions".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "user"
     }
@@ -19,12 +31,12 @@ impl ContextualUserFragment for UserInstructions {
         ("# AGENTS.md instructions", "</INSTRUCTIONS>")
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let directory = self
             .directory
             .as_ref()
             .map(|directory| format!(" for {directory}"))
             .unwrap_or_default();
-        format!("{directory}\n\n<INSTRUCTIONS>\n{}\n", self.text)
+        input_text(format!("{directory}\n\n<INSTRUCTIONS>\n{}\n", self.text))
     }
 }

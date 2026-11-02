@@ -12,27 +12,42 @@ use core_test_support::responses::strip_metadata;
 use core_test_support::responses::strip_response_item_id;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_dex::TestDex;
-use core_test_support::test_dex::local_selections;
+use core_test_support::test_dex::local_requests;
 use core_test_support::test_dex::test_dex;
 use core_test_support::test_dex::turn_permission_fields;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_match;
+use dex_attachment_store::AttachmentMetadata;
+use dex_attachment_store::AttachmentStore;
+use dex_attachment_store::AttachmentStoreError;
+use dex_attachment_store::AttachmentStoreErrorKind;
+use dex_attachment_store::IsResolvableFuture;
+use dex_attachment_store::ResolveFuture;
+use dex_attachment_store::ResolveRequest;
+use dex_attachment_store::UploadFuture;
+use dex_attachment_store::UploadRequest;
+use dex_attachment_store::UploadResult;
 use dex_core::TurnInputRequest;
 use dex_features::Feature;
 use dex_history::RolloutItem;
-use dex_history::RolloutLine;
 use dex_protocol::config_types::CollaborationMode;
 use dex_protocol::config_types::ModeKind;
 use dex_protocol::config_types::Settings;
+use dex_protocol::items::TurnItem;
 use dex_protocol::models::ContentItem;
 use dex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use dex_protocol::models::ImageDetail;
+use dex_protocol::models::ImageReference;
 use dex_protocol::models::PermissionProfile;
 use dex_protocol::models::ResponseInputItem;
 use dex_protocol::models::ResponseItem;
 use dex_protocol::protocol::AskForApproval;
 use dex_protocol::protocol::EventMsg;
 use dex_protocol::protocol::Op;
+use dex_protocol::protocol::ThreadHistoryMode;
 use dex_protocol::protocol::ThreadSettingsOverrides;
+use dex_protocol::user_input::ByteRange;
+use dex_protocol::user_input::TextElement;
 use dex_protocol::user_input::UserInput;
 use dex_utils_image::data_url_from_bytes;
 use image::GenericImageView;
@@ -40,9 +55,74 @@ use image::ImageBuffer;
 use image::Rgba;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
+
+const UPLOADED_FILE_ID: &str = "file_uploaded_image";
+
+#[derive(Default)]
+pub(super) struct RecordingFileAttachmentStore {
+    pub(super) uploads: Mutex<Vec<UploadRequest>>,
+    pub(super) resolve_errors: Mutex<HashMap<String, AttachmentStoreErrorKind>>,
+    pub(super) resolves: Mutex<HashMap<String, usize>>,
+    pub(super) resolve_barrier: Option<Arc<tokio::sync::Barrier>>,
+}
+
+impl AttachmentStore for RecordingFileAttachmentStore {
+    fn is_resolvable<'a>(&'a self, file_id: &'a str) -> IsResolvableFuture<'a> {
+        Box::pin(async move {
+            match self
+                .resolve(ResolveRequest {
+                    file_id,
+                    tags: HashMap::new(),
+                    download_url_ttl: None,
+                })
+                .await
+            {
+                Ok(_) => true,
+                Err(error) => error.kind() != AttachmentStoreErrorKind::NotFound,
+            }
+        })
+    }
+
+    fn upload(&self, request: UploadRequest) -> UploadFuture<'_> {
+        self.uploads.lock().expect("uploads lock").push(request);
+        Box::pin(async {
+            Ok(UploadResult::File {
+                file_id: UPLOADED_FILE_ID.to_string(),
+            })
+        })
+    }
+
+    fn resolve<'a>(&'a self, request: ResolveRequest<'a>) -> ResolveFuture<'a> {
+        *self
+            .resolves
+            .lock()
+            .expect("resolves lock")
+            .entry(request.file_id.to_string())
+            .or_default() += 1;
+        let error_kind = self
+            .resolve_errors
+            .lock()
+            .expect("resolve errors lock")
+            .get(request.file_id)
+            .copied();
+        let barrier = self.resolve_barrier.clone();
+        Box::pin(async move {
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+            }
+            match error_kind {
+                Some(kind) => Err(AttachmentStoreError::new(kind, "attachment unavailable")),
+                None => Ok(AttachmentMetadata::default()),
+            }
+        })
+    }
+}
 
 fn find_user_message_with_image(text: &str) -> Option<ResponseItem> {
     for line in text.lines() {
@@ -50,7 +130,7 @@ fn find_user_message_with_image(text: &str) -> Option<ResponseItem> {
         if trimmed.is_empty() {
             continue;
         }
-        let rollout: RolloutLine = match serde_json::from_str(trimmed) {
+        let rollout = match dex_rollout::parse_rollout_line(trimmed) {
             Ok(rollout) => rollout,
             Err(_) => continue,
         };
@@ -70,7 +150,10 @@ fn find_user_message_with_image(text: &str) -> Option<ResponseItem> {
 fn extract_image_url(item: &ResponseItem) -> Option<String> {
     match item {
         ResponseItem::Message { content, .. } => content.iter().find_map(|span| match span {
-            ContentItem::InputImage { image_url, .. } => Some(image_url.clone()),
+            ContentItem::InputImage {
+                image: ImageReference::Inline { image_url },
+                ..
+            } => Some(image_url.clone()),
             _ => None,
         }),
         _ => None,
@@ -141,7 +224,7 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
             },
         ])
         .with_thread_settings(ThreadSettingsOverrides {
-            environments: Some(local_selections(cwd.abs())),
+            environments: Some(local_requests(cwd.abs())),
             approval_policy: Some(AskForApproval::Never),
             sandbox_policy: Some(sandbox_policy),
             permission_profile,
@@ -169,6 +252,8 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
 
     let image_url = extract_image_url(&actual).expect("expected image url in rollout");
     let expected = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![
@@ -178,7 +263,7 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
                 ),
             },
             ContentItem::InputImage {
-                image_url,
+                image: ImageReference::Inline { image_url },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             ContentItem::InputText {
@@ -227,7 +312,9 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
     dex.start_or_steer_turn(
         TurnInputRequest::user_input(vec![
             UserInput::Image {
-                image_url: image_url.clone(),
+                image: ImageReference::Inline {
+                    image_url: image_url.clone(),
+                },
                 detail: None,
             },
             UserInput::Text {
@@ -236,7 +323,7 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
             },
         ])
         .with_thread_settings(ThreadSettingsOverrides {
-            environments: Some(local_selections(cwd.abs())),
+            environments: Some(local_requests(cwd.abs())),
             approval_policy: Some(AskForApproval::Never),
             sandbox_policy: Some(sandbox_policy),
             permission_profile,
@@ -264,11 +351,13 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
 
     let image_url = extract_image_url(&actual).expect("expected image url in rollout");
     let expected = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![
             ContentItem::InputImage {
-                image_url,
+                image: ImageReference::Inline { image_url },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             ContentItem::InputText {
@@ -280,6 +369,245 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
     };
 
     assert_eq!(strip_response_item_id(strip_metadata(actual)), expected);
+
+    Ok(())
+}
+
+/// Core must forward an opaque file ID and persist that same reference in canonical history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_image_passes_through_request_and_rollout() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let test = test_dex().build_with_auto_env(&server).await?;
+    let response_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-file"),
+            ev_assistant_message("msg-file", "done"),
+            ev_completed("resp-file"),
+        ]),
+    )
+    .await;
+
+    test.dex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![
+            UserInput::Image {
+                image: ImageReference::File {
+                    file_id: "file_123".to_string(),
+                },
+                detail: None,
+            },
+            UserInput::Text {
+                text: "file-backed image".to_string(),
+                text_elements: Vec::new(),
+            },
+        ]))
+        .await?;
+    wait_for_event(&test.dex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let request = response_mock.single_request();
+    assert!(request.input().iter().any(|item| {
+        item.get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| {
+                content.iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("input_image")
+                        && item.get("file_id").and_then(Value::as_str) == Some("file_123")
+                })
+            })
+    }));
+
+    test.dex.shutdown_and_wait().await?;
+    let rollout_path = test.dex.rollout_path().expect("rollout path");
+    let rollout_text = read_rollout_text(&rollout_path).await?;
+    let actual = find_user_message_with_image(&rollout_text)
+        .expect("expected user message with file image in rollout");
+    assert_eq!(
+        strip_response_item_id(strip_metadata(actual)),
+        ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputImage {
+                    image: ImageReference::File {
+                        file_id: "file_123".to_string(),
+                    },
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                },
+                ContentItem::InputText {
+                    text: "file-backed image".to_string(),
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    );
+
+    Ok(())
+}
+
+/// Uploaded images keep their original input positions and text spans in live and durable display
+/// history, even when earlier images fail preparation or expand into multiple model content items.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uploaded_images_preserve_user_message_display_history() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let test = test_dex()
+        .with_image_store(Arc::new(RecordingFileAttachmentStore::default()))
+        .with_history_mode(ThreadHistoryMode::Paginated)
+        .build_with_auto_env(&server)
+        .await?;
+    let image_path = test.cwd.path().join("display-image.png");
+    write_test_png(&image_path, [12, 34, 56, 255])?;
+    let image_url = data_url_from_bytes("image/png", &fs::read(&image_path)?);
+    let input = vec![
+        UserInput::Text {
+            text: "inspect these images".to_string(),
+            text_elements: vec![TextElement::new(
+                ByteRange { start: 0, end: 7 },
+                Some("<file>".to_string()),
+            )],
+        },
+        UserInput::LocalImage {
+            path: test.cwd.path().join("missing-image.png"),
+            detail: None,
+        },
+        UserInput::Image {
+            image: ImageReference::Inline {
+                image_url: "data:image/png;base64,bm90IGFuIGltYWdl".to_string(),
+            },
+            detail: None,
+        },
+        UserInput::LocalImage {
+            path: image_path,
+            detail: Some(ImageDetail::High),
+        },
+        UserInput::Image {
+            image: ImageReference::Inline {
+                image_url: image_url.clone(),
+            },
+            detail: None,
+        },
+        UserInput::Text {
+            text: "and this copy".to_string(),
+            text_elements: Vec::new(),
+        },
+        UserInput::Image {
+            image: ImageReference::File {
+                file_id: "file_existing".to_string(),
+            },
+            detail: Some(ImageDetail::Original),
+        },
+        UserInput::Image {
+            image: ImageReference::Inline { image_url },
+            detail: None,
+        },
+    ];
+    let mut expected_input = input.clone();
+    for index in [3, 4, 7] {
+        let detail = match &input[index] {
+            UserInput::Image { detail, .. } | UserInput::LocalImage { detail, .. } => *detail,
+            _ => unreachable!("these inputs are images"),
+        };
+        expected_input[index] = UserInput::Image {
+            image: ImageReference::File {
+                file_id: UPLOADED_FILE_ID.to_string(),
+            },
+            detail,
+        };
+    }
+    let response_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-display"),
+            ev_completed("resp-display"),
+        ]),
+    )
+    .await;
+    test.dex
+        .start_or_steer_turn(TurnInputRequest::user_input(input))
+        .await?;
+
+    let started = wait_for_event_match(&test.dex, |event| match event {
+        EventMsg::ItemStarted(event) => match &event.item {
+            TurnItem::UserMessage(item) => Some(item.clone()),
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+    let completed = wait_for_event_match(&test.dex, |event| match event {
+        EventMsg::ItemCompleted(event) => match &event.item {
+            TurnItem::UserMessage(item) => Some(item.clone()),
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+    assert_eq!(started.content, expected_input);
+    assert_eq!(completed.id, started.id);
+    assert_eq!(completed.client_id, started.client_id);
+    assert_eq!(completed.content, started.content);
+    wait_for_event(&test.dex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let request = response_mock.single_request();
+    let mut model_file_ids = Vec::new();
+    for item in request.input() {
+        if item.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        if let Some(content) = item.get("content").and_then(Value::as_array) {
+            for content_item in content {
+                if content_item.get("type").and_then(Value::as_str) == Some("input_image") {
+                    model_file_ids.push(
+                        content_item
+                            .get("file_id")
+                            .and_then(Value::as_str)
+                            .context("prepared image file ID")?
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(
+        model_file_ids,
+        vec![
+            UPLOADED_FILE_ID,
+            UPLOADED_FILE_ID,
+            "file_existing",
+            UPLOADED_FILE_ID,
+        ]
+    );
+
+    test.dex.shutdown_and_wait().await?;
+    let rollout_path = test.dex.rollout_path().context("rollout path")?;
+    let rollout_text = read_rollout_text(&rollout_path).await?;
+    let mut persisted_user_items = Vec::new();
+    for line in rollout_text.lines() {
+        if let RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) =
+            dex_rollout::parse_rollout_line(line)?.item
+            && let TurnItem::UserMessage(item) = event.item
+        {
+            persisted_user_items.push(item);
+        }
+    }
+    let [persisted] = persisted_user_items.as_slice() else {
+        panic!("expected exactly one persisted user message");
+    };
+    assert_eq!(persisted.id, completed.id);
+    assert_eq!(persisted.client_id, completed.client_id);
+    assert_eq!(persisted.content, completed.content);
 
     Ok(())
 }
@@ -319,7 +647,7 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
 
     let mut rollout_lines = fs::read_to_string(&rollout_path)?
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(dex_rollout::parse_rollout_line)
         .collect::<serde_json::Result<Vec<_>>>()?;
     let historical_content = rollout_lines
         .iter_mut()
@@ -340,7 +668,9 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
     historical_content.insert(
         /*index*/ 0,
         ContentItem::InputImage {
-            image_url: original_image_url.clone(),
+            image: ImageReference::Inline {
+                image_url: original_image_url.clone(),
+            },
             detail: Some(ImageDetail::High),
         },
     );
@@ -351,12 +681,15 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
         .join("\n");
     fs::write(&rollout_path, format!("{rollout}\n"))?;
 
-    let mut resume_builder = test_dex().with_config(|config| {
-        let _ = config.features.enable(Feature::ImageResizeNotice);
-        let _ = config
-            .features
-            .enable(Feature::RetainClientDeveloperMessages);
-    });
+    let resume_image_store = Arc::new(RecordingFileAttachmentStore::default());
+    let mut resume_builder = test_dex()
+        .with_image_store(resume_image_store.clone())
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::ImageResizeNotice);
+            let _ = config
+                .features
+                .enable(Feature::RetainClientDeveloperMessages);
+        });
     let resumed = resume_builder
         .resume(&server, initial.home.clone(), rollout_path.clone())
         .await?;
@@ -372,7 +705,9 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
     resumed
         .dex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Image {
-            image_url: original_image_url.clone(),
+            image: ImageReference::Inline {
+                image_url: original_image_url.clone(),
+            },
             detail: Some(ImageDetail::High),
         }]))
         .await?;
@@ -380,8 +715,24 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    {
+        let uploads = resume_image_store.uploads.lock().expect("uploads lock");
+        let [upload] = uploads.as_slice() else {
+            panic!("only the new image should be uploaded");
+        };
+        assert_eq!(
+            upload.thread_id,
+            resumed.session_configured.thread_id.to_string(),
+        );
+        assert_eq!(
+            image::load_from_memory(&upload.data)?.dimensions(),
+            (2048, 768)
+        );
+    }
 
     let request = resumed_mock.single_request();
+    assert!(request.has_content_kinds(&["images.resize_notice"]));
+    assert!(request.has_content_kinds(&["user.image"]));
     let input = request.input();
     let image_message_indices = input
         .iter()
@@ -417,6 +768,15 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
         .context("historical image data URL")?;
     let historical_image = image::load_from_memory(&BASE64_STANDARD.decode(encoded_image)?)?;
     assert_eq!(historical_image.dimensions(), (2048, 768));
+    assert_eq!(
+        input[image_message_indices[1]]
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|content| content.first())
+            .and_then(|item| item.get("file_id"))
+            .and_then(Value::as_str),
+        Some(UPLOADED_FILE_ID)
+    );
 
     let expected_notice = concat!(
         "<image_resize_notice>\n",
@@ -453,8 +813,17 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
     )
     .await;
     replayed.submit_turn("preserve recorded notices").await?;
-    let replayed_notices = replayed_mock
-        .single_request()
+    let replayed_request = replayed_mock.single_request();
+    assert!(replayed_request.input().iter().any(|item| {
+        item.get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| {
+                content.iter().any(|item| {
+                    item.get("file_id").and_then(Value::as_str) == Some(UPLOADED_FILE_ID)
+                })
+            })
+    }));
+    let replayed_notices = replayed_request
         .message_input_texts("developer")
         .into_iter()
         .filter(|text| text.starts_with("<image_resize_notice>"))
@@ -477,7 +846,9 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
             ResponseInputItem::Message {
                 role: "user".to_string(),
                 content: vec![ContentItem::InputImage {
-                    image_url: original_image_url,
+                    image: ImageReference::Inline {
+                        image_url: original_image_url,
+                    },
                     detail: Some(ImageDetail::High),
                 }],
                 phase: None,
@@ -497,7 +868,7 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
         .lines()
         .skip(existing_rollout_lines)
         .filter_map(|line| {
-            let RolloutItem::ResponseItem(envelope) = serde_json::from_str::<RolloutLine>(line)
+            let RolloutItem::ResponseItem(envelope) = dex_rollout::parse_rollout_line(line)
                 .expect("new rollout line should deserialize")
                 .item
             else {

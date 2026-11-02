@@ -2,9 +2,11 @@ use dex_api::OpenAiVerbosity;
 use dex_api::ResponsesApiRequest;
 use dex_api::TextControls;
 use dex_api::create_text_param_for_request;
+use dex_models_manager::model_info::model_info_from_slug;
 use dex_protocol::config_types::ServiceTier;
 use dex_protocol::models::FunctionCallOutputPayload;
 use dex_protocol::models::ImageDetail;
+use dex_protocol::models::ImageReference;
 use pretty_assertions::assert_eq;
 use serde_json::value::RawValue;
 use std::sync::Arc;
@@ -15,16 +17,25 @@ fn empty_tools() -> Arc<RawValue> {
     Arc::from(RawValue::from_string("[]".to_string()).expect("valid tool JSON"))
 }
 
-fn prompt_with_image_outputs() -> Prompt {
+fn prompt_with_image_outputs(detail: Option<ImageDetail>) -> Prompt {
     Prompt {
         input: vec![
             ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "user".to_string(),
-                content: vec![ContentItem::InputImage {
-                    image_url: "https://example.com/image.png".to_string(),
-                    detail: Some(ImageDetail::Original),
-                }],
+                content: vec![
+                    ContentItem::InputText {
+                        text: "Describe this image.".to_string(),
+                    },
+                    ContentItem::InputImage {
+                        image: ImageReference::Inline {
+                            image_url: "https://example.com/image.png".to_string(),
+                        },
+                        detail,
+                    },
+                ],
                 phase: None,
                 internal_chat_message_metadata_passthrough: None,
             },
@@ -35,8 +46,10 @@ fn prompt_with_image_outputs() -> Prompt {
                 namespace: None,
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
-                        image_url: "data:image/png;base64,function".to_string(),
-                        detail: Some(ImageDetail::High),
+                        image: ImageReference::Inline {
+                            image_url: "data:image/png;base64,function".to_string(),
+                        },
+                        detail,
                     },
                 ]),
                 internal_chat_message_metadata_passthrough: None,
@@ -47,8 +60,10 @@ fn prompt_with_image_outputs() -> Prompt {
                 name: None,
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
-                        image_url: "data:image/png;base64,custom".to_string(),
-                        detail: Some(ImageDetail::Auto),
+                        image: ImageReference::Inline {
+                            image_url: "data:image/png;base64,custom".to_string(),
+                        },
+                        detail,
                     },
                 ]),
                 internal_chat_message_metadata_passthrough: None,
@@ -58,58 +73,40 @@ fn prompt_with_image_outputs() -> Prompt {
     }
 }
 
-#[test]
-fn responses_lite_request_copies_strip_image_details() {
-    let prompt = prompt_with_image_outputs();
+#[test_case::test_case(Some(ImageDetail::Original), Some(ImageDetail::High); "original")]
+#[test_case::test_case(Some(ImageDetail::High), Some(ImageDetail::High); "high")]
+#[test_case::test_case(Some(ImageDetail::Auto), Some(ImageDetail::Auto); "auto")]
+#[test_case::test_case(Some(ImageDetail::Low), Some(ImageDetail::Low); "low")]
+#[test_case::test_case(None, None; "unspecified")]
+fn request_copies_project_image_details_for_receiving_model(
+    detail: Option<ImageDetail>,
+    unsupported_detail: Option<ImageDetail>,
+) {
+    let prompt = prompt_with_image_outputs(detail);
     let original = prompt.input.clone();
-
-    let stripped = prompt.get_formatted_input_for_request(/*use_responses_lite*/ true);
-
+    let mut model_info = model_info_from_slug("gpt-5.4");
+    model_info.use_responses_lite = false;
+    model_info.supports_image_detail_original = true;
     assert_eq!(
-        stripped,
-        vec![
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputImage {
-                    image_url: "https://example.com/image.png".to_string(),
-                    detail: None,
-                }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            },
-            ResponseItem::FunctionCallOutput {
-                id: None,
-                call_id: Some("function-call".to_string()),
-                name: None,
-                namespace: None,
-                output: FunctionCallOutputPayload::from_content_items(vec![
-                    FunctionCallOutputContentItem::InputImage {
-                        image_url: "data:image/png;base64,function".to_string(),
-                        detail: None,
-                    },
-                ]),
-                internal_chat_message_metadata_passthrough: None,
-            },
-            ResponseItem::CustomToolCallOutput {
-                id: None,
-                call_id: "custom-call".to_string(),
-                name: None,
-                output: FunctionCallOutputPayload::from_content_items(vec![
-                    FunctionCallOutputContentItem::InputImage {
-                        image_url: "data:image/png;base64,custom".to_string(),
-                        detail: None,
-                    },
-                ]),
-                internal_chat_message_metadata_passthrough: None,
-            },
-        ]
-    );
-    assert_eq!(prompt.input, original);
-    assert_eq!(
-        prompt.get_formatted_input_for_request(/*use_responses_lite*/ false),
+        prompt.get_formatted_input_for_request(&model_info),
         original
     );
+
+    model_info.supports_image_detail_original = false;
+    assert_eq!(
+        prompt.get_formatted_input_for_request(&model_info),
+        prompt_with_image_outputs(unsupported_detail).input
+    );
+
+    model_info.use_responses_lite = true;
+    for supports_original in [false, true] {
+        model_info.supports_image_detail_original = supports_original;
+        assert_eq!(
+            prompt.get_formatted_input_for_request(&model_info),
+            prompt_with_image_outputs(/*detail*/ None).input
+        );
+    }
+    assert_eq!(prompt.input, original);
 }
 
 #[test]
@@ -117,7 +114,6 @@ fn serializes_text_verbosity_when_set() {
     let input: Vec<ResponseItem> = vec![];
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
-        instructions: "i".to_string(),
         input,
         tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
@@ -134,6 +130,7 @@ fn serializes_text_verbosity_when_set() {
             format: None,
         }),
         client_metadata: None,
+        access_programs: None,
     };
 
     let v = serde_json::to_value(&req).expect("json");
@@ -164,7 +161,6 @@ fn serializes_text_schema_with_strict_format() {
 
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
-        instructions: "i".to_string(),
         input,
         tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
@@ -178,6 +174,7 @@ fn serializes_text_schema_with_strict_format() {
         service_tier: None,
         text: Some(text_controls),
         client_metadata: None,
+        access_programs: None,
     };
 
     let v = serde_json::to_value(&req).expect("json");
@@ -225,7 +222,6 @@ fn omits_text_when_not_set() {
     let input: Vec<ResponseItem> = vec![];
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
-        instructions: "i".to_string(),
         input,
         tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
@@ -239,6 +235,7 @@ fn omits_text_when_not_set() {
         service_tier: None,
         text: None,
         client_metadata: None,
+        access_programs: None,
     };
 
     let v = serde_json::to_value(&req).expect("json");
@@ -249,7 +246,6 @@ fn omits_text_when_not_set() {
 fn serializes_flex_service_tier_when_set() {
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
-        instructions: "i".to_string(),
         input: vec![],
         tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
@@ -263,6 +259,7 @@ fn serializes_flex_service_tier_when_set() {
         service_tier: Some(ServiceTier::Flex.to_string()),
         text: None,
         client_metadata: None,
+        access_programs: None,
     };
 
     let v = serde_json::to_value(&req).expect("json");

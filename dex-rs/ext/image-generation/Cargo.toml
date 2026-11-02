@@ -15,10 +15,12 @@ workspace = true
 [dependencies]
 base64 = { workspace = true }
 dex-api = { workspace = true }
+dex-attachment-store = { workspace = true }
 dex-core = { workspace = true }
 dex-exec-server = { workspace = true }
 dex-extension-api = { workspace = true }
 dex-extension-items = { workspace = true }
+dex-http-client = { workspace = true }
 dex-login = { workspace = true }
 dex-model-provider = { workspace = true }
 dex-model-provider-info = { workspace = true }
@@ -31,8 +33,11 @@ http = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+image = { workspace = true, features = ["png"] }
 pretty_assertions = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

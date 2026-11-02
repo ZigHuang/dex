@@ -1,57 +1,43 @@
 use crate::function_tool::FunctionCallError;
+use crate::safety::PatchPolicyMatcher;
 use crate::safety::SafetyCheck;
 use crate::safety::assess_patch_safety;
-use crate::session::turn_context::TurnContext;
+use crate::session::step_context::StepContext;
+use crate::session::turn_context::TurnEnvironment;
 use crate::tools::sandboxing::ExecApprovalRequirement;
 use dex_apply_patch::ApplyPatchAction;
 use dex_apply_patch::ApplyPatchFileChange;
-use dex_protocol::models::PermissionProfile;
 use dex_protocol::protocol::FileChange;
-use dex_protocol::protocol::FileSystemSandboxPolicy;
 use dex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-#[derive(Debug)]
-pub(crate) struct ApplyPatchRuntimeInvocation {
-    pub(crate) action: ApplyPatchAction,
-    pub(crate) auto_approved: bool,
-    pub(crate) exec_approval_requirement: ExecApprovalRequirement,
-}
-
-pub(crate) fn prepare_apply_patch(
-    turn_context: &TurnContext,
-    permission_profile: &PermissionProfile,
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    action: ApplyPatchAction,
-) -> Result<ApplyPatchRuntimeInvocation, FunctionCallError> {
+pub(crate) fn patch_approval_requirement(
+    step_context: &StepContext,
+    turn_environment: &TurnEnvironment,
+    matching: &PatchPolicyMatcher<'_>,
+    action: &ApplyPatchAction,
+) -> Result<ExecApprovalRequirement, FunctionCallError> {
     match assess_patch_safety(
-        &action,
-        turn_context.approval_policy(),
-        permission_profile,
-        file_system_sandbox_policy,
-        &action.cwd,
-        turn_context.windows_sandbox_level,
-    ) {
-        SafetyCheck::AutoApprove => Ok(ApplyPatchRuntimeInvocation {
-            action,
-            auto_approved: true,
-            exec_approval_requirement: ExecApprovalRequirement::Skip {
-                bypass_sandbox: false,
-                proposed_execpolicy_amendment: None,
-            },
+        action,
+        step_context.settings.approval_policy(),
+        turn_environment.permission_profile(),
+        matching,
+    )
+    .map_err(|error| {
+        FunctionCallError::RespondToModel(format!("failed to check patch permissions: {error}"))
+    })? {
+        SafetyCheck::AutoApprove => Ok(ExecApprovalRequirement::Skip {
+            bypass_sandbox: false,
+            proposed_execpolicy_amendment: None,
         }),
         SafetyCheck::AskUser => {
             // Delegate the approval prompt (including cached approvals) to the
             // tool runtime, consistent with how shell/unified_exec approvals
             // are orchestrator-driven.
-            Ok(ApplyPatchRuntimeInvocation {
-                action,
-                auto_approved: false,
-                exec_approval_requirement: ExecApprovalRequirement::NeedsApproval {
-                    reason: None,
-                    proposed_execpolicy_amendment: None,
-                },
+            Ok(ExecApprovalRequirement::NeedsApproval {
+                reason: None,
+                proposed_execpolicy_amendment: None,
             })
         }
         SafetyCheck::Reject { reason } => Err(FunctionCallError::RespondToModel(format!(

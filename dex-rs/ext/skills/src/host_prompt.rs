@@ -11,10 +11,11 @@ use crate::render::truncate_main_prompt_contents;
 /// Host skill prompts already supplied or superseded by an extension.
 ///
 /// Core preserves its host skill invocation lifecycle while avoiding duplicate
-/// prompts and retaining executor/orchestrator skill precedence.
+/// prompts and retaining executor/cloud skill precedence.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InjectedHostSkillPrompts {
     paths: HashSet<String>,
+    superseded_paths: HashSet<String>,
 }
 
 impl InjectedHostSkillPrompts {
@@ -24,12 +25,24 @@ impl InjectedHostSkillPrompts {
         self.paths.insert(path);
     }
 
+    pub fn insert_superseded_path(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        self.superseded_paths
+            .insert(normalize_host_skill_path(&path));
+        self.insert_path(path);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.paths.is_empty()
     }
 
     pub fn contains_path(&self, path: &str) -> bool {
         self.paths.contains(path) || self.paths.contains(&normalize_host_skill_path(path))
+    }
+
+    pub fn is_superseded_path(&self, path: &str) -> bool {
+        self.superseded_paths
+            .contains(&normalize_host_skill_path(path))
     }
 }
 
@@ -76,7 +89,7 @@ impl HostSkillsSnapshot {
                     }
                     prompts.fragments.push(Box::new(SkillInstructions {
                         name: skill.name.clone(),
-                        path: skill.path_to_skills_md.to_string_lossy().into_owned(),
+                        path: skill.path_to_skills_md.inferred_native_path_string(),
                         contents,
                         resource_access: None,
                     }));
@@ -86,7 +99,7 @@ impl HostSkillsSnapshot {
                     prompts.warnings.push(format!(
                         "Failed to load skill {} at {}: {err:#}",
                         skill.name,
-                        skill.path_to_skills_md.display()
+                        skill.path_to_skills_md.inferred_native_path_string()
                     ));
                 }
             }

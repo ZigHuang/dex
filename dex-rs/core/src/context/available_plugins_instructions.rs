@@ -2,11 +2,18 @@ use dex_protocol::protocol::PLUGINS_INSTRUCTIONS_CLOSE_TAG;
 use dex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
 
 use super::ContextualUserFragment;
+use dex_protocol::models::ContentItem;
+use dex_protocol::models::ContentItemKind;
+use dex_protocol::models::input_text;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AvailablePluginsInstructions;
 
 impl ContextualUserFragment for AvailablePluginsInstructions {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("plugins.usage_instructions".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }
@@ -22,7 +29,7 @@ impl ContextualUserFragment for AvailablePluginsInstructions {
         )
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let mut lines = vec![
             "## Plugins".to_string(),
             "A plugin is a local bundle of skills, MCP servers, and apps.".to_string(),
@@ -39,6 +46,6 @@ impl ContextualUserFragment for AvailablePluginsInstructions {
                 .to_string(),
         );
 
-        format!("\n{}\n", lines.join("\n"))
+        input_text(format!("\n{}\n", lines.join("\n")))
     }
 }

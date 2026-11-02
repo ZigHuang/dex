@@ -13,23 +13,39 @@ doctest = false
 workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
+dex-analytics = { workspace = true }
 dex-api = { workspace = true }
+dex-config = { workspace = true }
+dex-context-fragments = { workspace = true }
 dex-core = { workspace = true }
 dex-extension-api = { workspace = true }
 dex-features = { workspace = true }
+dex-guardian-context = { workspace = true }
+dex-guardian-reviewer = { workspace = true }
+dex-history = { workspace = true }
 dex-http-client = { workspace = true }
 dex-login = { workspace = true }
 dex-model-provider = { workspace = true }
 dex-protocol = { workspace = true }
+dex-prompts = { workspace = true }
+dex-websocket-client = { workspace = true }
+dirs = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
-anyhow = { workspace = true }
 dex-model-provider-info = { workspace = true }
+dex-protocol-test-support = { workspace = true }
+dex-utils-cargo-bin = { workspace = true }
 core_test_support = { workspace = true }
+insta = { workspace = true }
 pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = { workspace = true }
+zstd = { workspace = true }

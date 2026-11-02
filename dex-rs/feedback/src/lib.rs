@@ -17,9 +17,20 @@ use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::registry::LookupSpan;
 
 pub(crate) mod feedback_diagnostics;
+mod guardian;
 pub use feedback_diagnostics::FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME;
 pub use feedback_diagnostics::FeedbackDiagnostic;
 pub use feedback_diagnostics::FeedbackDiagnostics;
+pub use guardian::GuardianReviewFailures;
+pub use guardian::GuardianReviewRecord;
+pub use guardian::guardian_review_failures;
+pub use guardian::record_guardian_review_failure;
+
+pub struct FeedbackAttachment {
+    pub filename: String,
+    pub content_type: Option<String>,
+    pub buffer: Vec<u8>,
+}
 
 /// Filename used for the redacted `dex doctor --json` feedback attachment.
 pub const DOCTOR_REPORT_ATTACHMENT_FILENAME: &str = "dex-doctor-report.json";
@@ -158,6 +169,16 @@ pub fn emit_feedback_request_tags_with_auth_env(
 #[derive(Clone)]
 pub struct DexFeedback {
     inner: Arc<FeedbackInner>,
+}
+
+impl dex_state::LogWriteFailureReporter for DexFeedback {
+    fn report_failure(&self, diagnostic: &str) {
+        self.inner
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_bytes(diagnostic.as_bytes());
+    }
 }
 
 impl Default for DexFeedback {
@@ -349,6 +370,14 @@ pub struct FeedbackSnapshot {
 }
 
 impl FeedbackSnapshot {
+    pub fn log_attachment(&self, logs_override: Option<Vec<u8>>) -> FeedbackAttachment {
+        FeedbackAttachment {
+            filename: "dex-logs.log".to_string(),
+            content_type: Some("text/plain".to_string()),
+            buffer: logs_override.unwrap_or_else(|| self.bytes.clone()),
+        }
+    }
+
     pub fn feedback_diagnostics(&self) -> &FeedbackDiagnostics {
         &self.feedback_diagnostics
     }

@@ -3,4 +3,6 @@ load("//:defs.bzl", "dex_rust_crate")
 dex_rust_crate(
     name = "dex-mcp",
     crate_name = "dex_mcp",
+    extra_binaries = ["//dex-rs/cli:dex"],
+    test_data_extra = glob(["src/**/snapshots/**"]),
 )

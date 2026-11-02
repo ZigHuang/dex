@@ -1,11 +1,14 @@
 use crate::engine::ClaudeHooksEngine;
 use crate::engine::CommandShell;
+use crate::engine::ConfiguredHandler;
 use crate::engine::HookListEntry;
 use crate::engine::command_runner::CommandHookRuntime;
 use crate::events::compact::PostCompactRequest;
 use crate::events::compact::PreCompactOutcome;
 use crate::events::compact::PreCompactRequest;
 use crate::events::compact::StatelessHookOutcome;
+use crate::events::interrupt::InterruptOutcome;
+use crate::events::interrupt::InterruptRequest;
 use crate::events::permission_request::PermissionRequestOutcome;
 use crate::events::permission_request::PermissionRequestRequest;
 use crate::events::post_tool_use::PostToolUseOutcome;
@@ -30,8 +33,11 @@ use dex_config::ConfigLayerStack;
 use dex_plugin::ExecutorPluginHookSource;
 use dex_plugin::PluginHookSource;
 use dex_protocol::ThreadId;
+use dex_protocol::protocol::HookEventName;
+use dex_protocol::protocol::HookExecutionMode;
 use dex_protocol::shell_environment::scrub_non_inheritable_env_vars;
 use std::ffi::OsString;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
@@ -59,8 +65,10 @@ pub struct Hooks {
     // TODO: Once legacy `notify` is removed, capture this snapshot in `CommandHookRuntime::new`
     // and remove the environment plumbing from `Hooks` and `from_config`.
     environment: Arc<Vec<(OsString, OsString)>>,
-    after_agent: Vec<Hook>,
+    after_agent: Arc<[Hook]>,
     engine: ClaudeHooksEngine,
+    plugin_hook_sources: Arc<[PluginHookSource]>,
+    plugin_hook_load_warnings: Arc<[String]>,
 }
 
 impl Hooks {
@@ -76,13 +84,9 @@ impl Hooks {
         let hooks = Self::from_config(config, mcp_executor, Arc::clone(&environment), |shell| {
             CommandHookRuntime::new(shell, environment, thread_id, result_sender)
         });
-        let required_load_errors = hooks.engine.required_load_errors();
-        if !required_load_errors.is_empty() {
-            anyhow::bail!(
-                "failed to load required managed hooks: {}",
-                required_load_errors.join("; ")
-            );
-        }
+        crate::engine::discovery::ensure_required_hooks_loaded(
+            hooks.engine.required_load_errors(),
+        )?;
         Ok((hooks, result_receiver))
     }
 
@@ -96,9 +100,73 @@ impl Hooks {
         )
     }
 
+    pub fn matches_plugin_hooks<'a>(
+        &self,
+        sources: impl IntoIterator<Item = &'a PluginHookSource>,
+        warnings: impl IntoIterator<Item = &'a String>,
+    ) -> bool {
+        self.plugin_hook_sources.iter().eq(sources)
+            && self.plugin_hook_load_warnings.iter().eq(warnings)
+    }
+
+    /// Adds only owner-admitted requirements hooks; execution remains scoped to their environment.
+    pub fn with_environment_hooks(
+        &self,
+        sources: Vec<crate::EnvironmentHookSource>,
+        executor: Arc<dyn crate::HookEnvironmentExecutor>,
+    ) -> Self {
+        let discovered = self.discover_environment_hooks(sources);
+        let mut hooks = self.clone();
+        hooks.engine.command_runtime.environment_executor = Some(executor);
+        if !discovered.handlers.is_empty() {
+            Arc::make_mut(&mut hooks.engine.handlers).extend(discovered.handlers);
+        }
+        if !discovered.warnings.is_empty() {
+            let mut warnings = hooks.engine.warnings.to_vec();
+            warnings.extend(discovered.warnings);
+            hooks.engine.warnings = warnings.into();
+        }
+        hooks
+    }
+
+    /// List this session's declarations, including hooks that are disabled or not yet trusted.
+    pub fn list_with_environment_hooks(
+        &self,
+        sources: Vec<crate::EnvironmentHookSource>,
+    ) -> HookListOutcome {
+        let discovered = self.discover_environment_hooks(sources);
+        let mut hooks = self.engine.hook_entries.as_ref().clone();
+        hooks.extend(discovered.hook_entries);
+        let mut warnings = self.engine.warnings.to_vec();
+        warnings.extend(discovered.warnings);
+        HookListOutcome { hooks, warnings }
+    }
+
+    fn discover_environment_hooks(
+        &self,
+        sources: Vec<crate::EnvironmentHookSource>,
+    ) -> crate::engine::discovery::DiscoveryResult {
+        if !self.engine.enabled {
+            return crate::engine::discovery::DiscoveryResult::default();
+        }
+        let display_order = self
+            .engine
+            .hook_entries
+            .last()
+            .map_or(0, |entry| entry.display_order.saturating_add(1));
+        crate::engine::discovery::discover_environment_hooks(sources, display_order)
+    }
+
     pub fn with_executor_hooks(&self, executor_hooks: Vec<ExecutorPluginHookSource>) -> Self {
         let mut hooks = self.clone();
         hooks.engine.set_executor_hooks(executor_hooks);
+        hooks
+    }
+
+    pub fn for_memory_consolidation(&self, executor_hooks: Vec<ExecutorPluginHookSource>) -> Self {
+        let mut hooks = self.with_executor_hooks(executor_hooks);
+        Arc::make_mut(&mut hooks.engine.handlers)
+            .retain(ConfiguredHandler::runs_for_memory_consolidation);
         hooks
     }
 
@@ -122,8 +190,8 @@ impl Hooks {
             config.feature_enabled,
             config.bypass_hook_trust,
             config.config_layer_stack.as_ref(),
-            config.plugin_hook_sources,
-            config.plugin_hook_load_warnings,
+            config.plugin_hook_sources.clone(),
+            config.plugin_hook_load_warnings.clone(),
             command_runtime,
             mcp_executor,
         );
@@ -131,6 +199,8 @@ impl Hooks {
             environment,
             after_agent,
             engine,
+            plugin_hook_sources: config.plugin_hook_sources.into(),
+            plugin_hook_load_warnings: config.plugin_hook_load_warnings.into(),
         }
     }
 
@@ -276,6 +346,43 @@ impl Hooks {
     pub async fn run_session_end(&self, request: SessionEndRequest) -> SessionEndOutcome {
         self.engine.run_session_end(request).await
     }
+
+    pub fn preview_interrupt(&self) -> Vec<dex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_interrupt()
+    }
+
+    pub async fn run_interrupt(&self, request: InterruptRequest) -> InterruptOutcome {
+        self.engine.run_interrupt(request).await
+    }
+
+    /// None if unconfigured; Sync if any handler must finish before continuing.
+    pub fn execution_mode_for_event(&self, event: HookEventName) -> Option<HookExecutionMode> {
+        self.engine
+            .handlers
+            .iter()
+            .filter(|handler| handler.event_name == event)
+            .map(ConfiguredHandler::execution_mode)
+            .min_by_key(|mode| matches!(mode, HookExecutionMode::Async))
+    }
+
+    /// Run a hook task independently of the turn, but abort and join it at session shutdown.
+    pub fn schedule_async_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        self.engine.command_runtime.schedule_async_task(task);
+    }
+
+    pub fn preview_model_request(
+        &self,
+        request: &crate::ModelRequestHookInput,
+    ) -> Vec<dex_protocol::protocol::HookRunSummary> {
+        crate::events::model_request::preview(&self.engine.handlers, request)
+    }
+
+    pub async fn run_model_request(
+        &self,
+        request: crate::ModelRequestHookInput,
+    ) -> Vec<dex_protocol::protocol::HookCompletedEvent> {
+        crate::events::model_request::run(&self.engine, request).await
+    }
 }
 
 pub fn list_hooks(config: HooksConfig) -> HookListOutcome {
@@ -288,6 +395,7 @@ pub fn list_hooks(config: HooksConfig) -> HookListOutcome {
         config.plugin_hook_sources,
         config.plugin_hook_load_warnings,
         config.bypass_hook_trust,
+        crate::engine::discovery::DiscoveryMode::Listing,
     );
     HookListOutcome {
         hooks: discovered.hook_entries,
@@ -304,7 +412,7 @@ pub(crate) fn command_from_argv(
     if program.is_empty() {
         return None;
     }
-    let mut command = Command::new(program);
+    let mut command = Command::from(dex_utils_process::background_command(program));
     command.args(args);
     command.env_clear();
     command.envs(environment);

@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
 use dex_config::types::McpServerTransportConfig;
+use dex_core::config::edit::ConfigEditsBuilder;
 use dex_core::config::load_global_mcp_servers;
 use predicates::str::contains;
 use pretty_assertions::assert_eq;
@@ -70,6 +72,53 @@ async fn add_and_remove_server_updates_global_config() -> Result<()> {
     let servers = load_global_mcp_servers(dex_home.path()).await?;
     assert!(servers.is_empty());
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn npm_server_names_round_trip_through_cli() -> Result<()> {
+    let dex_home = TempDir::new()?;
+    let name = "npm:@modelcontextprotocol/server-sequential.thinking";
+
+    dex_command(dex_home.path())?
+        .args(["mcp", "add", name, "--", "echo", "hello"])
+        .assert()
+        .success();
+
+    let config = std::fs::read_to_string(dex_home.path().join("config.toml"))?;
+    assert!(config.contains(&format!("[mcp_servers.\"{name}\"]")));
+    let servers = load_global_mcp_servers(dex_home.path()).await?;
+    assert_eq!(
+        servers.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec![name]
+    );
+
+    let output = dex_command(dex_home.path())?
+        .args(["mcp", "get", name, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let server: serde_json::Value = serde_json::from_slice(&output)?;
+    assert_eq!(server["name"], name);
+
+    let output = dex_command(dex_home.path())?
+        .args(["mcp", "list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&output)?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["name"], name);
+
+    dex_command(dex_home.path())?
+        .args(["mcp", "remove", name])
+        .assert()
+        .success();
+    assert!(load_global_mcp_servers(dex_home.path()).await?.is_empty());
     Ok(())
 }
 
@@ -301,6 +350,40 @@ async fn add_streamable_http_without_manual_token() -> Result<()> {
 }
 
 #[tokio::test]
+async fn add_rejects_blank_client_credentials_before_saving() -> Result<()> {
+    let mut errors = Vec::new();
+    for (client_id, client_secret) in [("registered-client", "   "), ("   ", "cli-secret-marker")] {
+        let dex_home = TempDir::new()?;
+        let output = dex_command(dex_home.path())?
+            .args([
+                "mcp",
+                "add",
+                "private",
+                "--url",
+                "http://127.0.0.1:9/mcp",
+                "--oauth-client-id",
+                client_id,
+                "--oauth-client-secret",
+                client_secret,
+            ])
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(!stderr.contains("cli-secret-marker"));
+        assert!(!String::from_utf8(output.stdout)?.contains("cli-secret-marker"));
+        assert!(load_global_mcp_servers(dex_home.path()).await?.is_empty());
+        errors.push(stderr.trim().to_string());
+    }
+    insta::assert_snapshot!(errors.join("\n"), @r"
+    Error: --oauth-client-secret must not be empty
+    Error: --oauth-client-secret requires a nonempty --oauth-client-id
+    ");
+    Ok(())
+}
+
+#[tokio::test]
 async fn add_streamable_http_with_custom_env_var() -> Result<()> {
     let dex_home = TempDir::new()?;
 
@@ -342,10 +425,13 @@ async fn add_streamable_http_with_custom_env_var() -> Result<()> {
 #[tokio::test]
 async fn add_streamable_http_with_oauth_options() -> Result<()> {
     let dex_home = TempDir::new()?;
+    let expected_callback = "http://127.0.0.1/callback/w9gKTtkB7gWy";
 
     let mut add_cmd = dex_command(dex_home.path())?;
     add_cmd
         .args([
+            "-c",
+            "mcp_oauth_callback_port=43123",
             "mcp",
             "add",
             "oauth-server",
@@ -357,7 +443,8 @@ async fn add_streamable_http_with_oauth_options() -> Result<()> {
             "https://resource.example.com",
         ])
         .assert()
-        .success();
+        .success()
+        .stdout(contains(format!("OAuth callback URL: {expected_callback}")));
 
     let servers = load_global_mcp_servers(dex_home.path()).await?;
     let oauth_server = servers
@@ -365,8 +452,76 @@ async fn add_streamable_http_with_oauth_options() -> Result<()> {
         .expect("oauth server should exist");
     assert_eq!(oauth_server.oauth_client_id(), Some("eci-prd-pub-dex-123"));
     assert_eq!(
+        oauth_server
+            .oauth
+            .as_ref()
+            .and_then(|oauth| oauth.callback_url.as_deref()),
+        Some(expected_callback)
+    );
+    assert_eq!(
         oauth_server.oauth_resource.as_deref(),
         Some("https://resource.example.com")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_persists_issuer_bound_callback_before_starting_oauth() -> Result<()> {
+    let dex_home = TempDir::new()?;
+    let oauth_server = MockServer::start().await;
+    let issuer = format!("{}/mcp", oauth_server.uri());
+    let metadata = serde_json::json!({
+        "issuer": issuer,
+        "authorization_endpoint": "not-a-valid-authorization-url",
+        "token_endpoint": format!("{}/token", oauth_server.uri()),
+        "authorization_response_iss_parameter_supported": true,
+    });
+    let concurrent_dex_home = dex_home.path().to_path_buf();
+    let concurrent_servers = BTreeMap::from([(
+        "concurrent".to_string(),
+        toml::from_str("command = \"echo\"\nargs = [\"concurrent\"]")?,
+    )]);
+    let concurrent_add = std::sync::Once::new();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server/mcp"))
+        .respond_with(move |_: &wiremock::Request| {
+            concurrent_add.call_once(|| {
+                // Edit during discovery without starting another CLI inside the HTTP timeout.
+                ConfigEditsBuilder::new(&concurrent_dex_home)
+                    .replace_mcp_servers(&concurrent_servers)
+                    .apply_blocking()
+                    .expect("persist concurrent MCP server during discovery");
+            });
+            ResponseTemplate::new(200).set_body_json(metadata.clone())
+        })
+        .mount(&oauth_server)
+        .await;
+
+    let mut add_cmd = dex_command(dex_home.path())?;
+    add_cmd.args([
+        "mcp",
+        "add",
+        "issuer-bound",
+        "--url",
+        &format!("{}/mcp", oauth_server.uri()),
+        "--oauth-client-id",
+        "registered-client",
+    ]);
+    let output = tokio::task::spawn_blocking(move || add_cmd.output()).await??;
+
+    assert_cmd::assert::Assert::new(output)
+        .failure()
+        .stdout(contains("OAuth callback URL: http://127.0.0.1/callback"))
+        .stderr(contains("OAuth authorization endpoint must be a valid URL"));
+    let servers = load_global_mcp_servers(dex_home.path()).await?;
+    assert!(servers.contains_key("concurrent"));
+    assert_eq!(
+        servers["issuer-bound"]
+            .oauth
+            .as_ref()
+            .and_then(|oauth| oauth.callback_url.as_deref()),
+        Some("http://127.0.0.1/callback")
     );
 
     Ok(())

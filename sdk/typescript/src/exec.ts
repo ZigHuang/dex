@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 
 import type { DexConfigObject, DexConfigValue } from "./dexOptions";
 import { SandboxMode, ModelReasoningEffort, ApprovalMode, WebSearchMode } from "./threadOptions";
+import type { CyberAccessProgram } from "./turnOptions";
 
 export type DexExecArgs = {
   input: string;
@@ -13,6 +14,8 @@ export type DexExecArgs = {
   baseUrl?: string;
   apiKey?: string;
   threadId?: string | null;
+  // --thread-source; only applies when creating a new thread
+  threadSource?: string;
   images?: string[];
   // --model
   model?: string;
@@ -26,6 +29,8 @@ export type DexExecArgs = {
   skipGitRepoCheck?: boolean;
   // --output-schema
   outputSchemaFile?: string;
+  // --cyber-access-program
+  cyberAccessProgram?: CyberAccessProgram;
   // --config model_reasoning_effort
   modelReasoningEffort?: ModelReasoningEffort;
   // AbortSignal to cancel the execution
@@ -112,6 +117,10 @@ export class DexExec {
       commandArgs.push("--model", args.model);
     }
 
+    if (args.threadSource !== undefined && !args.threadId) {
+      commandArgs.push("--thread-source", args.threadSource);
+    }
+
     if (args.sandboxMode) {
       commandArgs.push("--sandbox", args.sandboxMode);
     }
@@ -132,6 +141,10 @@ export class DexExec {
 
     if (args.outputSchemaFile) {
       commandArgs.push("--output-schema", args.outputSchemaFile);
+    }
+
+    if (args.cyberAccessProgram !== undefined) {
+      commandArgs.push("--cyber-access-program", args.cyberAccessProgram);
     }
 
     if (args.modelReasoningEffort) {

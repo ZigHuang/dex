@@ -2,6 +2,10 @@ mod accepted_lines;
 mod client;
 mod events;
 mod facts;
+mod guardian_v2;
+mod product_attribution;
+mod thread_hint;
+mod turn_critical_path;
 
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -9,6 +13,7 @@ use std::time::UNIX_EPOCH;
 pub use accepted_lines::fingerprint_hash;
 pub use client::AnalyticsEventsClient;
 pub use events::AppServerRpcTransport;
+pub use events::GuardianAdditionalPermissions;
 pub use events::GuardianApprovalRequestSource;
 pub use events::GuardianReviewAnalyticsResult;
 pub use events::GuardianReviewDecision;
@@ -37,6 +42,7 @@ pub use facts::DexCompactionEvent;
 pub use facts::DexErrKind;
 pub use facts::DexGoalEvent;
 pub use facts::DexTurnSteerEvent;
+pub use facts::ElicitationType;
 pub use facts::ExternalAgentConfigImportCompletedInput;
 pub use facts::ExternalAgentConfigImportFailureInput;
 pub use facts::GoalEventKind;
@@ -46,6 +52,7 @@ pub use facts::ImagePreparationFact;
 pub use facts::ImagePreparationMetadata;
 pub use facts::InputError;
 pub use facts::InvocationType;
+pub use facts::McpToolCallElicitation;
 pub use facts::PluginInstallRequestSource;
 pub use facts::PluginInstallRequested;
 pub use facts::PluginInstallRequestedPlugin;
@@ -57,6 +64,7 @@ pub use facts::SkillInvocationLocation;
 pub use facts::SubAgentThreadStartedInput;
 pub use facts::ThreadInitializationMode;
 pub use facts::TrackEventsContext;
+pub use facts::TurnAnalyticsMetadata;
 pub use facts::TurnDexErrorFact;
 pub use facts::TurnProfile;
 pub use facts::TurnProfileFact;
@@ -67,6 +75,13 @@ pub use facts::TurnSteerRequestError;
 pub use facts::TurnSteerResult;
 pub use facts::TurnTokenUsageFact;
 pub use facts::build_track_events_context;
+pub use guardian_v2::GuardianV2Event;
+pub use guardian_v2::GuardianV2EventKind;
+pub use product_attribution::ThreadProductUpdate;
+pub use thread_hint::ThreadHintStatus;
+pub use thread_hint::ThreadHintStatusEvent;
+pub use turn_critical_path::TurnCriticalPath;
+pub use turn_critical_path::TurnCriticalPathDurations;
 
 pub fn now_unix_seconds() -> u64 {
     SystemTime::now()
@@ -83,4 +98,18 @@ pub fn now_unix_millis() -> u64 {
             .as_millis(),
     )
     .unwrap_or(u64::MAX)
+}
+
+pub(crate) fn serialize_enum_as_string<T: serde::Serialize>(value: &T) -> Option<String> {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+}
+
+pub(crate) fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn option_i64_to_u64(value: Option<i64>) -> Option<u64> {
+    value.and_then(|value| u64::try_from(value).ok())
 }

@@ -2,7 +2,7 @@ use anyhow::Result;
 use core_test_support::TempDirExt;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
-use core_test_support::test_dex::local_selections;
+use core_test_support::test_dex::local_requests;
 use core_test_support::test_dex::test_dex;
 use core_test_support::wait_for_event;
 use dex_core::config::Constrained;
@@ -69,7 +69,7 @@ async fn thread_settings_update_without_user_turn_does_not_record_environment_up
     core_test_support::submit_thread_settings(
         &test.dex,
         dex_protocol::protocol::ThreadSettingsOverrides {
-            environments: Some(local_selections(new_cwd.abs())),
+            environments: Some(local_requests(new_cwd.abs())),
             ..Default::default()
         },
     )

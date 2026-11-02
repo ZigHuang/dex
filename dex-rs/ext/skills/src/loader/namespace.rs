@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use dex_exec_server::ExecutorFileSystem;
+use dex_exec_server::EnvironmentAccess;
 use dex_utils_path_uri::PathUri;
 use dex_utils_plugins::plugin_namespace_for_root_uri;
 use futures::StreamExt;
@@ -37,7 +37,7 @@ impl SkillNamespaceResolver {
     }
 
     pub(crate) async fn discover(
-        fs: &dyn ExecutorFileSystem,
+        fs: &dyn EnvironmentAccess,
         root: &PathUri,
         skill_paths: &[PathUri],
         plugin_roots: HashSet<PathUri>,

@@ -1,3 +1,5 @@
+#[path = "buffered_operations_tests.rs"]
+mod buffered_operations;
 mod manager_metrics;
 mod otel_export_routing_policy;
 mod runtime_summary;

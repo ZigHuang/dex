@@ -58,6 +58,13 @@ pub(super) fn mcp_startup_failure_reason(
     if !error.is_authentication_required() {
         return None;
     }
+    if let StartupOutcomeError::Failed {
+        is_ema_authentication_required: true,
+        ..
+    } = error
+    {
+        return Some(McpStartupFailureReason::ReauthenticationRequired);
+    }
     match auth_state {
         Some(
             McpAuthState::LoggedOut(McpLoginRequirement::Reauthentication) | McpAuthState::OAuth,
@@ -78,6 +85,15 @@ pub(super) fn mcp_init_error_display(
     error: &StartupOutcomeError,
     reason: Option<McpStartupFailureReason>,
 ) -> String {
+    let server_key = if !server_name.is_empty()
+        && server_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        server_name.to_string()
+    } else {
+        serde_json::Value::String(server_name.to_string()).to_string()
+    };
     if let Some(McpServerTransportConfig::StreamableHttp {
         url,
         bearer_token_env_var,
@@ -89,14 +105,17 @@ pub(super) fn mcp_init_error_display(
         && http_headers.as_ref().map(HashMap::is_empty).unwrap_or(true)
     {
         format!(
-            "GitHub MCP does not support OAuth. Log in by adding a personal access token (https://github.com/settings/personal-access-tokens) to your environment and config.toml:\n[mcp_servers.{server_name}]\nbearer_token_env_var = DEX_GITHUB_PERSONAL_ACCESS_TOKEN"
+            "GitHub MCP does not support OAuth. Log in by adding a personal access token (https://github.com/settings/personal-access-tokens) to your environment and config.toml:\n[mcp_servers.{server_key}]\nbearer_token_env_var = DEX_GITHUB_PERSONAL_ACCESS_TOKEN"
         )
     } else if error.is_authentication_required() {
-        let recovery_hint = if config.is_some_and(|config| !config.is_local_environment()) {
-            "Use your client's MCP OAuth sign-in flow.".to_string()
-        } else {
-            format!("Run `dex mcp login {server_name}`.")
-        };
+        let recovery_hint =
+            if config.is_some_and(|config| matches!(config.auth, McpServerAuth::EmaAuth)) {
+                "Sign in to your enterprise provider in Dex, then start a new thread.".to_string()
+            } else if config.is_some_and(|config| !config.is_local_environment()) {
+                "Use your client's MCP OAuth sign-in flow.".to_string()
+            } else {
+                format!("Run `dex mcp login {server_name}`.")
+            };
         let auth_status = match reason {
             Some(McpStartupFailureReason::ReauthenticationRequired) => {
                 "requires OAuth reauthentication"
@@ -116,7 +135,7 @@ pub(super) fn mcp_init_error_display(
             .unwrap_or(DEFAULT_STARTUP_TIMEOUT)
             .as_secs();
         format!(
-            "MCP client for `{server_name}` timed out after {startup_timeout_secs} seconds. Add or adjust `startup_timeout_sec` in your config.toml:\n[mcp_servers.{server_name}]\nstartup_timeout_sec = XX"
+            "MCP client for `{server_name}` timed out after {startup_timeout_secs} seconds. Add or adjust `startup_timeout_sec` in your config.toml:\n[mcp_servers.{server_key}]\nstartup_timeout_sec = XX"
         )
     } else {
         format!("MCP client for `{server_name}` failed to start: {error:#}")

@@ -8,7 +8,7 @@ async fn api_key_setup_accepts_pasted_credentials() {
     widget.highlighted_mode = SignInOption::ApiKey;
 
     widget.start_api_key_entry();
-    assert!(widget.is_api_key_entry_active());
+    assert!(widget.is_text_entry_active());
     *widget.sign_in_state.write().unwrap() = SignInState::ApiKeyEntry(ApiKeyInputState {
         value: String::new(),
         prepopulated_from_env: false,

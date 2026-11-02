@@ -18,6 +18,7 @@ dex-analytics = { workspace = true }
 dex-core = { workspace = true }
 dex-extension-api = { workspace = true }
 dex-otel = { workspace = true }
+dex-prompts = { workspace = true }
 dex-protocol = { workspace = true }
 dex-rollout = { workspace = true }
 dex-state = { workspace = true }

@@ -1,0 +1,6 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "realtime-webrtc",
+    crate_name = "dex_realtime_webrtc",
+)

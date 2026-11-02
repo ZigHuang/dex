@@ -2,7 +2,7 @@ use dex_tools::FreeformTool;
 use dex_tools::FreeformToolFormat;
 use dex_tools::ToolSpec;
 
-const APPLY_PATCH_LARK_GRAMMAR: &str = include_str!("apply_patch.lark");
+const APPLY_PATCH_LARK_GRAMMAR: &str = include_str!("../../../assets/tools/apply_patch.lark");
 
 /// Returns a custom tool that can be used to edit files. Well-suited for GPT-5 models
 /// https://platform.openai.com/docs/guides/function-calling#custom-tools

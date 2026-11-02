@@ -12,6 +12,7 @@ use dex_protocol::protocol::EnvironmentConfig;
 use dex_protocol::protocol::EnvironmentConfigState;
 use dex_protocol::protocol::GranularApprovalConfig;
 use dex_protocol::protocol::TurnEnvironmentSelection;
+use dex_protocol::sandbox::SandboxOverride;
 use dex_sandboxing::SandboxManager;
 use dex_sandboxing::SandboxType;
 use dex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
@@ -22,11 +23,17 @@ use std::collections::HashMap;
 fn test_turn_environment(environment_id: &str) -> crate::session::turn_context::TurnEnvironment {
     crate::session::turn_context::TurnEnvironment::new(
         TurnEnvironmentSelection {
+            selected_capability_roots: Default::default(),
             environment_id: environment_id.to_string(),
             cwd: PathUri::from_abs_path(&std::env::temp_dir().abs()),
             workspace_roots: Vec::new(),
             config: EnvironmentConfigState::Ready(EnvironmentConfig {
+                environment_hooks: Default::default(),
                 allow_login_shell: true,
+                workspace_roots: Vec::new(),
+                windows_sandbox_level: WindowsSandboxLevel::Disabled,
+                windows_sandbox_type: SandboxType::None,
+                use_legacy_landlock: false,
                 permission_profile: PermissionProfileSnapshot::legacy(
                     PermissionProfile::read_only(),
                 ),
@@ -87,7 +94,7 @@ async fn approval_action_preserves_patch_path_uris() {
         permissions_preapproved: false,
     };
 
-    let approval_action = ApplyPatchRuntime::build_approval_action(&request, "call-1");
+    let approval_action = request.approval_action("call-1");
 
     assert_eq!(
         approval_action,
@@ -124,8 +131,7 @@ async fn permission_request_payload_uses_apply_patch_hook_name_and_aliases() {
         permissions_preapproved: false,
     };
 
-    let payload =
-        ApplyPatchRuntime::build_approval_action(&req, "call-1").permission_request_payload();
+    let payload = req.approval_action("call-1").permission_request_payload();
 
     assert_eq!(payload.tool_name.name(), "apply_patch");
     assert_eq!(
@@ -234,6 +240,7 @@ async fn file_system_sandbox_context_preserves_executor_workspace_permissions() 
     let manager = SandboxManager::new();
     let sandbox_policy_cwd = PathUri::from_abs_path(&path);
     let attempt = SandboxAttempt {
+        sandbox_override: SandboxOverride::NoOverride,
         sandbox: SandboxType::MacosSeatbelt,
         sandbox_requested: true,
         permissions: &permissions,
@@ -242,10 +249,10 @@ async fn file_system_sandbox_context_preserves_executor_workspace_permissions() 
         manager: &manager,
         sandbox_cwd: &sandbox_policy_cwd,
         workspace_roots: std::slice::from_ref(&sandbox_policy_cwd),
-        dex_linux_sandbox_exe: None,
+        sandbox_exe: None,
         use_legacy_landlock: true,
+        windows_sandbox_type: SandboxType::WindowsRestrictedToken,
         windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
-        windows_sandbox_private_desktop: true,
         network_denial_cancellation_token: None,
         network_proxy: None,
     };
@@ -261,21 +268,19 @@ async fn file_system_sandbox_context_preserves_executor_workspace_permissions() 
     );
     let expected_permissions =
         PermissionProfile::from_runtime_permissions(&file_system_policy, network_policy);
-    let native_permissions: PermissionProfile = sandbox
-        .permissions
-        .clone()
-        .try_into()
-        .expect("native sandbox permissions");
-    assert_eq!(native_permissions, expected_permissions);
+    assert_eq!(sandbox.permissions, expected_permissions);
     assert_eq!(
         sandbox.cwd,
-        Some(dex_utils_path_uri::PathUri::from_abs_path(&path))
+        dex_utils_path_uri::PathUri::from_abs_path(&path)
     );
     assert_eq!(
-        sandbox.windows_sandbox_level,
-        WindowsSandboxLevel::RestrictedToken
+        sandbox.windows_sandbox_selection,
+        if cfg!(windows) {
+            dex_file_system::WindowsSandboxSelection::RestrictedToken
+        } else {
+            dex_file_system::WindowsSandboxSelection::Disabled
+        }
     );
-    assert_eq!(sandbox.windows_sandbox_private_desktop, true);
     assert_eq!(sandbox.use_legacy_landlock, true);
 }
 
@@ -284,7 +289,7 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
     let path = std::env::temp_dir()
         .join("apply-patch-runtime-none.txt")
         .abs();
-    let req = ApplyPatchRequest {
+    let mut req = ApplyPatchRequest {
         turn_environment: test_turn_environment(dex_exec_server::LOCAL_ENVIRONMENT_ID),
         action: ApplyPatchAction::new_add_for_test(
             &PathUri::from_abs_path(&path),
@@ -303,6 +308,7 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
     let manager = SandboxManager::new();
     let sandbox_policy_cwd = PathUri::from_abs_path(&path);
     let attempt = SandboxAttempt {
+        sandbox_override: SandboxOverride::NoOverride,
         sandbox: SandboxType::None,
         sandbox_requested: false,
         permissions: &permissions,
@@ -311,10 +317,10 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
         manager: &manager,
         sandbox_cwd: &sandbox_policy_cwd,
         workspace_roots: std::slice::from_ref(&sandbox_policy_cwd),
-        dex_linux_sandbox_exe: None,
+        sandbox_exe: None,
         use_legacy_landlock: false,
+        windows_sandbox_type: SandboxType::None,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
         network_denial_cancellation_token: None,
         network_proxy: None,
     };
@@ -325,6 +331,8 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
     );
 
     let cwd = PathUri::parse("file:///C:/workspace").expect("Windows workspace URI");
+    let user_home_dir = PathUri::parse("file:///C:/Users/remote").expect("Windows home URI");
+    req.turn_environment.user_home_dir = Some(user_home_dir.clone());
     let permissions = PermissionProfile::workspace_write();
     let attempt = SandboxAttempt {
         sandbox_requested: true,
@@ -338,11 +346,13 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
     assert_eq!(
         ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt),
         Some(FileSystemSandboxContext {
-            permissions: permissions.into(),
-            cwd: Some(cwd.clone()),
+            sandbox_override: SandboxOverride::NoOverride,
+            permissions,
+            cwd: cwd.clone(),
             workspace_roots: vec![cwd],
-            windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
-            windows_sandbox_private_desktop: false,
+            user_home_dir: Some(user_home_dir),
+            temporary_directories: None,
+            windows_sandbox_selection: dex_file_system::WindowsSandboxSelection::RestrictedToken,
             windows_sandbox_proxy_settings_mode: None,
             use_legacy_landlock: false,
         })

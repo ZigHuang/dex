@@ -13,7 +13,8 @@ doctest = false
 workspace = true
 
 [dependencies]
-anyhow = { workspace = true }
+dex-http-client = { workspace = true }
+dex-websocket-client = { workspace = true }
 axum = { workspace = true, default-features = false, features = [
     "http1",
     "json",
@@ -21,22 +22,20 @@ axum = { workspace = true, default-features = false, features = [
     "ws",
 ] }
 base64 = { workspace = true }
-clap = { workspace = true, features = ["derive"] }
 dex-api = { workspace = true }
 dex-app-server-protocol = { workspace = true }
 dex-core = { workspace = true }
 dex-login = { workspace = true }
 dex-model-provider = { workspace = true }
+dex-protocol = { workspace = true }
 dex-state = { workspace = true }
 dex-uds = { workspace = true }
 dex-utils-absolute-path = { workspace = true }
 dex-utils-rustls-provider = { workspace = true }
-constant_time_eq = { workspace = true }
+dex-websocket-auth = { workspace = true }
 futures = { workspace = true }
 gethostname = { workspace = true }
-hmac = { workspace = true }
 httpdate = { workspace = true }
-jsonwebtoken = { workspace = true }
 owo-colors = { workspace = true, features = ["supports-colors"] }
 rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -54,11 +53,15 @@ tokio-util = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
 url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v7"] }
+zstd = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+signal-hook = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
 dex-config = { workspace = true }
-dex-protocol = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

@@ -1,3 +1,5 @@
+use dex_context_fragments::set_annotated_content;
+use dex_context_fragments::to_annotated_content;
 use dex_history::ResponseItemEnvelope;
 use dex_protocol::ResponseItemId;
 use dex_protocol::models::ContentItem;
@@ -8,13 +10,11 @@ use dex_protocol::openai_models::InputModality;
 use std::collections::HashSet;
 use uuid::Uuid;
 
+use crate::context::ContextualUserFragment;
+use crate::context::UnsupportedMedia;
 use crate::util::error_or_panic;
 use tracing::info;
 
-const IMAGE_CONTENT_OMITTED_PLACEHOLDER: &str =
-    "image content omitted because you do not support image input";
-const AUDIO_CONTENT_OMITTED_PLACEHOLDER: &str =
-    "audio content omitted because you do not support audio input";
 // Changing this value would change model-visible IDs and invalidate prompt caches.
 const SYNTHETIC_OUTPUT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 
@@ -87,9 +87,17 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
             ResponseItem::CustomToolCall { id, call_id, .. }
                 if !custom_tool_output_ids.contains(call_id.as_str()) =>
             {
-                error_or_panic(format!(
-                    "Custom tool call output is missing for call id: {call_id}"
-                ));
+                // Preserved-prefix forks mark copied calls as inherited. A call still
+                // running in the parent has no output in the child's snapshot.
+                if !envelope
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.inherited_user_message)
+                {
+                    error_or_panic(format!(
+                        "Custom tool call output is missing for call id: {call_id}"
+                    ));
+                }
                 missing_outputs_to_insert.push((
                     idx,
                     ResponseItemEnvelope::new(ResponseItem::CustomToolCallOutput {
@@ -107,9 +115,17 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
                 call_id: Some(call_id),
                 ..
             } if !function_output_ids.contains(call_id.as_str()) => {
-                error_or_panic(format!(
-                    "Local shell call output is missing for call id: {call_id}"
-                ));
+                // Preserved-prefix forks mark copied calls as inherited. A call still
+                // running in the parent has no output in the child's snapshot.
+                if !envelope
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.inherited_user_message)
+                {
+                    error_or_panic(format!(
+                        "Local shell call output is missing for call id: {call_id}"
+                    ));
+                }
                 missing_outputs_to_insert.push((
                     idx,
                     ResponseItemEnvelope::new(ResponseItem::FunctionCallOutput {
@@ -338,19 +354,16 @@ pub(crate) fn strip_images_when_unsupported(
 
     for envelope in items.iter_mut() {
         match &mut envelope.item {
-            ResponseItem::Message { content, .. } => {
-                let mut normalized_content = Vec::with_capacity(content.len());
-                for content_item in content.iter() {
-                    match content_item {
-                        ContentItem::InputImage { .. } => {
-                            normalized_content.push(ContentItem::InputText {
-                                text: IMAGE_CONTENT_OMITTED_PLACEHOLDER.to_string(),
-                            });
-                        }
-                        _ => normalized_content.push(content_item.clone()),
+            ResponseItem::Message { .. } => {
+                let Some(mut content) = to_annotated_content(&mut envelope.item) else {
+                    continue;
+                };
+                for content_item in &mut content {
+                    if matches!(content_item.content(), ContentItem::InputImage { .. }) {
+                        *content_item = UnsupportedMedia::IMAGE.render_fragment().into_parts().1;
                     }
                 }
-                *content = normalized_content;
+                let _ = set_annotated_content(&mut envelope.item, content);
             }
             ResponseItem::FunctionCallOutput { output, .. }
             | ResponseItem::CustomToolCallOutput { output, .. } => {
@@ -359,11 +372,8 @@ pub(crate) fn strip_images_when_unsupported(
                     for content_item in content_items.iter() {
                         match content_item {
                             FunctionCallOutputContentItem::InputImage { .. } => {
-                                normalized_content_items.push(
-                                    FunctionCallOutputContentItem::InputText {
-                                        text: IMAGE_CONTENT_OMITTED_PLACEHOLDER.to_string(),
-                                    },
-                                );
+                                normalized_content_items
+                                    .push(UnsupportedMedia::IMAGE.render().into());
                             }
                             _ => normalized_content_items.push(content_item.clone()),
                         }
@@ -391,14 +401,16 @@ pub(crate) fn strip_audio_when_unsupported(
 
     for envelope in items.iter_mut() {
         match &mut envelope.item {
-            ResponseItem::Message { content, .. } => {
-                for content_item in content.iter_mut() {
-                    if matches!(content_item, ContentItem::InputAudio { .. }) {
-                        *content_item = ContentItem::InputText {
-                            text: AUDIO_CONTENT_OMITTED_PLACEHOLDER.to_string(),
-                        };
+            ResponseItem::Message { .. } => {
+                let Some(mut content) = to_annotated_content(&mut envelope.item) else {
+                    continue;
+                };
+                for content_item in &mut content {
+                    if matches!(content_item.content(), ContentItem::InputAudio { .. }) {
+                        *content_item = UnsupportedMedia::AUDIO.render_fragment().into_parts().1;
                     }
                 }
+                let _ = set_annotated_content(&mut envelope.item, content);
             }
             ResponseItem::FunctionCallOutput { output, .. }
             | ResponseItem::CustomToolCallOutput { output, .. } => {
@@ -408,9 +420,7 @@ pub(crate) fn strip_audio_when_unsupported(
                             content_item,
                             FunctionCallOutputContentItem::InputAudio { .. }
                         ) {
-                            *content_item = FunctionCallOutputContentItem::InputText {
-                                text: AUDIO_CONTENT_OMITTED_PLACEHOLDER.to_string(),
-                            };
+                            *content_item = UnsupportedMedia::AUDIO.render().into();
                         }
                     }
                 }

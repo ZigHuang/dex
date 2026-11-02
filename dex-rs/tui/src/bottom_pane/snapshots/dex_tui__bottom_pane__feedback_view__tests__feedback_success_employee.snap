@@ -1,0 +1,10 @@
+---
+source: tui/src/bottom_pane/feedback_view.rs
+expression: rendered
+---
+• Feedback uploaded. You can share this in #dex-feedback:
+
+  http://go/dex-feedback-internal
+
+  Sentry Feedback ID: thread-2
+  Sentry URL: https://go/dex-feedback/thread-2

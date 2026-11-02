@@ -1,0 +1,6 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "otel-trace-websocket",
+    crate_name = "dex_otel_trace_websocket",
+)

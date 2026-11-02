@@ -122,7 +122,7 @@ async fn responses_api_emits_api_request_event() {
     let response_mock = mount_sse_once(&server, sse(vec![ev_completed("done")])).await;
 
     let TestDex { dex, .. } = test_dex()
-        .with_model("gpt-5.4")
+        .with_model("gpt-5.5")
         .with_config(|config| {
             config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
             config.model_reasoning_effort = Some(ReasoningEffort::High);
@@ -510,13 +510,14 @@ async fn process_sse_failed_event_logs_response_completed_parse_error() {
 
 #[tokio::test]
 #[traced_test]
-async fn process_sse_emits_completed_telemetry() {
+async fn process_sse_emits_completed_telemetry_with_delta_logs_disabled() {
     let server = start_mock_server().await;
 
-    mount_sse_once(
+    let mock = mount_sse_once(
         &server,
         sse(vec![
             ev_reasoning_item_added("reasoning-1", &[]),
+            ev_reasoning_summary_text_delta("Thinking"),
             serde_json::json!({
                 "type": "response.completed",
                 "response": {
@@ -537,7 +538,13 @@ async fn process_sse_emits_completed_telemetry() {
     )
     .await;
 
-    let TestDex { dex, .. } = test_dex().build(&server).await.unwrap();
+    let TestDex { dex, .. } = test_dex()
+        .with_config(|config| {
+            config.otel.log_sse_deltas = false;
+        })
+        .build_with_auto_env(&server)
+        .await
+        .unwrap();
 
     dex.start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
         text: "hello".into(),
@@ -547,6 +554,19 @@ async fn process_sse_emits_completed_telemetry() {
     .unwrap();
 
     wait_for_event(&dex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let _request = mock.single_request();
+    logs_assert(|lines: &[&str]| {
+        let delta_logged = lines.iter().any(|line| {
+            line.contains("dex.sse_event")
+                && line.contains("event.kind=response.reasoning_summary_text.delta")
+        });
+        if delta_logged {
+            Err("unexpected successful SSE delta log".to_string())
+        } else {
+            Ok(())
+        }
+    });
 
     logs_assert(|lines: &[&str]| {
         lines
@@ -1387,68 +1407,6 @@ async fn handle_exec_command_user_approved_for_session_records_tool_decision() {
 
 #[tokio::test]
 #[traced_test]
-async fn handle_sandbox_error_user_approves_retry_records_tool_decision() {
-    let server = start_mock_server().await;
-    let command = touch_command("dex-otel-approval-test");
-
-    mount_sse_once(
-        &server,
-        sse(vec![
-            exec_command_call("sandbox_retry_call", &command),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-    mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-1", "shell command done"),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-
-    let TestDex { dex, .. } = test_dex()
-        .with_config(|config| {
-            config.permissions.approval_policy =
-                Constrained::allow_any(AskForApproval::UnlessTrusted);
-        })
-        .build(&server)
-        .await
-        .unwrap();
-
-    dex.start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-        text: "retry".into(),
-        text_elements: Vec::new(),
-    }]))
-    .await
-    .unwrap();
-
-    let approval_event =
-        wait_for_event(&dex, |ev| matches!(ev, EventMsg::ExecApprovalRequest(_))).await;
-    let EventMsg::ExecApprovalRequest(approval) = approval_event else {
-        panic!("expected ExecApprovalRequest event");
-    };
-
-    dex.submit(Op::ExecApproval {
-        id: approval.effective_approval_id(),
-        turn_id: None,
-        decision: ReviewDecision::Approved,
-    })
-    .await
-    .unwrap();
-
-    wait_for_event(&dex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
-
-    logs_assert(tool_decision_assertion(
-        "sandbox_retry_call",
-        "approved",
-        "user",
-    ));
-}
-
-#[tokio::test]
-#[traced_test]
 async fn handle_exec_command_user_denies_records_tool_decision() {
     let server = start_mock_server().await;
     let command = touch_command("dex-otel-approval-test");
@@ -1504,131 +1462,6 @@ async fn handle_exec_command_user_denies_records_tool_decision() {
 
     logs_assert(tool_decision_assertion(
         "user_denied_call",
-        "denied",
-        "user",
-    ));
-}
-
-#[tokio::test]
-#[traced_test]
-async fn handle_sandbox_error_user_approves_for_session_records_tool_decision() {
-    let server = start_mock_server().await;
-    let command = touch_command("dex-otel-approval-test");
-
-    mount_sse_once(
-        &server,
-        sse(vec![
-            exec_command_call("sandbox_session_call", &command),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-    mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-1", "shell command done"),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-
-    let TestDex { dex, .. } = test_dex()
-        .with_config(|config| {
-            config.permissions.approval_policy =
-                Constrained::allow_any(AskForApproval::UnlessTrusted);
-        })
-        .build(&server)
-        .await
-        .unwrap();
-
-    dex.start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-        text: "persist".into(),
-        text_elements: Vec::new(),
-    }]))
-    .await
-    .unwrap();
-
-    let approval_event =
-        wait_for_event(&dex, |ev| matches!(ev, EventMsg::ExecApprovalRequest(_))).await;
-    let EventMsg::ExecApprovalRequest(approval) = approval_event else {
-        panic!("expected ExecApprovalRequest event");
-    };
-
-    dex.submit(Op::ExecApproval {
-        id: approval.effective_approval_id(),
-        turn_id: None,
-        decision: ReviewDecision::ApprovedForSession,
-    })
-    .await
-    .unwrap();
-
-    wait_for_event(&dex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
-
-    logs_assert(tool_decision_assertion(
-        "sandbox_session_call",
-        "approved_for_session",
-        "user",
-    ));
-}
-
-#[tokio::test]
-#[traced_test]
-async fn handle_sandbox_error_user_denies_records_tool_decision() {
-    let server = start_mock_server().await;
-    let command = touch_command("dex-otel-approval-test");
-
-    mount_sse_once(
-        &server,
-        sse(vec![
-            exec_command_call("sandbox_deny_call", &command),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-
-    mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-1", "shell command done"),
-            ev_completed("done"),
-        ]),
-    )
-    .await;
-
-    let TestDex { dex, .. } = test_dex()
-        .with_config(|config| {
-            config.permissions.approval_policy =
-                Constrained::allow_any(AskForApproval::UnlessTrusted);
-        })
-        .build(&server)
-        .await
-        .unwrap();
-
-    dex.start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-        text: "deny".into(),
-        text_elements: Vec::new(),
-    }]))
-    .await
-    .unwrap();
-
-    let approval_event =
-        wait_for_event(&dex, |ev| matches!(ev, EventMsg::ExecApprovalRequest(_))).await;
-    let EventMsg::ExecApprovalRequest(approval) = approval_event else {
-        panic!("expected ExecApprovalRequest event");
-    };
-
-    dex.submit(Op::ExecApproval {
-        id: approval.effective_approval_id(),
-        turn_id: None,
-        decision: ReviewDecision::denied("rejected by user"),
-    })
-    .await
-    .unwrap();
-
-    wait_for_event(&dex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
-
-    logs_assert(tool_decision_assertion(
-        "sandbox_deny_call",
         "denied",
         "user",
     ));

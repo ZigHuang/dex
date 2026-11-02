@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 /// Validates configured span attributes before they are attached to exported spans.
-pub fn validate_span_attributes(attributes: &BTreeMap<String, String>) -> std::io::Result<()> {
+pub fn validate_span_attributes(attributes: &HashMap<String, String>) -> std::io::Result<()> {
     if attributes.keys().any(String::is_empty) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -20,6 +20,7 @@ pub fn validate_span_attributes(attributes: &BTreeMap<String, String>) -> std::i
 
 #[derive(Clone, Debug)]
 pub struct OtelSettings {
+    pub http_client_factory: dex_http_client::HttpClientFactory,
     pub environment: String,
     pub service_name: String,
     pub service_version: String,
@@ -28,7 +29,7 @@ pub struct OtelSettings {
     pub trace_exporter: OtelExporter,
     pub metrics_exporter: OtelExporter,
     pub runtime_metrics: bool,
-    pub span_attributes: BTreeMap<String, String>,
+    pub span_attributes: HashMap<String, String>,
     pub tracestate: BTreeMap<String, BTreeMap<String, String>>,
 }
 

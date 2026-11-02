@@ -2,10 +2,17 @@ use dex_protocol::protocol::ENVIRONMENTS_INSTRUCTIONS_CLOSE_TAG;
 use dex_protocol::protocol::ENVIRONMENTS_INSTRUCTIONS_OPEN_TAG;
 
 use super::ContextualUserFragment;
+use dex_protocol::models::ContentItem;
+use dex_protocol::models::ContentItemKind;
+use dex_protocol::models::input_text;
 
 pub(crate) struct EnvironmentsInstructions;
 
 impl ContextualUserFragment for EnvironmentsInstructions {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("environments.instructions".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }
@@ -21,13 +28,13 @@ impl ContextualUserFragment for EnvironmentsInstructions {
         )
     }
 
-    fn body(&self) -> String {
-        "\n## Execution environments\n\
+    fn body(&self) -> ContentItem {
+        input_text("\n## Execution environments\n\
 Execution environments are separate machines or workspaces with their own files, shell, and installed capabilities. `<environment_context>` lists the environments selected for this task.\n\
 \n\
 An environment marked `starting` is not yet usable. Its files, commands, AGENTS.md instructions, skills, plugins, and MCP tools may become available when startup completes.\n\
 \n\
 Wait only when the current task needs that environment. Continue using tools that are already available for unrelated work.\n"
-            .to_string()
+            .to_string())
     }
 }

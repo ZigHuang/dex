@@ -14,7 +14,6 @@ from openai_dex import (
     Sandbox,
 )
 from openai_dex.types import (
-    Personality,
     ReasoningEffort,
     ReasoningSummary,
 )
@@ -95,7 +94,6 @@ with Dex(config=runtime_config()) as dex:
         effort=selected_effort,
         model=selected_model.model,
         output_schema=OUTPUT_SCHEMA,
-        personality=Personality.pragmatic,
         sandbox=Sandbox.read_only,
         summary=ReasoningSummary.model_validate("concise"),
     ).run()

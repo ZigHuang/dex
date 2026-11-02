@@ -3,6 +3,7 @@ load("//:defs.bzl", "dex_rust_crate")
 dex_rust_crate(
     name = "exec",
     crate_name = "dex_exec",
+    integration_compile_data_extra = ["tests/fixtures/apply_patch_freeform_final.txt"],
     test_shard_counts = {
         "exec-all-test": 8,
     },

@@ -13,7 +13,7 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_sandbox;
 use core_test_support::test_dex::TestDex;
-use core_test_support::test_dex::local_selections;
+use core_test_support::test_dex::local_requests;
 use core_test_support::test_dex::test_dex;
 use core_test_support::test_dex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -98,16 +98,6 @@ fn requested_directory_write_permissions(path: &Path) -> RequestPermissionProfil
     }
 }
 
-fn normalized_directory_write_permissions(path: &Path) -> Result<RequestPermissionProfile> {
-    Ok(RequestPermissionProfile {
-        file_system: Some(FileSystemPermissions::from_read_write_roots(
-            Some(vec![]),
-            Some(vec![AbsolutePathBuf::try_from(path.canonicalize()?)?]),
-        )),
-        ..RequestPermissionProfile::default()
-    })
-}
-
 fn parse_result(item: &Value) -> (Option<i64>, String) {
     let output_str = item
         .get("output")
@@ -155,7 +145,7 @@ async fn submit_turn(
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
+                environments: Some(local_requests(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer,
                 sandbox_policy: Some(sandbox_policy),
@@ -241,7 +231,7 @@ async fn approved_folder_write_request_permissions_unblocks_later_exec_without_s
     );
     let requested_permissions = requested_directory_write_permissions(requested_dir.path());
     let normalized_requested_permissions =
-        normalized_directory_write_permissions(requested_dir.path())?;
+        requested_directory_write_permissions(requested_dir.path());
 
     let responses = mount_sse_sequence(
         &server,
@@ -378,13 +368,10 @@ async fn apply_patch_after_request_permissions(strict_auto_review: bool) -> Resu
     } else {
         "patched-via-request-permissions"
     };
-    let requested_file = requested_dir
-        .path()
-        .canonicalize()?
-        .join(requested_file_name);
+    let requested_file = requested_dir.path().join(requested_file_name);
     let requested_permissions = requested_directory_write_permissions(requested_dir.path());
     let normalized_requested_permissions =
-        normalized_directory_write_permissions(requested_dir.path())?;
+        requested_directory_write_permissions(requested_dir.path());
     let patch = build_add_file_patch(&requested_file, patch_content);
 
     let response_prefix = if strict_auto_review {

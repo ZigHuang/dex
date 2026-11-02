@@ -1,2 +1,4 @@
 dex-rs/app-server-protocol/schema/** linguist-generated
 dex-rs/hooks/schema/generated/** linguist-generated
+third_party/voice/sources.json text eol=lf
+patches/v8_array_sort_elements_kind.patch text eol=lf

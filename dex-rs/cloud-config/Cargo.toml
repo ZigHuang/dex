@@ -10,10 +10,11 @@ workspace = true
 [dependencies]
 base64 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+dex-async-utils = { workspace = true }
 dex-backend-client = { workspace = true }
 dex-config = { workspace = true }
 dex-http-client = { workspace = true }
-dex-core = { workspace = true }
+dex-keyring-store = { workspace = true }
 dex-login = { workspace = true }
 dex-otel = { workspace = true }
 dex-protocol = { workspace = true }
@@ -21,14 +22,16 @@ hmac = "0.12.1"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt", "sync", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+wiremock = { workspace = true }
 dex-agent-identity = { workspace = true }
+dex-core = { workspace = true }
 pretty_assertions = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 
 [lib]

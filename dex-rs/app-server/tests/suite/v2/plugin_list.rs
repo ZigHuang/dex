@@ -42,6 +42,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::time::sleep;
 use tokio::time::timeout;
 use wiremock::Mock;
@@ -278,9 +279,13 @@ enabled = true
     Ok(())
 }
 
+#[test_case("", true; "without default")]
+#[test_case("[plugins._default]\nenabled = false", false; "default disabled")]
 #[tokio::test]
-async fn plugin_installed_prefers_remote_curated_conflicts_when_remote_plugin_enabled() -> Result<()>
-{
+async fn plugin_installed_prefers_remote_curated_conflicts_when_remote_plugin_enabled(
+    plugin_config: &str,
+    expected_remote_enabled: bool,
+) -> Result<()> {
     let dex_home = TempDir::new()?;
     let server = MockServer::start().await;
     write_openai_curated_marketplace(dex_home.path(), &["linear", "calendar"])?;
@@ -300,6 +305,8 @@ enabled = true
 
 [plugins."calendar@openai-curated"]
 enabled = true
+
+{plugin_config}
 "#,
             server.uri()
         ),
@@ -355,9 +362,9 @@ enabled = true
         local_marketplace
             .plugins
             .iter()
-            .map(|plugin| plugin.id.clone())
+            .map(|plugin| (plugin.id.clone(), plugin.enabled))
             .collect::<Vec<_>>(),
-        vec!["calendar@openai-curated".to_string()]
+        vec![("calendar@openai-curated".to_string(), true)]
     );
     let remote_marketplace = response
         .marketplaces
@@ -371,6 +378,7 @@ enabled = true
             .map(|plugin| {
                 (
                     plugin.id.clone(),
+                    plugin.enabled,
                     plugin.install_policy_source,
                     plugin.must_show_installation_interstitial,
                 )
@@ -379,11 +387,13 @@ enabled = true
         vec![
             (
                 "linear@openai-curated-remote".to_string(),
+                expected_remote_enabled,
                 Some(PluginInstallPolicySource::WorkspaceSetting),
                 Some(false),
             ),
             (
                 "remote-only@openai-curated-remote".to_string(),
+                expected_remote_enabled,
                 Some(PluginInstallPolicySource::WorkspaceSetting),
                 Some(false),
             ),
@@ -834,14 +844,22 @@ async fn plugin_list_uses_alternate_discoverable_manifest_and_keeps_undiscoverab
 }
 
 #[tokio::test]
-async fn plugin_list_accepts_omitted_cwds() -> Result<()> {
+async fn plugin_list_omitted_cwds_excludes_server_project_config() -> Result<()> {
     let dex_home = TempDir::new()?;
+    let project_marketplace = TempDir::new()?;
     std::fs::create_dir_all(dex_home.path().join(".agents/plugins"))?;
-    write_plugins_enabled_config(dex_home.path())?;
+    std::fs::create_dir_all(dex_home.path().join(".git"))?;
+    std::fs::create_dir_all(dex_home.path().join(".dex"))?;
+    std::fs::create_dir_all(project_marketplace.path().join(".agents/plugins"))?;
+    write_installed_plugin(&dex_home, "home-marketplace", "home-plugin")?;
+    std::fs::write(
+        dex_home.path().join("config.toml"),
+        "[features]\nplugins = true\n[plugins.\"home-plugin@home-marketplace\"]\nenabled = true\n",
+    )?;
     std::fs::write(
         dex_home.path().join(".agents/plugins/marketplace.json"),
         r#"{
-  "name": "dex-curated",
+  "name": "home-marketplace",
   "plugins": [
     {
       "name": "home-plugin",
@@ -853,6 +871,20 @@ async fn plugin_list_accepts_omitted_cwds() -> Result<()> {
   ]
 }"#,
     )?;
+    std::fs::write(
+        project_marketplace
+            .path()
+            .join(".agents/plugins/marketplace.json"),
+        r#"{"name":"project-marketplace","plugins":[{"name":"project-plugin","source":{"source":"local","path":"./project-plugin"}}]}"#,
+    )?;
+    let source = serde_json::to_string(&project_marketplace.path().to_string_lossy())?;
+    std::fs::write(
+        dex_home.path().join(".dex/config.toml"),
+        format!(
+            "[marketplaces.project-marketplace]\nsource_type = \"local\"\nsource = {source}\n\n[plugins.\"home-plugin@home-marketplace\"]\nenabled = false\n"
+        ),
+    )?;
+    set_project_trust_level(dex_home.path(), dex_home.path(), TrustLevel::Trusted)?;
     let home = dex_home.path().to_string_lossy().into_owned();
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
@@ -863,15 +895,39 @@ async fn plugin_list_accepts_omitted_cwds() -> Result<()> {
         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
 
-    let request_id = mcp
-        .send_plugin_list_request(PluginListParams {
-            cwds: None,
-            marketplace_kinds: None,
-            force_refetch: false,
-        })
-        .await?;
-
-    let _: PluginListResponse = timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+    for (cwds, expected) in [
+        (None, vec![("home-plugin@home-marketplace", true, true)]),
+        (
+            Some(Vec::new()),
+            vec![("home-plugin@home-marketplace", true, true)],
+        ),
+        (
+            Some(vec![AbsolutePathBuf::try_from(dex_home.path())?]),
+            vec![
+                ("home-plugin@home-marketplace", true, false),
+                ("project-plugin@project-marketplace", false, false),
+            ],
+        ),
+    ] {
+        let request_id = mcp
+            .send_plugin_list_request(PluginListParams {
+                cwds,
+                marketplace_kinds: Some(vec![PluginListMarketplaceKind::Local]),
+                force_refetch: false,
+            })
+            .await?;
+        let response: PluginListResponse =
+            timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+        let mut plugins = response
+            .marketplaces
+            .iter()
+            .flat_map(|marketplace| &marketplace.plugins)
+            .map(|plugin| (plugin.id.as_str(), plugin.installed, plugin.enabled))
+            .collect::<Vec<_>>();
+        plugins.sort_unstable();
+        assert_eq!(plugins, expected);
+        assert_eq!(response.marketplace_load_errors, Vec::new());
+    }
     Ok(())
 }
 
@@ -1062,8 +1118,233 @@ enabled = true
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MarketplaceRefreshScenario {
+    Distinct,
+    Duplicate,
+    DuplicateConfiguredInLaterCwd,
+}
+
+#[test_case(true, true, MarketplaceRefreshScenario::Distinct; "forced")]
+#[test_case(false, true, MarketplaceRefreshScenario::Distinct; "background")]
+#[test_case(true, false, MarketplaceRefreshScenario::Distinct; "forced with project-enabled plugins")]
+#[test_case(false, false, MarketplaceRefreshScenario::Distinct; "background with project-enabled plugins")]
+#[test_case(true, true, MarketplaceRefreshScenario::Duplicate; "forced preserves source precedence")]
+#[test_case(false, true, MarketplaceRefreshScenario::Duplicate; "background preserves source precedence")]
+#[test_case(true, true, MarketplaceRefreshScenario::DuplicateConfiguredInLaterCwd; "forced merges later repository configuration")]
+#[test_case(false, true, MarketplaceRefreshScenario::DuplicateConfiguredInLaterCwd; "background merges later repository configuration")]
 #[tokio::test]
-async fn plugin_list_includes_install_and_enabled_state_from_config() -> Result<()> {
+async fn plugin_list_refreshes_plugins_from_each_cwd(
+    force_refetch: bool,
+    home_plugins_enabled: bool,
+    scenario: MarketplaceRefreshScenario,
+) -> Result<()> {
+    let dex_home = TempDir::new()?;
+    std::fs::write(
+        dex_home.path().join("config.toml"),
+        format!("[features]\nplugins = {home_plugins_enabled}\n"),
+    )?;
+    let workspace = TempDir::new()?;
+    let repos = [
+        workspace.path().join("z_repo"),
+        workspace.path().join("a_repo"),
+    ];
+    let names = if scenario == MarketplaceRefreshScenario::Distinct {
+        ["first", "second"]
+    } else {
+        ["first", "first"]
+    };
+    let versions = ["1.1.0", "2.0.0"];
+    for ((repo, name), version) in repos.iter().zip(names).zip(versions) {
+        for directory in [".git", ".dex", ".agents/plugins", "sample/.dex-plugin"] {
+            std::fs::create_dir_all(repo.join(directory))?;
+        }
+        std::fs::write(
+            repo.join("sample/.dex-plugin/plugin.json"),
+            serde_json::to_vec(&serde_json::json!({"name": "sample", "version": version}))?,
+        )?;
+        std::fs::write(
+            repo.join(".agents/plugins/marketplace.json"),
+            serde_json::to_vec(&serde_json::json!({"name": name, "plugins": [{
+                "name": "sample", "source": {"source": "local", "path": "./sample"}
+            }]}))?,
+        )?;
+        let plugin_config = if scenario == MarketplaceRefreshScenario::DuplicateConfiguredInLaterCwd
+            && repo == &repos[0]
+        {
+            String::new()
+        } else {
+            format!("[plugins.\"sample@{name}\"]\nenabled = true\n")
+        };
+        std::fs::write(
+            repo.join(".dex/config.toml"),
+            format!("[features]\nplugins = true\n{plugin_config}"),
+        )?;
+        set_project_trust_level(dex_home.path(), repo, TrustLevel::Trusted)?;
+        write_installed_plugin_with_version(&dex_home, name, "sample", "1.0.0")?;
+    }
+    let mut server = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+    let cwds = repos
+        .iter()
+        .map(|repo| AbsolutePathBuf::try_from(repo.as_path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let id = server
+        .send_plugin_list_request(PluginListParams {
+            cwds: Some(cwds.clone()),
+            marketplace_kinds: Some(vec![PluginListMarketplaceKind::Local]),
+            force_refetch,
+        })
+        .await?;
+    let response: PluginListResponse = timeout(DEFAULT_TIMEOUT, server.read_response(id)).await??;
+    assert_eq!(response.marketplace_load_errors, Vec::new());
+    let expected_sources = names
+        .into_iter()
+        .zip(versions)
+        .take(if scenario == MarketplaceRefreshScenario::Distinct {
+            2
+        } else {
+            1
+        })
+        .collect::<Vec<_>>();
+    for (name, version) in &expected_sources {
+        let manifest = dex_home.path().join(format!(
+            "plugins/cache/{name}/sample/{version}/.dex-plugin/plugin.json"
+        ));
+        if !force_refetch {
+            wait_for_path_exists(&manifest).await?;
+        }
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest)?)?;
+        assert_eq!(value["version"], *version);
+    }
+    let id = server
+        .send_plugin_installed_request(PluginInstalledParams {
+            cwds: Some(cwds),
+            install_suggestion_plugin_names: None,
+        })
+        .await?;
+    let response: PluginInstalledResponse =
+        timeout(DEFAULT_TIMEOUT, server.read_response(id)).await??;
+    let mut plugins = response
+        .marketplaces
+        .iter()
+        .filter(|marketplace| ["first", "second"].contains(&marketplace.name.as_str()))
+        .flat_map(|marketplace| &marketplace.plugins)
+        .map(|plugin| (plugin.id.clone(), plugin.enabled))
+        .collect::<Vec<_>>();
+    plugins.sort_unstable();
+    let expected_plugins = expected_sources
+        .iter()
+        .map(|(name, _)| (format!("sample@{name}"), true))
+        .collect::<Vec<_>>();
+    assert_eq!(plugins, expected_plugins);
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_catalogs_skip_invalid_project_config_and_report_cwd_error() -> Result<()> {
+    let dex_home = TempDir::new()?;
+    write_plugins_enabled_config(dex_home.path())?;
+    let workspace = TempDir::new()?;
+    let invalid_repo = workspace.path().join("invalid");
+    let valid_repo = workspace.path().join("valid");
+    for repo in [&invalid_repo, &valid_repo] {
+        for directory in [".git", ".dex", ".agents/plugins"] {
+            std::fs::create_dir_all(repo.join(directory))?;
+        }
+        set_project_trust_level(dex_home.path(), repo, TrustLevel::Trusted)?;
+    }
+    std::fs::write(invalid_repo.join(".dex/config.toml"), "invalid = [\n")?;
+    std::fs::write(
+        valid_repo.join(".dex/config.toml"),
+        "[plugins.\"sample@valid-marketplace\"]\nenabled = true\n",
+    )?;
+    std::fs::write(
+        valid_repo.join(".agents/plugins/marketplace.json"),
+        r#"{"name":"valid-marketplace","plugins":[{"name":"sample","source":{"source":"local","path":"./sample"}}]}"#,
+    )?;
+    write_installed_plugin(&dex_home, "valid-marketplace", "sample")?;
+
+    let home = dex_home.path().to_string_lossy().into_owned();
+    let mut server = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .with_env_overrides(&[
+            ("HOME", Some(home.as_str())),
+            ("USERPROFILE", Some(home.as_str())),
+        ])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+    let invalid_cwd = AbsolutePathBuf::try_from(invalid_repo.as_path())?;
+    let cwds = vec![
+        invalid_cwd.clone(),
+        AbsolutePathBuf::try_from(valid_repo.as_path())?,
+    ];
+
+    let request_id = server
+        .send_plugin_list_request(PluginListParams {
+            cwds: Some(cwds.clone()),
+            marketplace_kinds: Some(vec![PluginListMarketplaceKind::Local]),
+            force_refetch: false,
+        })
+        .await?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, server.read_response(request_id)).await??;
+    assert_eq!(
+        response
+            .marketplaces
+            .iter()
+            .flat_map(|marketplace| &marketplace.plugins)
+            .map(|plugin| (plugin.id.as_str(), plugin.installed, plugin.enabled))
+            .collect::<Vec<_>>(),
+        vec![("sample@valid-marketplace", true, true)]
+    );
+    assert_eq!(response.marketplace_load_errors.len(), 1);
+    assert_eq!(
+        response.marketplace_load_errors[0].marketplace_path,
+        invalid_cwd
+    );
+    assert!(
+        response.marketplace_load_errors[0]
+            .message
+            .contains("failed to reload config")
+    );
+
+    let request_id = server
+        .send_plugin_installed_request(PluginInstalledParams {
+            cwds: Some(cwds),
+            install_suggestion_plugin_names: None,
+        })
+        .await?;
+    let response: PluginInstalledResponse =
+        timeout(DEFAULT_TIMEOUT, server.read_response(request_id)).await??;
+    assert_eq!(
+        response
+            .marketplaces
+            .iter()
+            .flat_map(|marketplace| &marketplace.plugins)
+            .map(|plugin| (plugin.id.as_str(), plugin.enabled))
+            .collect::<Vec<_>>(),
+        vec![("sample@valid-marketplace", true)]
+    );
+    assert_eq!(response.marketplace_load_errors.len(), 1);
+    assert_eq!(
+        response.marketplace_load_errors[0].marketplace_path,
+        invalid_cwd
+    );
+    Ok(())
+}
+
+#[test_case("", "enabled = true", true; "legacy explicit enabled")]
+#[test_case("[plugins._default]\nenabled = false", "mcp_servers.example.tools.search.approval_mode = 'approve'", false; "default disabled approval-only entry")]
+#[test_case("[plugins._default]\nenabled = false", "enabled = true", true; "explicitly enabled overrides default")]
+#[tokio::test]
+async fn plugin_list_includes_install_and_enabled_state_from_config(
+    plugin_default: &str,
+    plugin_settings: &str,
+    expected_enabled: bool,
+) -> Result<()> {
     let dex_home = TempDir::new()?;
     let repo_root = TempDir::new()?;
     std::fs::create_dir_all(repo_root.path().join(".git"))?;
@@ -1104,15 +1385,19 @@ async fn plugin_list_includes_install_and_enabled_state_from_config() -> Result<
     )?;
     std::fs::write(
         dex_home.path().join("config.toml"),
-        r#"[features]
+        format!(
+            r#"[features]
 plugins = true
 
+{plugin_default}
+
 [plugins."enabled-plugin@dex-curated"]
-enabled = true
+{plugin_settings}
 
 [plugins."disabled-plugin@dex-curated"]
 enabled = false
 "#,
+        ),
     )?;
 
     let mut mcp = TestAppServer::builder()
@@ -1157,7 +1442,7 @@ enabled = false
     assert_eq!(marketplace.plugins[0].id, "enabled-plugin@dex-curated");
     assert_eq!(marketplace.plugins[0].name, "enabled-plugin");
     assert_eq!(marketplace.plugins[0].installed, true);
-    assert_eq!(marketplace.plugins[0].enabled, true);
+    assert_eq!(marketplace.plugins[0].enabled, expected_enabled);
     assert_eq!(
         marketplace.plugins[0].install_policy,
         PluginInstallPolicy::Available
@@ -1190,29 +1475,43 @@ enabled = false
         marketplace.plugins[2].auth_policy,
         PluginAuthPolicy::OnInstall
     );
+
+    let request_id = mcp
+        .send_plugin_installed_request(PluginInstalledParams {
+            cwds: Some(vec![AbsolutePathBuf::try_from(repo_root.path())?]),
+            install_suggestion_plugin_names: None,
+        })
+        .await?;
+    let response: PluginInstalledResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+    let installed = response
+        .marketplaces
+        .into_iter()
+        .find(|entry| entry.path == marketplace.path)
+        .expect("expected installed repo marketplace entry");
+    assert_eq!(
+        installed
+            .plugins
+            .into_iter()
+            .map(|plugin| (plugin.id, plugin.installed, plugin.enabled))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "enabled-plugin@dex-curated".to_string(),
+                true,
+                expected_enabled,
+            ),
+            ("disabled-plugin@dex-curated".to_string(), true, false),
+        ]
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn plugin_list_uses_home_config_for_enabled_state() -> Result<()> {
+async fn plugin_list_deduplicates_sources_and_merges_enabled_state() -> Result<()> {
     let dex_home = TempDir::new()?;
     std::fs::create_dir_all(dex_home.path().join(".agents/plugins"))?;
     write_installed_plugin(&dex_home, "dex-curated", "shared-plugin")?;
-    std::fs::write(
-        dex_home.path().join(".agents/plugins/marketplace.json"),
-        r#"{
-  "name": "dex-curated",
-  "plugins": [
-    {
-      "name": "shared-plugin",
-      "source": {
-        "source": "local",
-        "path": "./shared-plugin"
-      }
-    }
-  ]
-}"#,
-    )?;
     std::fs::write(
         dex_home.path().join("config.toml"),
         r#"[features]
@@ -1257,6 +1556,16 @@ enabled = false
     )?;
 
     let workspace_default = TempDir::new()?;
+    std::fs::create_dir_all(workspace_default.path().join(".git"))?;
+    std::fs::create_dir_all(workspace_default.path().join(".agents/plugins"))?;
+    std::fs::copy(
+        workspace_enabled
+            .path()
+            .join(".agents/plugins/marketplace.json"),
+        workspace_default
+            .path()
+            .join(".agents/plugins/marketplace.json"),
+    )?;
     let home = dex_home.path().to_string_lossy().into_owned();
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
@@ -1281,15 +1590,28 @@ enabled = false
     let response: PluginListResponse =
         timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
-    let shared_plugin = response
+    let marketplaces = response
         .marketplaces
         .iter()
-        .flat_map(|marketplace| marketplace.plugins.iter())
-        .find(|plugin| plugin.name == "shared-plugin")
-        .expect("expected shared-plugin entry");
-    assert_eq!(shared_plugin.id, "shared-plugin@dex-curated");
-    assert_eq!(shared_plugin.installed, true);
-    assert_eq!(shared_plugin.enabled, true);
+        .filter(|marketplace| marketplace.name == "dex-curated")
+        .map(|marketplace| {
+            (
+                marketplace.name.as_str(),
+                marketplace
+                    .plugins
+                    .iter()
+                    .map(|plugin| (plugin.id.as_str(), plugin.installed, plugin.enabled))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        marketplaces,
+        vec![(
+            "dex-curated",
+            vec![("shared-plugin@dex-curated", true, true)]
+        )]
+    );
     Ok(())
 }
 
@@ -1492,13 +1814,17 @@ async fn plugin_list_accepts_legacy_string_default_prompt() -> Result<()> {
     Ok(())
 }
 
+#[test_case(false; "configured globally")]
+#[test_case(true; "configured in later repository")]
 #[tokio::test]
-async fn plugin_list_returns_installed_git_source_interface_from_cache() -> Result<()> {
+async fn plugin_list_returns_installed_git_source_interface_from_cache(
+    configured_in_later_cwd: bool,
+) -> Result<()> {
     let dex_home = TempDir::new()?;
     let repo_root = TempDir::new()?;
     let missing_remote_repo = repo_root.path().join("missing-remote-plugin-repo");
     let missing_remote_repo_url = url::Url::from_directory_path(&missing_remote_repo)
-        .unwrap()
+        .expect("temporary repository path should produce a file URL")
         .to_string();
     std::fs::create_dir_all(repo_root.path().join(".git"))?;
     std::fs::create_dir_all(repo_root.path().join(".agents/plugins"))?;
@@ -1537,15 +1863,32 @@ async fn plugin_list_returns_installed_git_source_interface_from_cache() -> Resu
   }
 }"##,
     )?;
+    let plugin_config = r#"[plugins."toolkit@debug"]
+enabled = true
+"#;
+    let user_plugin_config = if configured_in_later_cwd {
+        ""
+    } else {
+        plugin_config
+    };
     std::fs::write(
         dex_home.path().join("config.toml"),
-        r#"[features]
-plugins = true
-
-[plugins."toolkit@debug"]
-enabled = true
-"#,
+        format!("[features]\nplugins = true\n\n{user_plugin_config}"),
     )?;
+    let later_repo = TempDir::new()?;
+    let mut cwds = vec![AbsolutePathBuf::try_from(repo_root.path())?];
+    if configured_in_later_cwd {
+        for directory in [".git", ".dex", ".agents/plugins"] {
+            std::fs::create_dir_all(later_repo.path().join(directory))?;
+        }
+        std::fs::copy(
+            repo_root.path().join(".agents/plugins/marketplace.json"),
+            later_repo.path().join(".agents/plugins/marketplace.json"),
+        )?;
+        std::fs::write(later_repo.path().join(".dex/config.toml"), plugin_config)?;
+        set_project_trust_level(dex_home.path(), later_repo.path(), TrustLevel::Trusted)?;
+        cwds.push(AbsolutePathBuf::try_from(later_repo.path())?);
+    }
 
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
@@ -1554,7 +1897,7 @@ enabled = true
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
-            cwds: Some(vec![AbsolutePathBuf::try_from(repo_root.path())?]),
+            cwds: Some(cwds),
             marketplace_kinds: None,
             force_refetch: false,
         })
@@ -1610,7 +1953,8 @@ enabled = true
 }
 
 #[tokio::test]
-async fn app_server_startup_sync_downloads_remote_installed_plugin_bundles() -> Result<()> {
+async fn app_server_startup_downloads_installed_plugin_bundles_without_discovery_prefetch()
+-> Result<()> {
     let dex_home = TempDir::new()?;
     let server = MockServer::start().await;
     write_remote_plugin_catalog_config(dex_home.path(), &format!("{}/backend-api/", server.uri()))?;
@@ -1647,11 +1991,24 @@ async fn app_server_startup_sync_downloads_remote_installed_plugin_bundles() -> 
         .await;
     mount_empty_user_installed_plugins(&server).await;
 
+    for endpoint in [
+        "/backend-api/ps/plugins/list",
+        "/backend-api/plugins/featured",
+        "/backend-api/ps/plugins/suggested/dex",
+    ] {
+        Mock::given(path(endpoint))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
+            .mount(&server)
+            .await;
+    }
+
     let installed_path = dex_home
         .path()
         .join("plugins/cache/openai-curated-remote/linear/1.2.3");
     let _mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
+        .with_args(&["-c", "features.plugin_discovery_prefetch=false"])
         .with_plugin_startup_tasks()
         .with_env_overrides(&[(TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS, Some("1"))])
         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
@@ -1773,11 +2130,34 @@ async fn plugin_list_sync_upgrades_and_removes_remote_installed_plugin_bundles()
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProjectPluginConfiguration {
+    None,
+    Disabled,
+    Invalid,
+}
+
+#[test_case(ProjectPluginConfiguration::None, None, "plugin_discovery_prefetch = false", true, true; "without discovery prefetch")]
+#[test_case(ProjectPluginConfiguration::Disabled, None, "", true, true; "project disables local plugins")]
+#[test_case(ProjectPluginConfiguration::Invalid, None, "", true, true; "invalid project preserves remote plugins")]
+#[test_case(ProjectPluginConfiguration::None, Some("tpp"), "", true, true; "configured product sku")]
+#[test_case(ProjectPluginConfiguration::None, None, "[plugins._default]\nenabled = false", true, false; "default disabled")]
+#[test_case(ProjectPluginConfiguration::None, None, "[plugins._default]\nenabled = false\n[plugins.\"linear@openai-curated-remote\"]\nenabled = true", true, true; "explicitly enabled")]
+#[test_case(ProjectPluginConfiguration::None, None, "[plugins._default]\nenabled = false\n[plugins.\"linear@openai-curated-remote\"]\nenabled = true", false, false; "source disabled")]
 #[tokio::test]
-async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -> Result<()> {
+async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled(
+    project_configuration: ProjectPluginConfiguration,
+    product_sku: Option<&str>,
+    plugin_config: &str,
+    source_enabled: bool,
+    expected_enabled: bool,
+) -> Result<()> {
     let dex_home = TempDir::new()?;
     let server = MockServer::start().await;
     write_remote_plugin_catalog_config(dex_home.path(), &format!("{}/backend-api/", server.uri()))?;
+    let config_path = dex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(config_path, format!("{config}\n{plugin_config}\n"))?;
     write_chatgpt_auth(
         dex_home.path(),
         ChatGptAuthFixture::new("chatgpt-token")
@@ -1787,6 +2167,27 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
         AuthCredentialsStoreMode::File,
     )?;
     write_installed_plugin_with_version(&dex_home, "openai-curated-remote", "linear", "1.2.3")?;
+
+    let repo = TempDir::new()?;
+    let cwds = if project_configuration != ProjectPluginConfiguration::None {
+        for directory in [".git", ".dex", ".agents/plugins"] {
+            std::fs::create_dir_all(repo.path().join(directory))?;
+        }
+        let config = if project_configuration == ProjectPluginConfiguration::Invalid {
+            "invalid = [\n"
+        } else {
+            "[features]\nplugins = false\n[plugins.\"sample@disabled-local\"]\nenabled = true\n"
+        };
+        std::fs::write(repo.path().join(".dex/config.toml"), config)?;
+        std::fs::write(
+            repo.path().join(".agents/plugins/marketplace.json"),
+            r#"{"name":"disabled-local","plugins":[{"name":"sample","source":{"source":"local","path":"./sample"}}]}"#,
+        )?;
+        set_project_trust_level(dex_home.path(), repo.path(), TrustLevel::Trusted)?;
+        Some(vec![AbsolutePathBuf::try_from(repo.path())?])
+    } else {
+        None
+    };
 
     let global_directory_body = r#"{
   "plugins": [
@@ -1864,13 +2265,16 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
   }
 }"#;
 
+    let mut global_installed_body: serde_json::Value = serde_json::from_str(global_installed_body)?;
+    global_installed_body["plugins"][0]["enabled"] = serde_json::json!(source_enabled);
+    let expected_product_sku = product_sku.unwrap_or("dex");
     Mock::given(method("GET"))
         .and(path("/backend-api/ps/plugins/list"))
         .and(query_param("scope", "GLOBAL"))
         .and(query_param("limit", "200"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
-        .and(header("oai-product-sku", "dex"))
+        .and(header("oai-product-sku", expected_product_sku))
         .respond_with(ResponseTemplate::new(200).set_body_string(global_directory_body))
         .mount(&server)
         .await;
@@ -1880,25 +2284,27 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
         .and(query_param("limit", "200"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
-        .and(header("oai-product-sku", "dex"))
+        .and(header("oai-product-sku", expected_product_sku))
         .respond_with(ResponseTemplate::new(200).set_body_string(empty_page_body))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/backend-api/ps/plugins/installed"))
         .and(query_param("scope", "GLOBAL"))
+        .and(query_param("limit", "200"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
-        .and(header("oai-product-sku", "dex"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(global_installed_body))
+        .and(header("oai-product-sku", expected_product_sku))
+        .respond_with(ResponseTemplate::new(200).set_body_json(global_installed_body))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/backend-api/ps/plugins/installed"))
         .and(query_param("scope", "WORKSPACE"))
+        .and(query_param("limit", "200"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
-        .and(header("oai-product-sku", "dex"))
+        .and(header("oai-product-sku", expected_product_sku))
         .respond_with(ResponseTemplate::new(200).set_body_string(empty_page_body))
         .mount(&server)
         .await;
@@ -1911,14 +2317,17 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
         .mount(&server)
         .await;
 
-    let mut mcp = TestAppServer::builder()
-        .with_dex_home(dex_home.path())
+    let mut builder = TestAppServer::builder().with_dex_home(dex_home.path());
+    if let Some(product_sku) = product_sku {
+        builder = builder.with_args(&["-c", &format!("apps_mcp_product_sku=\"{product_sku}\"")]);
+    }
+    let mut mcp = builder
         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
-            cwds: None,
+            cwds,
             marketplace_kinds: None,
             force_refetch: false,
         })
@@ -1927,6 +2336,21 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
     let response: PluginListResponse =
         timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
+    if project_configuration == ProjectPluginConfiguration::Invalid {
+        assert_eq!(response.marketplace_load_errors.len(), 1);
+        assert_eq!(
+            response.marketplace_load_errors[0].marketplace_path,
+            AbsolutePathBuf::try_from(repo.path())?
+        );
+    } else {
+        assert!(response.marketplace_load_errors.is_empty());
+    }
+    assert!(
+        !response
+            .marketplaces
+            .iter()
+            .any(|marketplace| marketplace.name == "disabled-local")
+    );
     let remote_marketplace = response
         .marketplaces
         .into_iter()
@@ -1964,7 +2388,7 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
         remote_marketplace.plugins[0].installed_at,
         Some(1_767_312_000)
     );
-    assert_eq!(remote_marketplace.plugins[0].enabled, true);
+    assert_eq!(remote_marketplace.plugins[0].enabled, expected_enabled);
     assert_eq!(
         remote_marketplace.plugins[0].install_policy_source,
         Some(PluginInstallPolicySource::ImplicitCanonicalApp)
@@ -3467,9 +3891,16 @@ trusted_hash = "sha256:unrelated"
     )?)?;
     let hook_states = config["hooks"]["state"].as_table().expect("hook states");
     for hook in &hooks {
+        let (declaration_hash, content_hash) = hook
+            .current_hash
+            .split_once('/')
+            .expect("declaration and content hashes");
         assert_eq!(
-            hook_states[hook.key.as_str()]["trusted_hash"].as_str(),
-            Some(hook.current_hash.as_str())
+            (
+                hook_states[hook.key.as_str()]["trusted_hash"].as_str(),
+                hook_states[hook.key.as_str()]["trusted_content_hash"].as_str(),
+            ),
+            (Some(declaration_hash), Some(content_hash))
         );
     }
     assert!(
@@ -4354,8 +4785,12 @@ async fn assert_disabled_remote_plugin_metadata(
     Ok(())
 }
 
+#[test_case(false; "no project override")]
+#[test_case(true; "project enables local plugins only")]
 #[tokio::test]
-async fn plugin_list_does_not_fetch_remote_marketplaces_when_plugins_disabled() -> Result<()> {
+async fn plugin_list_does_not_fetch_remote_marketplaces_when_plugins_disabled(
+    project_enables_plugins: bool,
+) -> Result<()> {
     let dex_home = TempDir::new()?;
     let server = MockServer::start().await;
     std::fs::write(
@@ -4380,23 +4815,92 @@ remote_plugin = true
         AuthCredentialsStoreMode::File,
     )?;
 
+    let repo = TempDir::new()?;
+    for directory in [".git", ".dex", ".agents/plugins"] {
+        std::fs::create_dir_all(repo.path().join(directory))?;
+    }
+    std::fs::write(
+        repo.path().join(".dex/config.toml"),
+        "[features]\nplugins = true\n[plugins.\"sample@local\"]\nenabled = true\n",
+    )?;
+    std::fs::write(
+        repo.path().join(".agents/plugins/marketplace.json"),
+        r#"{"name":"local","plugins":[{"name":"sample","source":{"source":"local","path":"./sample"}}]}"#,
+    )?;
+    write_installed_plugin(&dex_home, "local", "sample")?;
+    set_project_trust_level(dex_home.path(), repo.path(), TrustLevel::Trusted)?;
+    let repo_cwd = AbsolutePathBuf::try_from(repo.path())?;
+    let cwds = project_enables_plugins.then(|| vec![repo_cwd]);
+
+    let home = dex_home.path().to_string_lossy().into_owned();
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
+        .with_env_overrides(&[
+            ("HOME", Some(home.as_str())),
+            ("USERPROFILE", Some(home.as_str())),
+        ])
         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
 
+    for marketplace_kinds in [
+        None,
+        Some(vec![
+            PluginListMarketplaceKind::Local,
+            PluginListMarketplaceKind::WorkspaceDirectory,
+            PluginListMarketplaceKind::CreatedByMeRemote,
+            PluginListMarketplaceKind::SharedWithMe,
+            PluginListMarketplaceKind::Vertical,
+        ]),
+    ] {
+        let request_id = mcp
+            .send_plugin_list_request(PluginListParams {
+                cwds: cwds.clone(),
+                marketplace_kinds,
+                force_refetch: false,
+            })
+            .await?;
+
+        let response: PluginListResponse =
+            timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+
+        let ids = response
+            .marketplaces
+            .iter()
+            .flat_map(|marketplace| &marketplace.plugins)
+            .map(|plugin| plugin.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            if project_enables_plugins {
+                vec!["sample@local"]
+            } else {
+                vec![]
+            }
+        );
+        assert_eq!(response.featured_plugin_ids, Vec::<String>::new());
+    }
     let request_id = mcp
-        .send_plugin_list_request(PluginListParams {
-            cwds: None,
-            marketplace_kinds: None,
-            force_refetch: false,
+        .send_plugin_installed_request(PluginInstalledParams {
+            cwds,
+            install_suggestion_plugin_names: None,
         })
         .await?;
-
-    let response: PluginListResponse =
+    let response: PluginInstalledResponse =
         timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
-
-    assert!(response.marketplaces.is_empty());
+    let ids = response
+        .marketplaces
+        .iter()
+        .flat_map(|marketplace| &marketplace.plugins)
+        .map(|plugin| plugin.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        if project_enables_plugins {
+            vec!["sample@local"]
+        } else {
+            vec![]
+        }
+    );
     wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 0).await?;
     Ok(())
 }
@@ -4418,8 +4922,13 @@ async fn plugin_list_omits_featured_plugin_ids_without_chatgpt_auth() -> Result<
         .mount(&server)
         .await;
 
+    let home = dex_home.path().to_string_lossy().into_owned();
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
+        .with_env_overrides(&[
+            ("HOME", Some(home.as_str())),
+            ("USERPROFILE", Some(home.as_str())),
+        ])
         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
 
@@ -4605,6 +5114,9 @@ fn cached_remote_catalog_plugin_ids(dex_home: &std::path::Path) -> Result<Vec<St
     let mut plugin_ids = Vec::new();
     for entry in std::fs::read_dir(cache_dir)? {
         let path = entry?.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
         let cached_catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
         let Some(plugins) = cached_catalog["plugins"].as_array() else {
             continue;
@@ -4627,6 +5139,9 @@ fn rewrite_cached_remote_catalog_fetched_at(
     let cache_dir = dex_home.join("cache/remote_plugin_catalog");
     for entry in std::fs::read_dir(cache_dir)? {
         let path = entry?.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
         let mut cached_catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         cached_catalog["fetched_at"] = serde_json::json!(fetched_at);
         std::fs::write(path, serde_json::to_vec_pretty(&cached_catalog)?)?;
@@ -4670,6 +5185,7 @@ async fn wait_for_plugin_hooks(
             let request_id = mcp
                 .send_hooks_list_request(HooksListParams {
                     cwds: vec![cwd.to_path_buf()],
+                    ..Default::default()
                 })
                 .await?;
             let HooksListResponse { data } = mcp.read_response(request_id).await?;

@@ -1,3 +1,5 @@
+use dex_protocol::protocol::TurnEnvironmentRequest;
+use dex_protocol::protocol::TurnEnvironmentRequests;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::mem::swap;
@@ -13,9 +15,12 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use dex_agent_graph_store::AgentGraphStore;
+use dex_analytics::AnalyticsEventsClient;
+use dex_attachment_store::AttachmentStore;
 use dex_config::CloudConfigBundleLoader;
 use dex_core::DexThread;
-use dex_core::StartThreadOptions;
+pub use dex_core::StartThreadOptions;
 use dex_core::ThreadManager;
 use dex_core::TimeProvider;
 pub use dex_core::TurnInputRequest;
@@ -24,15 +29,17 @@ use dex_core::resolve_installation_id;
 use dex_core::shell::Shell;
 use dex_core::shell::get_shell_by_model_provided_path;
 use dex_core::thread_store_from_config;
+use dex_core::windows_sandbox::WindowsSandboxLevelExt;
 use dex_exec_server::CreateDirectoryOptions;
 use dex_exec_server::ExecutorFileSystem;
 use dex_exec_server::RemoveOptions;
 use dex_extension_api::ExtensionRegistry;
-use dex_extension_api::LoadUserInstructionsFuture;
+use dex_extension_api::LoadInstructionsFuture;
 use dex_extension_api::UserInstructionsProvider;
 use dex_extension_api::empty_extension_registry;
 use dex_features::Feature;
 use dex_home::DexHomeUserInstructionsProvider;
+use dex_login::AuthManager;
 use dex_login::DexAuth;
 use dex_model_provider_info::ModelProviderInfo;
 use dex_model_provider_info::built_in_model_providers;
@@ -40,13 +47,19 @@ use dex_models_manager::bundled_models_response;
 use dex_models_manager::manager::SharedModelsManager;
 use dex_protocol::config_types::CollaborationMode;
 use dex_protocol::config_types::ModeKind;
+use dex_protocol::config_types::ReasoningSummary;
 use dex_protocol::config_types::Settings;
+use dex_protocol::config_types::WindowsSandboxLevel;
 use dex_protocol::mcp::ClientMcpExtensions;
 use dex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
 use dex_protocol::models::PermissionProfile;
+use dex_protocol::models::PermissionProfileSnapshot;
 use dex_protocol::openai_models::ModelInfo;
 use dex_protocol::openai_models::ModelsResponse;
+use dex_protocol::openai_models::TruncationPolicyConfig;
+use dex_protocol::openai_models::WebSearchToolType;
 use dex_protocol::protocol::AskForApproval;
+use dex_protocol::protocol::EnvironmentConfig;
 use dex_protocol::protocol::EnvironmentConfigState;
 use dex_protocol::protocol::EventMsg;
 use dex_protocol::protocol::RealtimeConversationVersion as RealtimeWsVersion;
@@ -111,18 +124,54 @@ impl RecordingUserInstructionsProvider {
 }
 
 impl UserInstructionsProvider for RecordingUserInstructionsProvider {
-    fn load_user_instructions(&self) -> LoadUserInstructionsFuture<'_> {
+    fn load_user_instructions(&self) -> LoadInstructionsFuture<'_> {
         self.load_count.fetch_add(1, Ordering::SeqCst);
         self.inner.load_user_instructions()
     }
 }
 
-pub fn local(cwd: AbsolutePathBuf) -> TurnEnvironmentSelection {
-    TurnEnvironmentSelection {
+/// Builds environment input without attaching any thread's capability roots.
+pub fn local_request(cwd: AbsolutePathBuf) -> TurnEnvironmentRequest {
+    TurnEnvironmentRequest {
         environment_id: dex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
         cwd: PathUri::from_abs_path(&cwd),
         workspace_roots: vec![PathUri::from_abs_path(&cwd)],
         config: EnvironmentConfigState::FromThread,
+    }
+}
+
+pub fn local(cwd: AbsolutePathBuf) -> TurnEnvironmentSelection {
+    TurnEnvironmentSelection::new(local_request(cwd), &[])
+}
+
+/// Builds explicit environment configuration with the test thread's permissions and shell settings.
+pub fn environment_config_for_selection(
+    config: &Config,
+    selection: &TurnEnvironmentSelection,
+) -> EnvironmentConfig {
+    let permissions = &config.permissions;
+    let profile = permissions.permission_profile().clone();
+    let permission_profile = match permissions.active_permission_profile() {
+        Some(active) => PermissionProfileSnapshot::active_with_profile_workspace_roots(
+            profile,
+            active,
+            permissions.profile_workspace_roots().to_vec(),
+        ),
+        None => PermissionProfileSnapshot::legacy(profile),
+    };
+    EnvironmentConfig {
+        environment_hooks: Default::default(),
+        allow_login_shell: permissions.allow_login_shell,
+        workspace_roots: selection.workspace_roots.clone(),
+        permission_profile,
+        shell_environment_policy: permissions.shell_environment_policy.clone(),
+        windows_sandbox_level: WindowsSandboxLevel::from_config(config),
+        windows_sandbox_type: permissions.windows_sandbox_type,
+        use_legacy_landlock: config.features.use_legacy_landlock(),
+        exec_policy: None,
+        mcp_policy: None,
+        network_policy: None,
+        selected_capability_roots: Vec::new(),
     }
 }
 
@@ -143,6 +192,11 @@ pub fn executor_path_uri(path: impl AsRef<Path>) -> Result<PathUri> {
 
 pub fn local_selections(cwd: AbsolutePathBuf) -> TurnEnvironmentSelections {
     TurnEnvironmentSelections::new(cwd.clone(), vec![local(cwd)])
+}
+
+/// Builds thread-settings input using the local test environment.
+pub fn local_requests(cwd: AbsolutePathBuf) -> TurnEnvironmentRequests {
+    TurnEnvironmentRequests::new(cwd.clone(), vec![local_request(cwd)])
 }
 
 #[derive(Debug)]
@@ -167,6 +221,7 @@ impl TestEnv {
         let cwd = local_cwd_temp_dir.abs();
         let selection = match exec_server_url {
             Some(_) => TurnEnvironmentSelection {
+                selected_capability_roots: Default::default(),
                 environment_id: dex_exec_server::REMOTE_ENVIRONMENT_ID.to_string(),
                 cwd: PathUri::from_abs_path(&cwd),
                 workspace_roots: vec![PathUri::from_abs_path(&cwd)],
@@ -200,6 +255,16 @@ impl TestEnv {
     /// Returns the environment and target-native cwd selected by the test harness.
     pub fn selection(&self) -> &TurnEnvironmentSelection {
         &self.selection
+    }
+
+    /// Requests the fixture's environment without copying a thread's root choices.
+    pub fn request(&self) -> TurnEnvironmentRequest {
+        TurnEnvironmentRequest {
+            environment_id: self.selection.environment_id.clone(),
+            cwd: self.selection.cwd.clone(),
+            workspace_roots: self.selection.workspace_roots.clone(),
+            config: self.selection.config.clone(),
+        }
     }
 
     fn local_cwd_temp_dir(&self) -> Option<Arc<TempDir>> {
@@ -238,6 +303,7 @@ pub async fn test_env() -> Result<TestEnv> {
                 )
                 .await?;
             let selection = TurnEnvironmentSelection {
+                selected_capability_roots: Default::default(),
                 environment_id: dex_exec_server::REMOTE_ENVIRONMENT_ID.to_string(),
                 cwd: cwd_uri.clone(),
                 workspace_roots: vec![cwd_uri.clone()],
@@ -321,9 +387,29 @@ pub fn turn_permission_fields(
     (sandbox_policy, Some(permission_profile))
 }
 
+enum TestAuth {
+    Cached(DexAuth),
+    Manager(Arc<AuthManager>),
+}
+
+impl TestAuth {
+    fn manager_for_home(&self, home: &Path) -> Arc<AuthManager> {
+        match self {
+            Self::Cached(auth) => dex_core::test_support::auth_manager_from_auth_with_home(
+                auth.clone(),
+                home.to_path_buf(),
+            ),
+            Self::Manager(manager) => manager.clone(),
+        }
+    }
+}
+
 pub struct TestDexBuilder {
+    apps_tools_cache: dex_core::DexAppsToolsCache,
     config_mutators: Vec<Box<ConfigMutator>>,
-    auth: DexAuth,
+    thread_manager_configurer: Option<Box<dyn FnOnce(ThreadManager) -> ThreadManager + Send>>,
+    auth: TestAuth,
+    analytics_events_client: Option<AnalyticsEventsClient>,
     pre_build_hooks: Vec<Box<PreBuildHook>>,
     workspace_setups: Vec<Box<WorkspaceSetup>>,
     home: Option<Arc<TempDir>>,
@@ -337,9 +423,35 @@ pub struct TestDexBuilder {
     code_mode_host_program: Option<PathBuf>,
     history_mode: Option<ThreadHistoryMode>,
     models_manager: Option<SharedModelsManager>,
+    thread_store: Option<Arc<dyn ThreadStore>>,
+    agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
+    image_store: Arc<dyn AttachmentStore>,
 }
 
 impl TestDexBuilder {
+    pub fn with_apps_tools_cache(mut self, cache: dex_core::DexAppsToolsCache) -> Self {
+        self.apps_tools_cache = cache;
+        self
+    }
+
+    pub fn with_thread_store(mut self, thread_store: Arc<dyn ThreadStore>) -> Self {
+        self.thread_store = Some(thread_store);
+        self
+    }
+
+    pub fn with_agent_graph_store(mut self, agent_graph_store: Arc<dyn AgentGraphStore>) -> Self {
+        self.agent_graph_store = Some(agent_graph_store);
+        self
+    }
+
+    pub fn with_thread_manager(
+        mut self,
+        configure: impl FnOnce(ThreadManager) -> ThreadManager + Send + 'static,
+    ) -> Self {
+        self.thread_manager_configurer = Some(Box::new(configure));
+        self
+    }
+
     pub fn with_config<T>(mut self, mutator: T) -> Self
     where
         T: FnOnce(&mut Config) + Send + 'static,
@@ -349,12 +461,30 @@ impl TestDexBuilder {
     }
 
     pub fn with_auth(mut self, auth: DexAuth) -> Self {
-        self.auth = auth;
+        self.auth = TestAuth::Cached(auth);
+        self
+    }
+
+    pub fn with_auth_manager(mut self, auth_manager: Arc<AuthManager>) -> Self {
+        self.auth = TestAuth::Manager(auth_manager);
+        self
+    }
+
+    pub fn with_analytics_events_client(
+        mut self,
+        analytics_events_client: AnalyticsEventsClient,
+    ) -> Self {
+        self.analytics_events_client = Some(analytics_events_client);
         self
     }
 
     pub fn with_models_manager(mut self, models_manager: SharedModelsManager) -> Self {
         self.models_manager = Some(models_manager);
+        self
+    }
+
+    pub fn with_image_store(mut self, image_store: Arc<dyn AttachmentStore>) -> Self {
+        self.image_store = image_store;
         self
     }
 
@@ -365,8 +495,8 @@ impl TestDexBuilder {
         })
     }
 
-    pub fn with_history_mode(mut self, history_mode: ThreadHistoryMode) -> Self {
-        self.history_mode = Some(history_mode);
+    pub fn with_history_mode(mut self, history_mode: impl Into<Option<ThreadHistoryMode>>) -> Self {
+        self.history_mode = history_mode.into();
         self
     }
 
@@ -377,8 +507,23 @@ impl TestDexBuilder {
         let model = model.to_string();
         self.with_config(move |config| {
             let model_catalog = config.model_catalog.get_or_insert_with(|| {
-                bundled_models_response().expect("bundled models.json should parse")
+                bundled_models_response().expect("test model catalog should parse")
             });
+            if !model_catalog
+                .models
+                .iter()
+                .any(|candidate| candidate.slug == model)
+            {
+                let mut fixture = bundled_models_response()
+                    .expect("bundled model catalog should parse")
+                    .models
+                    .into_iter()
+                    .find(|candidate| candidate.slug == "gpt-5.5")
+                    .expect("missing bundled model gpt-5.5");
+                fixture.slug = model.clone();
+                fixture.display_name = model.clone();
+                model_catalog.models.push(fixture);
+            }
             let model_info = model_catalog
                 .models
                 .iter_mut()
@@ -493,12 +638,21 @@ impl TestDexBuilder {
         &mut self,
         server: &wiremock::MockServer,
     ) -> anyhow::Result<TestDex> {
+        let test_env = test_env().await?;
+        self.build_with_environment(server, test_env).await
+    }
+
+    /// Builds a test runtime using an explicitly selected execution environment.
+    pub async fn build_with_environment(
+        &mut self,
+        server: &wiremock::MockServer,
+        test_env: TestEnv,
+    ) -> anyhow::Result<TestDex> {
         let home = match self.home.clone() {
             Some(home) => home,
             None => Arc::new(TempDir::new()?),
         };
         let base_url = format!("{}/v1", server.uri());
-        let test_env = test_env().await?;
         Box::pin(self.build_with_home_and_base_url(
             base_url, home, /*resume_from*/ None, test_env,
             /*include_local_environment*/ false,
@@ -552,9 +706,7 @@ impl TestDexBuilder {
             Some(home) => home,
             None => Arc::new(TempDir::new()?),
         };
-        let base_url_clone = base_url.clone();
         self.config_mutators.push(Box::new(move |config| {
-            config.model_provider.base_url = Some(base_url_clone);
             config.model_provider.supports_websockets = true;
             config.experimental_realtime_ws_model = Some("realtime-test-model".to_string());
             config.realtime.version = RealtimeWsVersion::V1;
@@ -596,6 +748,30 @@ impl TestDexBuilder {
             .await
     }
 
+    /// Restarts without changing the executor platform selected by the test process.
+    pub async fn restart_with_auto_env(
+        &mut self,
+        server: &MockServer,
+        previous: &TestDex,
+    ) -> Result<TestDex> {
+        let rollout_path = previous
+            .session_configured
+            .rollout_path
+            .clone()
+            .context("rollout path")?;
+        previous.dex.shutdown_and_wait().await?;
+        let base_url = format!("{}/v1", server.uri());
+        let test_env = test_env().await?;
+        Box::pin(self.build_with_home_and_base_url(
+            base_url,
+            Arc::clone(&previous.home),
+            Some(rollout_path),
+            test_env,
+            /*include_local_environment*/ false,
+        ))
+        .await
+    }
+
     async fn build_with_home_and_base_url(
         &mut self,
         base_url: String,
@@ -618,7 +794,7 @@ impl TestDexBuilder {
         );
         #[cfg(not(target_os = "linux"))]
         let dex_linux_sandbox_exe = None;
-        let local_runtime_paths = dex_exec_server::ExecServerRuntimePaths::new(
+        let local_runtime_paths = dex_exec_server::ExecServerRuntimeOptions::new(
             std::env::current_exe()?,
             dex_linux_sandbox_exe,
         )?;
@@ -662,9 +838,11 @@ impl TestDexBuilder {
         mut test_env: TestEnv,
         environment_manager: Arc<dex_exec_server::EnvironmentManager>,
     ) -> anyhow::Result<TestDex> {
-        let auth = self.auth.clone();
         let state_db = dex_core::init_state_db(&config).await;
-        let thread_store = thread_store_from_config(&config, state_db.clone());
+        let thread_store = self
+            .thread_store
+            .clone()
+            .unwrap_or_else(|| thread_store_from_config(&config, state_db.clone()));
         let installation_id = resolve_installation_id(&config.dex_home).await?;
         let user_instructions_provider =
             self.user_instructions_provider.clone().unwrap_or_else(|| {
@@ -672,46 +850,58 @@ impl TestDexBuilder {
                     config.dex_home.clone(),
                 ))
             });
-        let auth_manager = dex_core::test_support::auth_manager_from_auth_with_home(
-            auth.clone(),
-            config.dex_home.to_path_buf(),
-        );
+        let auth_manager = self.auth.manager_for_home(config.dex_home.as_path());
         let models_manager = self
             .models_manager
             .clone()
             .unwrap_or_else(|| dex_core::build_models_manager(&config, auth_manager.clone()));
-        let thread_manager = ThreadManager::new(
-            &config,
-            auth_manager.clone(),
-            models_manager,
-            dex_core::DexAppsToolsCache::default(),
-            SessionSource::Exec,
-            Arc::clone(&environment_manager),
-            Arc::clone(&self.extensions),
-            user_instructions_provider,
-            /*analytics_events_client*/ None,
-            Arc::clone(&thread_store),
-            dex_core::local_agent_graph_store_from_state_db(state_db.as_ref()),
-            installation_id,
-            /*attestation_provider*/ None,
-            /*external_time_provider*/ self.external_time_provider.clone(),
-        );
         let code_mode_host_program = self
             .code_mode_host_program
             .take()
             .or_else(|| dex_utils_cargo_bin::cargo_bin("dex-code-mode-host").ok());
-        let thread_manager = if config.features.enabled(Feature::CodeModeHost)
-            && let Some(code_mode_host_program) = code_mode_host_program
-        {
-            dex_core::test_support::with_code_mode_host_program(
-                thread_manager,
-                code_mode_host_program,
+        let thread_manager = Arc::new_cyclic(|manager| {
+            let mut extensions = self.extensions.to_builder();
+            dex_core::install_agent_message_board(&mut extensions, manager.clone());
+            if config.features.enabled(Feature::GuardianV2) {
+                dex_guardian_v2::install(&mut extensions, auth_manager.clone(), manager.clone());
+            } else {
+                dex_guardian_v2::install_reviewer(&mut extensions, manager.clone());
+            }
+            let thread_manager = ThreadManager::new(
                 &config,
-            )
-        } else {
-            thread_manager
-        };
-        let thread_manager = Arc::new(thread_manager);
+                auth_manager.clone(),
+                models_manager,
+                self.apps_tools_cache.clone(),
+                SessionSource::Exec,
+                Arc::clone(&environment_manager),
+                Arc::new(extensions.build()),
+                user_instructions_provider,
+                self.analytics_events_client.clone(),
+                Arc::clone(&self.image_store),
+                Arc::clone(&thread_store),
+                self.agent_graph_store
+                    .clone()
+                    .or_else(|| dex_core::local_agent_graph_store_from_state_db(state_db.as_ref())),
+                installation_id,
+                /*attestation_provider*/ None,
+                /*external_time_provider*/ self.external_time_provider.clone(),
+            );
+            let thread_manager = match self.thread_manager_configurer.take() {
+                Some(configure) => configure(thread_manager),
+                None => thread_manager,
+            };
+            if config.features.enabled(Feature::CodeModeHost)
+                && let Some(code_mode_host_program) = code_mode_host_program
+            {
+                dex_core::test_support::with_code_mode_host_program(
+                    thread_manager,
+                    code_mode_host_program,
+                    &config,
+                )
+            } else {
+                thread_manager
+            }
+        });
         let user_shell_override = self.user_shell_override.clone();
         let client_mcp_extensions = || {
             ClientMcpExtensions::new(
@@ -722,12 +912,9 @@ impl TestDexBuilder {
 
         let new_conversation = match (resume_from, user_shell_override) {
             (Some(path), Some(user_shell_override)) => {
-                let auth_manager = dex_core::test_support::auth_manager_from_auth_with_home(
-                    auth,
-                    config.dex_home.to_path_buf(),
-                );
+                let auth_manager = self.auth.manager_for_home(config.dex_home.as_path());
                 Box::pin(
-                    dex_core::test_support::resume_thread_from_rollout_with_user_shell_override(
+                    dex_core::test_support::resume_legacy_thread_from_rollout_with_user_shell_override(
                         thread_manager.as_ref(),
                         config.clone(),
                         path,
@@ -739,11 +926,8 @@ impl TestDexBuilder {
                 .await?
             }
             (Some(path), None) => {
-                let auth_manager = dex_core::test_support::auth_manager_from_auth_with_home(
-                    auth,
-                    config.dex_home.to_path_buf(),
-                );
-                Box::pin(thread_manager.resume_thread_from_rollout(
+                let auth_manager = self.auth.manager_for_home(config.dex_home.as_path());
+                Box::pin(thread_manager.resume_legacy_thread_from_rollout(
                     config.clone(),
                     path,
                     auth_manager,
@@ -764,7 +948,7 @@ impl TestDexBuilder {
                 .await?
             }
             (None, None) => {
-                let environments = if test_env.selection().cwd.infer_path_convention()
+                let environment_requests = if test_env.selection().cwd.infer_path_convention()
                     == Some(PathConvention::Windows)
                     && PathUri::from_abs_path(&config.cwd) != test_env.selection().cwd
                 {
@@ -772,15 +956,15 @@ impl TestDexBuilder {
                     let mut selection = test_env.selection().clone();
                     selection.cwd = cwd.clone();
                     selection.workspace_roots = vec![cwd];
-                    test_env.selection = selection.clone();
-                    Some(vec![selection])
+                    test_env.selection = selection;
+                    Some(vec![test_env.request()])
                 } else {
                     None
                 };
                 Box::pin(thread_manager.start_thread(StartThreadOptions {
                     history_mode: self.history_mode,
                     client_mcp_extensions: client_mcp_extensions(),
-                    environments,
+                    environments: environment_requests,
                     ..StartThreadOptions::new(config.clone())
                 }))
                 .await?
@@ -862,16 +1046,23 @@ fn ensure_test_model_catalog(config: &mut Config) -> Result<()> {
         return Ok(());
     }
 
-    let bundled_models = bundled_models_response().expect("bundled models.json should parse");
+    let bundled_models = bundled_models_response().expect("test model catalog should parse");
     let mut model = bundled_models
         .models
         .iter()
-        .find(|candidate| candidate.slug == "gpt-5.2")
+        .find(|candidate| candidate.slug == "gpt-5.5")
         .cloned()
-        .expect("missing bundled model gpt-5.2");
+        .expect("missing bundled model gpt-5.5");
     model.slug = TEST_MODEL_WITH_EXPERIMENTAL_TOOLS.to_string();
     model.display_name = TEST_MODEL_WITH_EXPERIMENTAL_TOOLS.to_string();
     model.experimental_supported_tools = vec!["test_sync_tool".to_string()];
+    model.truncation_policy = TruncationPolicyConfig::bytes(/*limit*/ 10_000);
+    model.default_reasoning_summary = ReasoningSummary::Auto;
+    model.comp_hash = None;
+    model.service_tiers.clear();
+    model.additional_speed_tiers.clear();
+    model.web_search_tool_type = WebSearchToolType::Text;
+    model.supports_image_detail_original = false;
     config.model_catalog = Some(ModelsResponse {
         models: vec![model],
     });
@@ -890,6 +1081,22 @@ pub struct TestDex {
 }
 
 impl TestDex {
+    /// Starts another test thread with the fixture's current environments and configuration.
+    /// Keeping request construction here lets ordinary tests ignore runtime selection fields.
+    pub async fn start_thread_options(&self) -> StartThreadOptions {
+        StartThreadOptions {
+            environments: Some(
+                self.dex
+                    .environment_selections()
+                    .await
+                    .into_iter()
+                    .map(TurnEnvironmentSelection::into_request)
+                    .collect(),
+            ),
+            ..StartThreadOptions::new(self.config.clone())
+        }
+    }
+
     pub fn cwd_path(&self) -> &Path {
         self.cwd.path()
     }
@@ -1063,7 +1270,8 @@ impl TestDex {
                     text_elements: Vec::new(),
                 }])
                 .with_thread_settings(ThreadSettingsOverrides {
-                    environments: turn_environment_selections,
+                    environments: turn_environment_selections
+                        .map(TurnEnvironmentSelections::into_requests),
                     approval_policy: Some(approval_policy),
                     sandbox_policy: Some(sandbox_policy),
                     permission_profile,
@@ -1324,6 +1532,8 @@ fn function_call_output<'a>(bodies: &'a [Value], call_id: &str) -> &'a Value {
 
 pub fn test_dex() -> TestDexBuilder {
     TestDexBuilder {
+        apps_tools_cache: Default::default(),
+        thread_manager_configurer: None,
         config_mutators: vec![Box::new(|config| {
             config
                 .features
@@ -1335,7 +1545,8 @@ pub fn test_dex() -> TestDexBuilder {
                 .disable(Feature::ShellSnapshot)
                 .expect("test config should allow ShellSnapshot override");
         })],
-        auth: DexAuth::from_api_key("dummy"),
+        auth: TestAuth::Cached(DexAuth::from_api_key("dummy")),
+        analytics_events_client: None,
         pre_build_hooks: vec![],
         workspace_setups: vec![],
         home: None,
@@ -1347,9 +1558,38 @@ pub fn test_dex() -> TestDexBuilder {
         supports_openai_form_elicitation: false,
         external_time_provider: None,
         code_mode_host_program: None,
-        history_mode: None,
+        // These fixtures exercise legacy-only resume/fork helpers; store-default tests opt out.
+        history_mode: Some(ThreadHistoryMode::Legacy),
         models_manager: None,
+        thread_store: None,
+        agent_graph_store: None,
+        image_store: dex_core::passthrough_image_store(),
     }
+}
+
+pub fn run_test_with_large_stack<F, Fut>(name: &str, test: F) -> Result<()>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    const WORKER_THREADS: usize = 2;
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
+    let handle = std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(move || -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(WORKER_THREADS)
+                .thread_stack_size(TEST_STACK_SIZE_BYTES)
+                .enable_all()
+                .build()?;
+            runtime.block_on(Box::pin(test()))
+        })?;
+
+    handle
+        .join()
+        .map_err(|_| anyhow!("{name} thread panicked"))?
 }
 
 #[cfg(test)]

@@ -7,7 +7,25 @@ use dex_extension_api::McpServerContributor;
 use dex_mcp::DEX_APPS_MCP_SERVER_NAME;
 use dex_mcp::hosted_plugin_runtime_mcp_server_config;
 
-mod executor_plugin;
+mod catalog_observability;
+mod cloud_plugin;
+mod plugin;
+mod plugin_contributor;
+mod plugin_contributor_state;
+mod plugin_providers;
+mod stream_manager;
+
+pub use dex_core_plugins::PluginListQuery;
+pub use dex_core_plugins::PluginProvider;
+pub use dex_core_plugins::PluginProviderError;
+pub use dex_core_plugins::PluginProviderFuture;
+pub use dex_core_plugins::PluginProviderResult;
+pub use plugin_contributor::install_plugin_providers;
+pub use plugin_contributor::install_plugins;
+pub use plugin_contributor_state::PluginsThreadState;
+pub use plugin_providers::PluginProviders;
+pub use stream_manager::McpEventStreamManager;
+pub use stream_manager::McpEventStreamUpdate;
 
 struct HostedPluginRuntimeExtension;
 
@@ -33,6 +51,7 @@ impl McpServerContributor<Config> for HostedPluginRuntimeExtension {
                     config.apps_mcp_product_sku.as_deref(),
                     context.originator(),
                 )),
+                protocol_mode: None,
             }]
         })
     }
@@ -40,16 +59,6 @@ impl McpServerContributor<Config> for HostedPluginRuntimeExtension {
 
 pub fn install(builder: &mut ExtensionRegistryBuilder<Config>) {
     builder.mcp_server_contributor(std::sync::Arc::new(HostedPluginRuntimeExtension));
-}
-
-/// Installs discovery for MCP servers declared by thread-selected executor plugins.
-pub fn install_executor_plugins(
-    builder: &mut ExtensionRegistryBuilder<Config>,
-    environment_manager: std::sync::Arc<dex_exec_server::EnvironmentManager>,
-) {
-    builder.mcp_server_contributor(std::sync::Arc::new(
-        executor_plugin::SelectedExecutorPluginMcpContributor::new(environment_manager),
-    ));
 }
 
 #[cfg(test)]

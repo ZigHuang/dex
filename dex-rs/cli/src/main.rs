@@ -10,15 +10,15 @@ use dex_arg0::Arg0DispatchPaths;
 use dex_arg0::arg0_dispatch_or_else;
 use dex_chatgpt::apply_command::ApplyCommand;
 use dex_chatgpt::apply_command::run_apply_command;
+use dex_cli::cloud_config;
 use dex_cli::read_access_token_from_stdin;
 use dex_cli::read_api_key_from_stdin;
 use dex_cli::run_login_status;
 use dex_cli::run_login_with_access_token;
 use dex_cli::run_login_with_api_key;
-use dex_cli::run_login_with_chatgpt;
+use dex_cli::run_login_with_browser;
 use dex_cli::run_login_with_device_code;
 use dex_cli::run_logout;
-use dex_cloud_config::cloud_config_bundle_loader_for_storage;
 use dex_cloud_tasks::Cli as CloudTasksCli;
 use dex_exec::Cli as ExecCli;
 use dex_exec::Command as ExecCommand;
@@ -36,7 +36,6 @@ use dex_utils_absolute_path::AbsolutePathBuf;
 use dex_utils_cli::CliConfigOverrides;
 use dex_utils_cli::ProfileV2Name;
 use dex_utils_cli::SharedCliOptions;
-use owo_colors::OwoColorize;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::io::Write;
@@ -44,21 +43,39 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use supports_color::Stream;
 
+#[cfg(all(
+    target_os = "linux",
+    target_env = "musl",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app_cmd;
-mod cloud_config;
+mod config_override_args;
+mod daemon_install;
+mod daemon_telemetry;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
 mod doctor;
-mod exec_server_telemetry;
+#[cfg(test)]
+#[path = "exec_args_tests.rs"]
+mod exec_args_tests;
+#[cfg(test)]
+#[path = "exec_server_args_tests.rs"]
+mod exec_server_args_tests;
 mod marketplace_cmd;
 mod mcp_cmd;
+mod mcp_login;
+mod migrate_nfs_db;
 mod migrate_rollouts;
 mod plugin_cmd;
 mod queue_cmd;
 mod remote_control_cmd;
 #[cfg(target_os = "windows")]
 mod sandbox_setup;
+mod sandbox_uninstall;
 mod state_db_recovery;
 #[cfg(not(windows))]
 mod wsl_paths;
@@ -68,6 +85,7 @@ use crate::plugin_cmd::PluginCli;
 use crate::plugin_cmd::PluginSubcommand;
 use crate::queue_cmd::QueueCommand;
 use crate::remote_control_cmd::RemoteControlCommand;
+use dex_exec_server_cli::ExecServerCommand;
 use doctor::DoctorCommand;
 use state_db_recovery as local_state_db;
 
@@ -75,21 +93,15 @@ use dex_config::LoaderOverrides;
 use dex_core::build_models_manager;
 use dex_core::config::Config;
 use dex_core::config::ConfigBuilder;
-use dex_core::config::ConfigLoadOptions;
 use dex_core::config::ConfigOverrides;
-use dex_core::config::bootstrap_auth_config;
 use dex_core::config::edit::ConfigEditsBuilder;
 use dex_core::config::find_dex_home;
-use dex_core::config::load_config_toml_with_layer_stack;
 use dex_core::config::resolve_profile_v2_config_path;
 use dex_features::FEATURES;
 use dex_features::Stage;
 use dex_features::is_known_feature_key;
 use dex_home::DexHomeUserInstructionsProvider;
 use dex_login::AuthManager;
-use dex_login::DexAuth;
-use dex_login::is_workload_identity_selected;
-use dex_login::read_dex_access_token_from_env;
 use dex_memories_write::clear_memory_roots_contents;
 use dex_models_manager::bundled_models_response;
 use dex_models_manager::manager::RefreshStrategy;
@@ -131,9 +143,12 @@ struct MultitoolCli {
 
 #[derive(Debug, clap::Subcommand)]
 enum Subcommand {
-    /// Browse all agent sessions on the shared local app-server daemon.
+    /// Open the agent command center to browse and switch sessions.
     Agents(AgentsCommand),
 
+    /// Internal: forward a local TCP socket through an HTTP/3 CONNECT proxy.
+    #[clap(hide = true)]
+    TcpTunnel(dex_tcp_tunnel::Args),
     /// Run Dex non-interactively.
     #[clap(visible_alias = "e")]
     Exec(ExecCli),
@@ -152,9 +167,6 @@ enum Subcommand {
 
     /// Manage Dex plugins.
     Plugin(PluginCli),
-
-    /// Start Dex as an MCP server (stdio).
-    McpServer(McpServerCommand),
 
     /// [experimental] Run the app server or related tooling.
     AppServer(AppServerCommand),
@@ -176,7 +188,7 @@ enum Subcommand {
     Doctor(DoctorCommand),
 
     /// Run commands within a Dex-provided sandbox.
-    Sandbox(HostSandboxArgs),
+    Sandbox(SandboxCommand),
 
     /// Debugging tools.
     Debug(DebugCommand),
@@ -203,6 +215,9 @@ enum Subcommand {
 
     /// Inspect or migrate legacy local sessions to paginated thread history.
     MigrateRollouts(migrate_rollouts::MigrateRolloutsCommand),
+
+    /// [experimental] Migrate configured SQLite databases to DELETE mode in place.
+    MigrateNfsDb(migrate_nfs_db::MigrateNfsDbCommand),
 
     /// Unarchive a saved session by id or session name.
     Unarchive(SessionArchiveCommand),
@@ -309,13 +324,6 @@ struct ReviewCommand {
 }
 
 #[derive(Debug, Parser)]
-struct McpServerCommand {
-    /// Error out when config.toml contains fields that are not recognized by this version of Dex.
-    #[arg(long = "strict-config", default_value_t = false)]
-    strict_config: bool,
-}
-
-#[derive(Debug, Parser)]
 struct DebugTraceReduceCommand {
     /// Trace bundle directory containing manifest.json and trace.jsonl.
     #[arg(value_name = "TRACE_BUNDLE")]
@@ -328,6 +336,9 @@ struct DebugTraceReduceCommand {
 
 #[derive(Debug, Parser)]
 struct AgentsCommand {
+    /// Run the agents overview with an embedded app server.
+    #[arg(long)]
+    no_daemon: bool,
     #[clap(flatten)]
     remote: InteractiveRemoteOptions,
 
@@ -450,6 +461,20 @@ impl clap::FromArgMatches for SessionTuiCli {
     }
 }
 
+#[derive(Debug, Parser)]
+struct SandboxCommand {
+    #[command(flatten)]
+    host: HostSandboxArgs,
+
+    #[command(subcommand)]
+    subcommand: Option<SandboxSubcommand>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum SandboxSubcommand {
+    Uninstall(sandbox_uninstall::SandboxUninstallCommand),
+}
+
 #[cfg(target_os = "macos")]
 type HostSandboxArgs = dex_cli::SeatbeltCommand;
 #[cfg(target_os = "linux")]
@@ -545,6 +570,12 @@ struct LogoutCommand {
 
 #[derive(Debug, Parser)]
 struct AppServerCommand {
+    #[command(flatten)]
+    startup_config: dex_app_server::StartupConfigArgs,
+
+    /// Load frozen cloud skills from a JSON snapshot instead of a live skill service.
+    #[arg(long, value_name = "PATH")]
+    cloud_skills_snapshot: Option<PathBuf>,
     /// Omit to run the app server; specify a subcommand for tooling.
     #[command(subcommand)]
     subcommand: Option<AppServerSubcommand>,
@@ -573,6 +604,10 @@ struct AppServerCommand {
     #[arg(long = "remote-control", hide = true)]
     remote_control: bool,
 
+    /// Save loaded threads during managed daemon shutdown.
+    #[arg(long, hide = true)]
+    managed_daemon: bool,
+
     /// Controls whether analytics are enabled by default.
     ///
     /// Analytics are disabled by default for app-server. Users have to explicitly opt in
@@ -592,83 +627,7 @@ struct AppServerCommand {
     analytics_default_enabled: bool,
 
     #[command(flatten)]
-    auth: dex_app_server::AppServerWebsocketAuthArgs,
-}
-
-#[derive(Debug, Parser)]
-struct ExecServerCommand {
-    #[command(subcommand)]
-    command: Option<ExecServerSubcommand>,
-
-    /// Error out when config.toml contains fields that are not recognized by this version of Dex.
-    #[arg(
-        id = "exec_server_strict_config",
-        long = "strict-config",
-        default_value_t = false,
-        global = true
-    )]
-    strict_config: bool,
-
-    /// Maximum number of requests to process concurrently on each connection.
-    #[arg(
-        long = "concurrent-requests",
-        value_name = "COUNT",
-        default_value = "1"
-    )]
-    request_dispatch_mode: dex_exec_server::RequestDispatchMode,
-
-    /// Transport endpoint URL. Supported values: `ws://IP:PORT` (default), `stdio`, `stdio://`.
-    #[arg(
-        long = "listen",
-        value_name = "URL",
-        conflicts_with = "exec_server_remote"
-    )]
-    listen: Option<String>,
-
-    /// Register this exec-server as a remote environment using the given base URL.
-    #[arg(
-        long = "remote",
-        id = "exec_server_remote",
-        value_name = "URL",
-        requires = "environment_id",
-        global = true
-    )]
-    remote: Option<String>,
-
-    /// Environment id to attach to when registering remotely.
-    #[arg(long = "environment-id", value_name = "ID", global = true)]
-    environment_id: Option<String>,
-
-    /// Human-readable environment name.
-    #[arg(long = "name", value_name = "NAME", global = true)]
-    name: Option<String>,
-
-    /// Use Agent Identity auth from DEX_ACCESS_TOKEN for remote registration.
-    #[arg(
-        long = "use-agent-identity-auth",
-        requires = "exec_server_remote",
-        global = true
-    )]
-    use_agent_identity_auth: bool,
-
-    /// Exit when the parent-owned standard-input pipe closes.
-    #[arg(
-        long = "exit-on-stdin-close",
-        env = dex_exec_server::DEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE_ENV_VAR,
-        requires_if("true", "exec_server_remote"),
-        global = true
-    )]
-    exit_on_stdin_close: bool,
-}
-
-#[derive(Debug, clap::Subcommand)]
-enum ExecServerSubcommand {
-    /// Register an existing WebSocket exec-server as a remote environment.
-    Forward {
-        /// Destination exec-server WebSocket URL.
-        #[arg(long, value_name = "URL", requires = "exec_server_remote")]
-        connect: String,
-    },
+    auth: dex_websocket_auth::WebsocketAuthArgs,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -708,6 +667,16 @@ enum AppServerDaemonSubcommand {
     /// Restart the local app server daemon.
     Restart,
 
+    /// Update the daemon package (may interrupt running work).
+    Update {
+        /// Copy and pin this CLI package.
+        #[arg(long)]
+        from_cli: bool,
+        /// Confirm replacing the daemon package without an interactive prompt.
+        #[arg(short = 'y', long, requires = "from_cli")]
+        yes: bool,
+    },
+
     /// Enable remote control for future starts and a currently running managed daemon.
     EnableRemoteControl,
 
@@ -722,7 +691,14 @@ enum AppServerDaemonSubcommand {
 
     /// [internal] Run the detached pid-backed standalone updater loop.
     #[clap(hide = true)]
-    PidUpdateLoop,
+    PidUpdateLoop {
+        /// Check support for daemon-owned packages without starting the updater.
+        #[arg(long, hide = true)]
+        check_package_ownership: bool,
+        /// Authorize one production restoration of this selected release.
+        #[arg(long, hide = true)]
+        restore_release: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -784,81 +760,83 @@ fn parse_socket_path(raw: &str) -> Result<AbsolutePathBuf, String> {
         .map_err(|err| format!("failed to resolve socket path `{raw}`: {err}"))
 }
 
-fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<String> {
-    let is_fatal = matches!(&exit_info.exit_reason, ExitReason::Fatal(_));
-    let AppExitInfo {
-        token_usage,
-        thread_id: conversation_id,
-        resume_hint,
-        ..
-    } = exit_info;
-
-    let mut lines = Vec::new();
-    if !token_usage.is_zero() {
-        lines.push(token_usage.to_string());
-    }
-
-    if let Some(resume_cmd) = resume_hint {
-        let command = if color_enabled {
-            resume_cmd.cyan().to_string()
-        } else {
-            resume_cmd
-        };
-        lines.push(format!("To continue this session, run {command}"));
-    } else if is_fatal && let Some(conversation_id) = conversation_id {
-        lines.push(format!("Session ID: {conversation_id}"));
-    }
-
-    lines
-}
-
 /// Handle the app exit and print the results. Optionally run the update action.
-fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
+fn handle_app_exit(
+    exit_info: AppExitInfo,
+    cli_executable: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     let is_fatal = match &exit_info.exit_reason {
         ExitReason::Fatal(message) => {
             eprintln!("ERROR: {message}");
             true
         }
-        ExitReason::UserRequested => false,
+        ExitReason::UserRequested | ExitReason::TurnInterrupted => false,
     };
 
     let update_action = exit_info.update_action;
-    let color_enabled = supports_color::on(Stream::Stdout).is_some();
-    for line in format_exit_messages(exit_info, color_enabled) {
-        println!("{line}");
+    if !matches!(update_action, Some(UpdateAction::Daemon(_))) {
+        let color_enabled = supports_color::on(Stream::Stdout).is_some();
+        for line in exit_info.format_exit_messages(color_enabled) {
+            println!("{line}");
+        }
     }
     if is_fatal {
         std::io::stdout().flush()?;
         std::process::exit(1);
     }
     if let Some(action) = update_action {
-        run_update_action(action)?;
+        run_update_action(action, cli_executable)?;
     }
     Ok(())
 }
 
 /// Run the update action and print the result.
-fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
+fn run_update_action(
+    action: UpdateAction,
+    cli_executable: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    if let UpdateAction::Daemon(source) = action {
+        let executable =
+            cli_executable.ok_or_else(|| anyhow::anyhow!("Cannot locate the launching Dex CLI"))?;
+        println!("Updating the local background server...");
+        let status = std::process::Command::new(executable)
+            .args(source.command_args())
+            .env(dex_app_server_daemon::telemetry::HANDOFF_ENV, "1")
+            .status()?;
+        anyhow::ensure!(
+            status.success(),
+            "Daemon update failed with status {status}"
+        );
+        println!("Relaunch Dex to reconnect.");
+        return Ok(());
+    }
     println!();
     let cmd_str = action.command_str();
     println!("Updating Dex via `{cmd_str}`...");
-
     let status = {
         #[cfg(windows)]
         {
-            if action == UpdateAction::StandaloneWindows {
-                let (cmd, args) = action.command_args();
-                // Run the standalone PowerShell installer with PowerShell
-                // itself. Routing this through `cmd.exe /C` would parse
-                // PowerShell metacharacters like `|` before PowerShell sees
-                // the installer command.
-                std::process::Command::new(cmd).args(args).status()?
+            let (cmd, args) = action.command_args();
+            let cmd = if action == UpdateAction::StandaloneWindows {
+                // These args contain PowerShell metacharacters, so do not let
+                // PATHEXT select a batch shim for this action.
+                "powershell.exe"
             } else {
-                // On Windows, run via cmd.exe so .CMD/.BAT are correctly resolved (PATHEXT semantics).
-                std::process::Command::new("cmd")
-                    .args(["/C", &cmd_str])
-                    .status()?
-            }
+                cmd
+            };
+            let path_env =
+                std::env::var_os("PATH").ok_or_else(|| anyhow::anyhow!("PATH is not set"))?;
+            let command_path = resolve_windows_update_command_from_path(cmd, &path_env)?;
+            // Do not let a project-local command or package-manager config
+            // influence the updater after the user accepts the update prompt.
+            let update_cwd = tempfile::tempdir()?;
+            // Resolve through PATH without consulting the project cwd. When
+            // this returns a .cmd/.bat shim, std::process::Command routes the
+            // absolute path through the system command processor.
+            std::process::Command::new(command_path)
+                .args(args)
+                .current_dir(update_cwd.path())
+                .status()?
         }
         #[cfg(not(windows))]
         {
@@ -870,6 +848,8 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
                 .collect();
             std::process::Command::new(&command_path)
                 .args(&normalized_args)
+                // Package managers search parent directories for project config and hooks.
+                .current_dir("/")
                 .status()?
         }
     };
@@ -878,6 +858,23 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
     }
     println!("\n🎉 Update ran successfully! Please restart Dex.");
     Ok(())
+}
+
+#[cfg(windows)]
+fn resolve_windows_update_command_from_path(
+    command: &str,
+    path_env: &std::ffi::OsStr,
+) -> anyhow::Result<PathBuf> {
+    let path_env =
+        std::env::join_paths(std::env::split_paths(path_env).filter(|path| path.is_absolute()))?;
+    if path_env.is_empty() {
+        anyhow::bail!(
+            "Could not find an absolute update command `{command}` on PATH. Please update manually: https://developers.openai.com/dex/cli/"
+        );
+    }
+    which::which_in_global(command, Some(&path_env))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("could not find update command `{command}` on PATH"))
 }
 
 fn run_update_command() -> anyhow::Result<()> {
@@ -895,7 +892,7 @@ fn run_update_command() -> anyhow::Result<()> {
                 "Could not detect the Dex installation method. Please update manually: https://developers.openai.com/dex/cli/"
             );
         };
-        run_update_action(action)
+        run_update_action(action, /*cli_executable*/ None)
     }
 }
 
@@ -1038,24 +1035,38 @@ fn stage_str(stage: Stage) -> &'static str {
 }
 
 fn main() -> anyhow::Result<()> {
+    dex_build_info::initialize!();
     let remote_control_disabled = dex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
-        Box::pin(cli_main(arg0_paths, remote_control_disabled)).await?;
+        // Finish polling the large subcommand dispatcher before polling interactive TUI events.
+        if let Some(tui) = Box::pin(dispatch_cli(arg0_paths, remote_control_disabled)).await? {
+            tui.await?;
+        }
         Ok(())
     })
 }
 
-async fn cli_main(
+async fn dispatch_cli(
     arg0_paths: Arg0DispatchPaths,
     remote_control_disabled: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<impl Future<Output = anyhow::Result<()>>>> {
     let MultitoolCli {
         config_overrides: mut root_config_overrides,
         feature_toggles,
         remote,
         mut interactive,
         subcommand,
-    } = MultitoolCli::parse();
+    } = config_override_args::try_parse_from(std::env::args_os())
+        .unwrap_or_else(|error| error.exit());
+    // Retain the launch target through TUI exit, even if a launcher changes selection.
+    let daemon_cli_executable = arg0_paths
+        .dex_self_exe
+        .as_ref()
+        .and_then(|path| path.canonicalize().ok());
+    interactive.daemon_cli_executable = daemon_cli_executable
+        .clone()
+        .and_then(|path| AbsolutePathBuf::from_absolute_path(path).ok());
+    reject_unsupported_worktree_for_subcommand(interactive.shared.worktree, &subcommand)?;
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;
     root_config_overrides.raw_overrides.extend(toggle_overrides);
@@ -1079,6 +1090,7 @@ async fn cli_main(
     if let Some(options) = agents_options {
         interactive.cwd = options.cwd.clone().or(interactive.cwd.take());
         interactive.no_alt_screen |= options.no_alt_screen;
+        interactive.no_daemon |= options.no_daemon;
     }
     let root_strict_config = interactive.strict_config;
     interactive
@@ -1089,6 +1101,11 @@ async fn cli_main(
         profile_v2_for_subcommand(&interactive, subcommand)?;
     }
 
+    let launch_tui = move |interactive, remote, auth_token_env, arg0_paths| async move {
+        let exit_info =
+            run_interactive_tui(interactive, remote, auth_token_env, arg0_paths).await?;
+        handle_app_exit(exit_info, daemon_cli_executable.as_deref())
+    };
     let open_agents_overview = matches!(&subcommand, Some(Subcommand::Agents(_)));
     match subcommand {
         None | Some(Subcommand::Agents(_)) => {
@@ -1119,27 +1136,17 @@ async fn cli_main(
                         "`dex agents` cannot apply local provider or additional-directory overrides to a remote server"
                     );
                 }
-                if is_workload_identity_selected() {
-                    anyhow::bail!("`dex agents` is unavailable while workload identity is active");
-                }
-                if root_remote.is_none() {
-                    resolve_remote_endpoint(
-                        /*remote*/ None,
-                        root_remote_auth_token_env.clone(),
-                    )?;
-                    #[cfg(not(unix))]
-                    anyhow::bail!("`dex agents` requires `--remote` on this platform");
-                }
                 interactive.agents_overview = true;
             }
-            let exit_info = run_interactive_tui(
+            return Ok(Some(launch_tui(
                 interactive,
-                root_remote.clone(),
-                root_remote_auth_token_env.clone(),
-                arg0_paths.clone(),
-            )
-            .await?;
-            handle_app_exit(exit_info)?;
+                root_remote,
+                root_remote_auth_token_env,
+                arg0_paths,
+            )));
+        }
+        Some(Subcommand::TcpTunnel(args)) => {
+            dex_tcp_tunnel::run(args).await?;
         }
         Some(Subcommand::Exec(mut exec_cli)) => {
             reject_remote_mode_for_subcommand(
@@ -1177,22 +1184,6 @@ async fn cli_main(
                 root_config_overrides.clone(),
             );
             dex_exec::run_main(exec_cli, arg0_paths.clone()).await?;
-        }
-        Some(Subcommand::McpServer(McpServerCommand { strict_config })) => {
-            eprintln!(
-                "warning: `dex mcp-server` is deprecated and will be removed in a future release."
-            );
-            reject_remote_mode_for_subcommand(
-                root_remote.as_deref(),
-                root_remote_auth_token_env.as_deref(),
-                "mcp-server",
-            )?;
-            dex_mcp_server::run_main(
-                arg0_paths.clone(),
-                root_config_overrides,
-                strict_config || root_strict_config,
-            )
-            .await?;
         }
         Some(Subcommand::Mcp(mut mcp_cli)) => {
             reject_remote_mode_for_subcommand(
@@ -1244,12 +1235,15 @@ async fn cli_main(
         }
         Some(Subcommand::AppServer(app_server_cli)) => {
             let AppServerCommand {
+                startup_config,
+                cloud_skills_snapshot,
                 subcommand,
                 code_mode_host,
                 strict_config: app_server_strict_config,
                 listen,
                 stdio,
                 remote_control,
+                managed_daemon,
                 analytics_default_enabled,
                 auth,
             } = app_server_cli;
@@ -1260,6 +1254,21 @@ async fn cli_main(
                 root_remote_auth_token_env.as_deref(),
                 subcommand.as_ref(),
             )?;
+            if startup_config.print_startup_config {
+                anyhow::ensure!(
+                    subcommand.is_none(),
+                    "--print-startup-config cannot run a subcommand"
+                );
+                dex_app_server::print_startup_config(
+                    arg0_paths,
+                    root_config_overrides,
+                    LoaderOverrides::default(),
+                    strict_config,
+                    startup_config,
+                )
+                .await?;
+                return Ok(None);
+            }
             match subcommand {
                 None => {
                     let transport = if stdio {
@@ -1268,8 +1277,18 @@ async fn cli_main(
                         listen
                     };
                     let auth = auth.try_into_settings()?;
+                    if managed_daemon
+                        && matches!(
+                            &transport,
+                            dex_app_server::AppServerTransport::UnixSocket { .. }
+                        )
+                    {
+                        let _ = dex_app_server_daemon::maintain_stderr_log();
+                    }
                     let runtime_options = dex_app_server::AppServerRuntimeOptions {
+                        cloud_skills_snapshot,
                         code_mode_host_transport: code_mode_host.into(),
+                        managed_daemon,
                         remote_control_startup_mode: match (remote_control, remote_control_disabled)
                         {
                             (true, _) => dex_app_server::RemoteControlStartupMode::EnabledEphemeral,
@@ -1282,7 +1301,7 @@ async fn cli_main(
                         },
                         ..Default::default()
                     };
-                    dex_app_server::run_main_with_transport_options(
+                    let exit = dex_app_server::run_main_with_transport_options(
                         arg0_paths.clone(),
                         root_config_overrides,
                         LoaderOverrides::default(),
@@ -1294,6 +1313,10 @@ async fn cli_main(
                         runtime_options,
                     )
                     .await?;
+                    if exit == dex_app_server::AppServerExit::Forced {
+                        // Runtime teardown can wait forever for blocked rollout I/O.
+                        std::process::exit(0);
+                    }
                 }
                 Some(AppServerSubcommand::Daemon(daemon_cli)) => match daemon_cli.subcommand {
                     AppServerDaemonSubcommand::Start => {
@@ -1307,7 +1330,64 @@ async fn cli_main(
                         println!("{}", serde_json::to_string(&output)?);
                     }
                     AppServerDaemonSubcommand::Restart => {
-                        print_app_server_daemon_output(AppServerLifecycleCommand::Restart).await?;
+                        let overrides = root_config_overrides
+                            .parse_overrides()
+                            .map_err(anyhow::Error::msg)?;
+                        let layer = dex_config::build_cli_overrides_layer(&overrides);
+                        let features = layer
+                            .get("features")
+                            .and_then(toml::Value::as_table)
+                            .into_iter()
+                            .flatten()
+                            .map(|(name, value)| (name.as_str(), value))
+                            .collect::<std::collections::BTreeMap<_, _>>();
+                        let mut feature_overrides = std::collections::BTreeMap::new();
+                        // Match Features::apply_map's alias precedence.
+                        for (&name, &value) in &features {
+                            if name == "imagegenext" && features.contains_key("image_generation") {
+                                continue;
+                            }
+                            let value = if let Some(table) = value.as_table() {
+                                let Some(enabled) = table.get("enabled") else {
+                                    continue;
+                                };
+                                enabled
+                            } else {
+                                value
+                            };
+                            let feature = dex_features::feature_for_key(name).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "daemon restart requires a boolean feature toggle: {name}"
+                                )
+                            })?;
+                            let enabled = value.as_bool().ok_or_else(|| {
+                                anyhow::anyhow!("daemon restart requires a boolean enablement for features.{name}")
+                            })?;
+                            feature_overrides.insert(feature.key().to_string(), enabled);
+                        }
+                        print_app_server_daemon_output(AppServerLifecycleCommand::Restart {
+                            feature_overrides,
+                        })
+                        .await?;
+                    }
+                    AppServerDaemonSubcommand::Update {
+                        from_cli: true,
+                        yes,
+                    } => {
+                        let result = dex_app_server_daemon::update_from_cli(|request| {
+                            daemon_install::confirm_install(request, yes)
+                        })
+                        .await;
+                        daemon_telemetry::record_command(
+                            &root_config_overrides,
+                            analytics_default_enabled,
+                            "this_cli",
+                            &result,
+                        )
+                        .await;
+                        if let Some(output) = result? {
+                            println!("{}", serde_json::to_string(&output)?);
+                        }
                     }
                     AppServerDaemonSubcommand::EnableRemoteControl => {
                         print_app_server_remote_control_output(AppServerRemoteControlMode::Enabled)
@@ -1325,7 +1405,17 @@ async fn cli_main(
                     AppServerDaemonSubcommand::Version => {
                         print_app_server_daemon_output(AppServerLifecycleCommand::Version).await?;
                     }
-                    AppServerDaemonSubcommand::PidUpdateLoop => {
+                    AppServerDaemonSubcommand::PidUpdateLoop {
+                        check_package_ownership: true,
+                        ..
+                    } => return Ok(None),
+                    AppServerDaemonSubcommand::Update {
+                        from_cli: false, ..
+                    }
+                    | AppServerDaemonSubcommand::PidUpdateLoop {
+                        check_package_ownership: false,
+                        ..
+                    } => {
                         let cli_overrides = root_config_overrides
                             .parse_overrides()
                             .map_err(anyhow::Error::msg)?;
@@ -1334,8 +1424,37 @@ async fn cli_main(
                             .build()
                             .await
                             .map_err(anyhow::Error::from);
-                        let http_client_factory = updater_http_client_factory(config);
-                        dex_app_server_daemon::run_pid_update_loop(http_client_factory).await?;
+                        let http_client_factory = updater_http_client_factory(config)?;
+                        if matches!(
+                            daemon_cli.subcommand,
+                            AppServerDaemonSubcommand::Update { .. }
+                        ) {
+                            let result = dex_app_server_daemon::update(http_client_factory)
+                                .await
+                                .map(Some);
+                            daemon_telemetry::record_command(
+                                &root_config_overrides,
+                                analytics_default_enabled,
+                                "public_stable",
+                                &result,
+                            )
+                            .await;
+                            if let Some(output) = result? {
+                                println!("{}", serde_json::to_string(&output)?);
+                            }
+                        } else {
+                            let AppServerDaemonSubcommand::PidUpdateLoop {
+                                restore_release, ..
+                            } = daemon_cli.subcommand
+                            else {
+                                unreachable!()
+                            };
+                            dex_app_server_daemon::run_pid_update_loop(
+                                http_client_factory,
+                                restore_release,
+                            )
+                            .await?;
+                        }
                     }
                 },
                 Some(AppServerSubcommand::Proxy(proxy_cli)) => {
@@ -1370,7 +1489,8 @@ async fn cli_main(
                 }
             }
         }
-        Some(Subcommand::RemoteControl(remote_control_cli)) => {
+        Some(Subcommand::RemoteControl(mut remote_control_cli)) => {
+            remote_control_cli.no_daemon |= interactive.no_daemon;
             let subcommand_name = remote_control_cli.subcommand_name();
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
@@ -1411,16 +1531,12 @@ async fn cli_main(
                 include_non_interactive,
                 config_overrides,
             );
-            let exit_info = run_interactive_tui(
+            return Ok(Some(launch_tui(
                 interactive,
-                remote.remote.or(root_remote.clone()),
-                remote
-                    .remote_auth_token_env
-                    .or(root_remote_auth_token_env.clone()),
-                arg0_paths.clone(),
-            )
-            .await?;
-            handle_app_exit(exit_info)?;
+                remote.remote.or(root_remote),
+                remote.remote_auth_token_env.or(root_remote_auth_token_env),
+                arg0_paths,
+            )));
         }
         Some(Subcommand::Archive(cmd)) => {
             let output = run_session_archive_cli_command(
@@ -1469,6 +1585,19 @@ async fn cli_main(
             )?;
             migrate_rollouts::run(command, root_config_overrides).await?;
         }
+        Some(Subcommand::MigrateNfsDb(command)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "migrate-nfs-db",
+            )?;
+            migrate_nfs_db::run(
+                command,
+                root_config_overrides,
+                loader_overrides_for_profile(interactive.config_profile_v2.as_ref())?,
+            )
+            .await?;
+        }
         Some(Subcommand::Unarchive(cmd)) => {
             let output = run_session_archive_cli_command(
                 dex_tui::SessionArchiveAction::Unarchive,
@@ -1498,16 +1627,12 @@ async fn cli_main(
                 all,
                 config_overrides,
             );
-            let exit_info = run_interactive_tui(
+            return Ok(Some(launch_tui(
                 interactive,
-                remote.remote.or(root_remote.clone()),
-                remote
-                    .remote_auth_token_env
-                    .or(root_remote_auth_token_env.clone()),
-                arg0_paths.clone(),
-            )
-            .await?;
-            handle_app_exit(exit_info)?;
+                remote.remote.or(root_remote),
+                remote.remote_auth_token_env.or(root_remote_auth_token_env),
+                arg0_paths,
+            )));
         }
         Some(Subcommand::Login(mut login_cli)) => {
             reject_remote_mode_for_subcommand(
@@ -1548,7 +1673,7 @@ async fn cli_main(
                         let access_token = read_access_token_from_stdin();
                         run_login_with_access_token(login_cli.config_overrides, access_token).await;
                     } else {
-                        run_login_with_chatgpt(login_cli.config_overrides).await;
+                        run_login_with_browser(login_cli.config_overrides).await;
                     }
                 }
             }
@@ -1607,7 +1732,10 @@ async fn cli_main(
             );
             dex_cloud_tasks::run_main(cloud_cli, arg0_paths.dex_linux_sandbox_exe.clone()).await?;
         }
-        Some(Subcommand::Sandbox(mut sandbox_cli)) => {
+        Some(Subcommand::Sandbox(SandboxCommand {
+            host: mut sandbox_cli,
+            subcommand,
+        })) => {
             let config_profile = sandbox_cli
                 .config_profile
                 .as_ref()
@@ -1628,13 +1756,17 @@ async fn cli_main(
                     .parse_overrides()
                     .map_err(anyhow::Error::msg)?;
                 sandbox_setup::run(setup_cli, config_profile.cloned(), cli_overrides).await?;
-                return Ok(());
+                return Ok(None);
             }
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
                 root_remote_auth_token_env.as_deref(),
                 "sandbox",
             )?;
+            if let Some(SandboxSubcommand::Uninstall(command)) = subcommand {
+                command.run()?;
+                return Ok(None);
+            }
             let loader_overrides = loader_overrides_for_profile(config_profile)?;
             #[cfg(target_os = "macos")]
             dex_cli::run_command_under_seatbelt(
@@ -1750,15 +1882,14 @@ async fn cli_main(
             let socket_path = cmd.socket_path;
             dex_stdio_to_uds::run(socket_path.as_path()).await?;
         }
-        Some(Subcommand::ExecServer(cmd)) => {
+        Some(Subcommand::ExecServer(mut cmd)) => {
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
                 root_remote_auth_token_env.as_deref(),
                 "exec-server",
             )?;
-            let strict_config = cmd.strict_config || root_strict_config;
-            run_exec_server_command(cmd, &arg0_paths, &root_config_overrides, strict_config)
-                .await?;
+            cmd.strict_config |= root_strict_config;
+            cmd.run(&arg0_paths, &root_config_overrides).await?;
         }
         Some(Subcommand::Features(FeaturesCli { sub })) => match sub {
             FeaturesSubcommand::List => {
@@ -1813,7 +1944,7 @@ async fn cli_main(
         },
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn profile_v2_for_subcommand<'a>(
@@ -1835,275 +1966,15 @@ fn profile_v2_for_subcommand<'a>(
         | Subcommand::Unarchive(_)
         | Subcommand::Fork(_)
         | Subcommand::Mcp(_)
+        | Subcommand::MigrateNfsDb(_)
         | Subcommand::Sandbox(_)
         | Subcommand::Debug(DebugCommand {
             subcommand: DebugSubcommand::PromptInput(_),
         }) => Ok(Some(profile_v2)),
         _ => anyhow::bail!(
-            "--profile only applies to runtime commands and `dex mcp`: `dex`, `dex exec`, `dex review`, `dex resume`, `dex queue`, `dex archive`, `dex delete`, `dex unarchive`, `dex fork`, `dex mcp`, `dex sandbox`, and `dex debug prompt-input`."
+            "--profile only applies to runtime commands, `dex mcp`, and `dex migrate-nfs-db`: `dex`, `dex exec`, `dex review`, `dex resume`, `dex queue`, `dex archive`, `dex delete`, `dex unarchive`, `dex fork`, `dex mcp`, `dex migrate-nfs-db`, `dex sandbox`, and `dex debug prompt-input`."
         ),
     }
-}
-
-async fn run_exec_server_command(
-    cmd: ExecServerCommand,
-    arg0_paths: &Arg0DispatchPaths,
-    root_config_overrides: &CliConfigOverrides,
-    strict_config: bool,
-) -> anyhow::Result<()> {
-    let dex_self_exe = arg0_paths
-        .dex_self_exe
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("Dex executable path is not configured"))?;
-    let runtime_paths = dex_exec_server::ExecServerRuntimePaths::new(
-        dex_self_exe,
-        arg0_paths.dex_linux_sandbox_exe.clone(),
-    )?;
-    if let Some(base_url) = cmd.remote {
-        let environment_id = cmd
-            .environment_id
-            .ok_or_else(|| anyhow::anyhow!("--environment-id is required when --remote is set"))?;
-        let config = load_exec_server_config(
-            root_config_overrides,
-            strict_config,
-            /*enable_workload_identity*/ true,
-        )
-        .await?;
-        let (_otel, telemetry) = exec_server_telemetry::init(Some(&config));
-        let auth_provider =
-            load_exec_server_remote_auth_provider(&config, &base_url, cmd.use_agent_identity_auth)
-                .await?;
-        let mut remote_config = dex_exec_server::RemoteEnvironmentConfig::new(
-            base_url,
-            environment_id,
-            auth_provider,
-            config.http_client_factory(),
-        )?;
-        if let Some(name) = cmd.name {
-            remote_config.name = name;
-        }
-        remote_config.request_dispatch_mode = cmd.request_dispatch_mode;
-        let remote_config = remote_config.with_telemetry(telemetry);
-        let parent_lifetime = if cmd.exit_on_stdin_close {
-            exec_server_telemetry::ParentLifetime::StdinPipe
-        } else {
-            exec_server_telemetry::ParentLifetime::Independent
-        };
-        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
-        exec_server_telemetry::run_until_shutdown(
-            async move {
-                let shutdown = async move {
-                    let _ = shutdown_receiver.await;
-                };
-                match cmd.command {
-                    Some(ExecServerSubcommand::Forward { connect }) => {
-                        dex_exec_server::run_remote_environment_forward_until_shutdown(
-                            remote_config,
-                            connect,
-                            shutdown,
-                        )
-                        .await
-                    }
-                    None => {
-                        dex_exec_server::run_remote_environment_until_shutdown(
-                            remote_config,
-                            runtime_paths,
-                            shutdown,
-                        )
-                        .await
-                    }
-                }
-            },
-            parent_lifetime,
-            exec_server_telemetry::ShutdownBehavior::Graceful(shutdown_sender),
-        )
-        .await?;
-        Ok(())
-    } else {
-        let config_result = load_exec_server_config(
-            root_config_overrides,
-            strict_config,
-            /*enable_workload_identity*/ false,
-        )
-        .await;
-        let config = if strict_config {
-            Some(config_result?)
-        } else {
-            config_result.ok()
-        };
-        let (_otel, telemetry) = exec_server_telemetry::init(config.as_ref());
-        let http_client_factory = config
-            .as_ref()
-            .map(dex_core::config::Config::http_client_factory)
-            .unwrap_or_else(|| {
-                dex_http_client::HttpClientFactory::new(
-                    dex_http_client::OutboundProxyPolicy::ReqwestDefault,
-                )
-            });
-        let listen_url = cmd
-            .listen
-            .unwrap_or_else(|| dex_exec_server::DEFAULT_LISTEN_URL.to_string());
-        exec_server_telemetry::run_until_shutdown(
-            async move {
-                dex_exec_server::run_main_with_telemetry(
-                    &listen_url,
-                    runtime_paths,
-                    telemetry,
-                    http_client_factory,
-                    cmd.request_dispatch_mode,
-                )
-                .await
-            },
-            exec_server_telemetry::ParentLifetime::Independent,
-            exec_server_telemetry::ShutdownBehavior::Immediate,
-        )
-        .await
-        .map_err(anyhow::Error::from_boxed)
-    }
-}
-
-async fn load_exec_server_remote_auth_provider(
-    config: &dex_core::config::Config,
-    base_url: &str,
-    use_agent_identity_auth: bool,
-) -> anyhow::Result<dex_api::SharedAuthProvider> {
-    if use_agent_identity_auth {
-        read_dex_access_token_from_env().ok_or_else(|| {
-            anyhow::anyhow!("DEX_ACCESS_TOKEN is required when --use-agent-identity-auth is set")
-        })?;
-        let auth = AuthManager::shared_from_config(config, /*enable_dex_api_key_env*/ false)
-            .await?
-            .auth()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("Agent Identity authentication is unavailable"))?;
-        if !matches!(auth, DexAuth::AgentIdentity(_)) {
-            anyhow::bail!(
-                "DEX_ACCESS_TOKEN did not provide permitted Agent Identity authentication"
-            );
-        }
-        return Ok(dex_model_provider::auth_provider_from_auth(&auth));
-    }
-
-    let (auth_manager, auth) = load_exec_server_remote_auth(
-        config,
-        "remote exec-server registration requires ChatGPT authentication or API key authentication; run `dex login` or set DEX_API_KEY",
-    )
-    .await?;
-
-    if !is_supported_exec_server_remote_auth(&auth) {
-        anyhow::bail!(
-            "remote exec-server registration requires ChatGPT authentication or API key authentication; Agent Identity auth requires --use-agent-identity-auth"
-        );
-    }
-
-    if auth.is_api_key_auth() {
-        validate_api_key_remote_host(base_url)?;
-    }
-
-    if auth_manager.is_workload_identity_selected() {
-        Ok(dex_model_provider::auth_provider_from_auth_manager(
-            auth_manager,
-            &auth,
-        ))
-    } else {
-        Ok(dex_model_provider::auth_provider_from_auth(&auth))
-    }
-}
-
-fn is_supported_exec_server_remote_auth(auth: &DexAuth) -> bool {
-    auth.is_chatgpt_auth() || auth.is_api_key_auth()
-}
-
-fn validate_api_key_remote_host(base_url: &str) -> anyhow::Result<()> {
-    let url = url::Url::parse(base_url)
-        .map_err(|err| anyhow::anyhow!("invalid remote exec-server registration URL: {err}"))?;
-    let host = url.host().ok_or_else(|| {
-        anyhow::anyhow!("remote exec-server registration URL must include a host")
-    })?;
-
-    let is_loopback = match &host {
-        url::Host::Domain(host) => host.eq_ignore_ascii_case("localhost"),
-        url::Host::Ipv4(ip) => ip.is_loopback(),
-        url::Host::Ipv6(ip) => ip.is_loopback(),
-    };
-    let is_openai_host = match &host {
-        url::Host::Domain(host) => ["openai.com", "openai.org"].into_iter().any(|domain| {
-            host.eq_ignore_ascii_case(domain)
-                || host.to_ascii_lowercase().ends_with(&format!(".{domain}"))
-        }),
-        _ => false,
-    };
-    let is_allowed = match url.scheme() {
-        "https" => is_loopback || is_openai_host,
-        "http" => is_loopback,
-        _ => false,
-    };
-
-    if !is_allowed {
-        anyhow::bail!(
-            "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains or loopback hosts"
-        );
-    }
-
-    Ok(())
-}
-
-async fn load_exec_server_config(
-    root_config_overrides: &CliConfigOverrides,
-    strict_config: bool,
-    enable_workload_identity: bool,
-) -> anyhow::Result<dex_core::config::Config> {
-    let cli_kv_overrides = root_config_overrides
-        .parse_overrides()
-        .map_err(anyhow::Error::msg)?;
-    let bootstrap_cli_overrides = cli_kv_overrides.clone();
-    let mut builder = ConfigBuilder::default()
-        .cli_overrides(cli_kv_overrides)
-        .strict_config(strict_config);
-    if enable_workload_identity && is_workload_identity_selected() {
-        let dex_home = find_dex_home()?;
-        let bootstrap_cwd = AbsolutePathBuf::current_dir()?;
-        let bootstrap_config = load_config_toml_with_layer_stack(
-            &dex_home,
-            Some(&bootstrap_cwd),
-            bootstrap_cli_overrides,
-            ConfigLoadOptions {
-                loader_overrides: LoaderOverrides::default(),
-                strict_config,
-                cloud_config_bundle: Default::default(),
-            },
-        )
-        .await?;
-        let bootstrap_auth_config = bootstrap_auth_config(&dex_home, &bootstrap_config)?;
-        let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
-            bootstrap_auth_config,
-            /*enable_dex_api_key_env*/ false,
-        )
-        .await?;
-        builder = builder.cloud_config_bundle(cloud_config_bundle);
-    }
-    Ok(builder.build().await?)
-}
-
-async fn load_exec_server_remote_auth(
-    config: &dex_core::config::Config,
-    missing_auth_error: &'static str,
-) -> anyhow::Result<(Arc<AuthManager>, dex_login::DexAuth)> {
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_dex_api_key_env*/ true).await?;
-
-    let auth = match auth_manager.auth().await {
-        Some(auth) => auth,
-        None => {
-            auth_manager.reload().await;
-            auth_manager
-                .auth()
-                .await
-                .ok_or_else(|| anyhow::anyhow!(missing_auth_error))?
-        }
-    };
-
-    Ok((auth_manager, auth))
 }
 
 async fn enable_feature_in_config(feature: &str) -> anyhow::Result<()> {
@@ -2221,7 +2092,6 @@ async fn run_debug_prompt_input_command(
         cwd: shared.cwd,
         dex_self_exe: arg0_paths.dex_self_exe,
         dex_linux_sandbox_exe: arg0_paths.dex_linux_sandbox_exe,
-        main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe,
         show_raw_agent_reasoning: shared.oss.then_some(true),
         ephemeral: Some(true),
         bypass_hook_trust: shared.bypass_hook_trust.then_some(true),
@@ -2254,6 +2124,13 @@ async fn run_debug_prompt_input_command(
     let auth_manager =
         AuthManager::shared_from_config(&config, /*enable_dex_api_key_env*/ false).await?;
     let mut extensions = dex_extension_api::ExtensionRegistryBuilder::new();
+    // Debug prompt construction bypasses app-server and needs its own extension registry.
+    if config
+        .features
+        .enabled(dex_features::Feature::MultiEnvCopyFile)
+    {
+        dex_multi_env_copy_file::install(&mut extensions);
+    }
     dex_git_attribution::install(
         &mut extensions,
         auth_manager,
@@ -2263,9 +2140,15 @@ async fn run_debug_prompt_input_command(
     dex_skills_extension::install(&mut extensions, |config: &Config| {
         dex_skills_extension::SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
+            catalog_deltas_enabled: config
+                .features
+                .enabled(dex_features::Feature::SkillCatalogDeltas),
+            omit_descriptions: config
+                .features
+                .enabled(dex_features::Feature::OmitSkillDescriptions),
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: config.bundled_skills_enabled(),
-            orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+            cloud_skill_enabled: config.cloud_skill_enabled,
             shadow_selection_enabled: config.features.enabled(dex_features::Feature::SkillSearch),
         }
     });
@@ -2371,6 +2254,49 @@ fn reject_remote_mode_for_subcommand(
     Ok(())
 }
 
+fn reject_unsupported_worktree_for_subcommand(
+    root_worktree: bool,
+    subcommand: &Option<Subcommand>,
+) -> anyhow::Result<()> {
+    let subcommand_worktree = match subcommand {
+        Some(Subcommand::Exec(command)) => command.shared.worktree,
+        Some(Subcommand::Resume(command)) => command.config_overrides.0.shared.worktree,
+        Some(Subcommand::Fork(command)) => command.config_overrides.0.shared.worktree,
+        Some(Subcommand::Archive(command)) | Some(Subcommand::Unarchive(command)) => {
+            command.config_overrides.shared.worktree
+        }
+        Some(Subcommand::Delete(command)) => command.session.config_overrides.shared.worktree,
+        Some(Subcommand::Queue(command)) => command.config_overrides.shared.worktree,
+        _ => false,
+    };
+
+    if !root_worktree && !subcommand_worktree {
+        return Ok(());
+    }
+
+    match subcommand {
+        None => Ok(()),
+        Some(Subcommand::Fork(command)) if command.session_id.is_some() && !command.last => Ok(()),
+        Some(Subcommand::Fork(_)) => {
+            anyhow::bail!("`dex fork --worktree` requires an explicit session ID")
+        }
+        Some(Subcommand::Exec(command)) => match &command.command {
+            None | Some(ExecCommand::Fork(_)) => Ok(()),
+            Some(ExecCommand::Resume(_)) => anyhow::bail!(
+                "`--worktree` cannot resume an existing session; use `dex exec fork --worktree`"
+            ),
+            Some(ExecCommand::Review(_)) => {
+                anyhow::bail!("`--worktree` is not supported for code review")
+            }
+        },
+        _ => {
+            anyhow::bail!(
+                "`--worktree` supports new interactive sessions, `dex fork`, `dex exec`, and `dex exec fork`"
+            )
+        }
+    }
+}
+
 fn reject_root_strict_config_for_subcommand(
     strict_config: bool,
     subcommand: &Option<Subcommand>,
@@ -2407,7 +2333,6 @@ fn unsupported_subcommand_name_for_strict_config(
         | Some(Subcommand::Agents(_))
         | Some(Subcommand::Exec(_))
         | Some(Subcommand::Review(_))
-        | Some(Subcommand::McpServer(_))
         | Some(Subcommand::ExecServer(_))
         | Some(Subcommand::Resume(_))
         | Some(Subcommand::Queue(_))
@@ -2424,6 +2349,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::Mcp(_)) => Some("mcp"),
         Some(Subcommand::Plugin(_)) => Some("plugin"),
         Some(Subcommand::MigrateRollouts(_)) => Some("migrate-rollouts"),
+        Some(Subcommand::MigrateNfsDb(_)) => Some("migrate-nfs-db"),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Some(Subcommand::App(_)) => Some("app"),
         Some(Subcommand::Login(_)) => Some("login"),
@@ -2438,6 +2364,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::ResponsesApiProxy(_)) => Some("responses-api-proxy"),
         Some(Subcommand::StdioToUds(_)) => Some("stdio-to-uds"),
         Some(Subcommand::Features(_)) => Some("features"),
+        Some(Subcommand::TcpTunnel(_)) => Some("tcp-tunnel"),
     }
 }
 
@@ -2480,6 +2407,7 @@ fn app_server_subcommand_name(subcommand: Option<&AppServerSubcommand>) -> &'sta
             AppServerDaemonSubcommand::Bootstrap(_) => "app-server daemon bootstrap",
             AppServerDaemonSubcommand::Start => "app-server daemon start",
             AppServerDaemonSubcommand::Restart => "app-server daemon restart",
+            AppServerDaemonSubcommand::Update { .. } => "app-server daemon update",
             AppServerDaemonSubcommand::EnableRemoteControl => {
                 "app-server daemon enable-remote-control"
             }
@@ -2488,7 +2416,7 @@ fn app_server_subcommand_name(subcommand: Option<&AppServerSubcommand>) -> &'sta
             }
             AppServerDaemonSubcommand::Stop => "app-server daemon stop",
             AppServerDaemonSubcommand::Version => "app-server daemon version",
-            AppServerDaemonSubcommand::PidUpdateLoop => "app-server daemon pid-update-loop",
+            AppServerDaemonSubcommand::PidUpdateLoop { .. } => "app-server daemon pid-update-loop",
         },
         Some(AppServerSubcommand::Proxy(_)) => "app-server proxy",
         Some(AppServerSubcommand::GenerateTs(_)) => "app-server generate-ts",
@@ -2507,16 +2435,10 @@ async fn print_app_server_daemon_output(command: AppServerLifecycleCommand) -> a
 
 fn updater_http_client_factory(
     config: anyhow::Result<dex_core::config::Config>,
-) -> dex_http_client::HttpClientFactory {
-    match config {
-        Ok(config) => config.http_client_factory(),
-        Err(error) => {
-            eprintln!("warning: failed to load updater network configuration: {error}");
-            dex_http_client::HttpClientFactory::new(
-                dex_http_client::OutboundProxyPolicy::ReqwestDefault,
-            )
-        }
-    }
+) -> anyhow::Result<dex_http_client::HttpClientFactory> {
+    let mut config = config?;
+    dex_app_server::in_process::EmbeddedNetworkPolicy::default().activate(&mut config);
+    Ok(config.http_client_factory())
 }
 
 async fn print_app_server_remote_control_output(
@@ -2553,6 +2475,11 @@ async fn run_interactive_tui(
     remote_auth_token_env: Option<String>,
     arg0_paths: Arg0DispatchPaths,
 ) -> std::io::Result<AppExitInfo> {
+    if interactive.no_daemon && remote.is_some() {
+        return Ok(AppExitInfo::fatal(
+            "--no-daemon cannot be used with --remote.",
+        ));
+    }
     if let Some(prompt) = interactive.prompt.take() {
         // Normalize CRLF/CR to LF so CLI-provided text can't leak `\r` into TUI state.
         interactive.prompt = Some(prompt.replace("\r\n", "\n").replace('\r', "\n"));
@@ -2576,29 +2503,21 @@ async fn run_interactive_tui(
         }
     }
 
-    #[cfg(unix)]
-    if interactive.agents_overview && remote.is_none() {
-        if !std::io::stdin().is_terminal() {
-            return Ok(AppExitInfo::fatal("stdin is not a terminal"));
-        }
-        if !std::io::stdout().is_terminal() {
-            return Ok(AppExitInfo::fatal("stdout is not a terminal"));
-        }
-        cloud_config::load_config(&interactive.config_overrides, LoaderOverrides::default())
-            .await
-            .map_err(std::io::Error::other)?;
-        dex_app_server_daemon::run(AppServerLifecycleCommand::Start)
-            .await
-            .map_err(std::io::Error::other)?;
-    }
-
-    let remote_endpoint = match resolve_remote_endpoint(remote, remote_auth_token_env) {
+    let remote_endpoint = match resolve_remote_endpoint(remote, remote_auth_token_env.clone()) {
         Ok(remote_endpoint) => remote_endpoint,
         Err(err) if is_remote_auth_usage_error(&err) => {
             return Ok(AppExitInfo::fatal(err.to_string()));
         }
         Err(err) => return Err(err),
     };
+    if interactive.agents_overview && remote_endpoint.is_none() {
+        if !std::io::stdin().is_terminal() {
+            return Ok(AppExitInfo::fatal("stdin is not a terminal"));
+        }
+        if !std::io::stdout().is_terminal() {
+            return Ok(AppExitInfo::fatal("stdout is not a terminal"));
+        }
+    }
     let start_tui = || {
         dex_tui::run_main(
             interactive.clone(),
@@ -2607,11 +2526,31 @@ async fn run_interactive_tui(
             remote_endpoint.clone(),
         )
     };
+    run_tui_with_recovery(start_tui, remote_auth_token_env.as_deref()).await
+}
+
+async fn run_tui_with_recovery<F, Fut>(
+    mut start_tui: F,
+    remote_auth_token_env: Option<&str>,
+) -> std::io::Result<AppExitInfo>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<AppExitInfo>>,
+{
     let mut attempted_backups = HashSet::new();
     loop {
         // Keep the large TUI future out of the CLI dispatcher's stack frame.
         let err = match Box::pin(start_tui()).await {
-            Ok(exit_info) => return Ok(exit_info),
+            Ok(mut exit_info) => {
+                if let Some(disconnect) = &mut exit_info.disconnect_info
+                    && let Some(env_var) = remote_auth_token_env
+                {
+                    disconnect
+                        .command
+                        .extend(["--remote-auth-token-env".to_string(), env_var.to_string()]);
+                }
+                return Ok(exit_info);
+            }
             Err(err) => err,
         };
         let Some(startup_error) = local_state_db::startup_error(&err) else {
@@ -2792,6 +2731,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         approval_policy,
         web_search,
         no_alt_screen,
+        no_daemon,
         prompt,
         mut config_overrides,
         ..
@@ -2812,6 +2752,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         interactive.web_search = true;
     }
     interactive.no_alt_screen |= no_alt_screen;
+    interactive.no_daemon |= no_daemon;
     if strict_config {
         interactive.strict_config = true;
     }
@@ -2853,6 +2794,52 @@ mod tests {
         assert!(size < 64 * 1024, "interactive TUI future is {size} bytes");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_command_resolution_ignores_relative_path_entries() {
+        let cwd = std::env::current_dir().expect("current directory");
+        let decoy_dir = tempfile::tempdir_in(&cwd).expect("relative decoy directory");
+        let trusted_dir = tempfile::tempdir().expect("trusted PATH directory");
+        let relative_decoy_dir = decoy_dir
+            .path()
+            .strip_prefix(&cwd)
+            .expect("decoy directory should be relative to cwd");
+
+        for command in ["npm.cmd", "pnpm.cmd", "bun.exe"] {
+            std::fs::write(decoy_dir.path().join(command), "decoy")
+                .expect("write cwd-relative decoy");
+            std::fs::write(trusted_dir.path().join(command), "trusted")
+                .expect("write trusted PATH command");
+            let path_env = std::env::join_paths([relative_decoy_dir, trusted_dir.path()])
+                .expect("join synthetic PATH");
+
+            let resolved = resolve_windows_update_command_from_path(command, &path_env)
+                .expect("resolve update command");
+
+            assert_eq!(resolved, trusted_dir.path().join(command));
+        }
+
+        let cwd_decoy = tempfile::Builder::new()
+            .suffix(".cmd")
+            .tempfile_in(&cwd)
+            .expect("cwd-local decoy");
+        let command = cwd_decoy
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("decoy filename");
+        let relative_only_path_env = std::env::join_paths(["."]).expect("join relative-only PATH");
+        let err = resolve_windows_update_command_from_path(command, &relative_only_path_env)
+            .expect_err("relative-only PATH should not resolve a cwd command");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Could not find an absolute update command `{command}` on PATH. Please update manually: https://developers.openai.com/dex/cli/"
+            )
+        );
+    }
+
     #[tokio::test]
     async fn updater_http_client_factory_honors_respect_system_proxy() {
         let dex_home = tempfile::tempdir().expect("temporary Dex home");
@@ -2867,74 +2854,66 @@ mod tests {
             .expect("config should load");
 
         assert_eq!(
-            updater_http_client_factory(Ok(config)).outbound_proxy_policy(),
+            updater_http_client_factory(Ok(config))
+                .expect("updater configuration")
+                .outbound_proxy_policy(),
             dex_http_client::OutboundProxyPolicy::RespectSystemProxy
         );
     }
 
     #[test]
-    fn updater_http_client_factory_falls_back_when_config_load_fails() {
+    fn updater_http_client_factory_propagates_config_errors() {
         assert_eq!(
             updater_http_client_factory(Err(anyhow::anyhow!("invalid config")))
-                .outbound_proxy_policy(),
-            dex_http_client::OutboundProxyPolicy::ReqwestDefault
+                .expect_err("invalid configuration must prevent updates")
+                .to_string(),
+            "invalid config"
         );
     }
 
-    #[test]
-    fn exec_server_remote_auth_accepts_api_key_auth() {
-        let auth = DexAuth::from_api_key("sk-test");
-
-        assert!(is_supported_exec_server_remote_auth(&auth));
-    }
-
-    #[test]
-    fn exec_server_remote_api_key_auth_accepts_https_openai_domains() {
-        for base_url in [
-            "https://openai.com/api",
-            "https://service.openai.com/api",
-            "https://openai.org/api",
-            "https://service.openai.org/api",
-        ] {
-            assert!(validate_api_key_remote_host(base_url).is_ok());
-        }
-    }
-
-    #[test]
-    fn exec_server_remote_api_key_auth_accepts_http_loopback() {
-        for base_url in [
-            "http://localhost:8098/api",
-            "http://127.0.0.1:8098/api",
-            "http://[::1]:8098/api",
-        ] {
-            assert!(validate_api_key_remote_host(base_url).is_ok());
-        }
-    }
-
-    #[test]
-    fn exec_server_remote_api_key_auth_rejects_http_openai_domain() {
-        for base_url in [
-            "http://service.openai.com/api",
-            "http://service.openai.org/api",
-        ] {
-            let error = validate_api_key_remote_host(base_url)
-                .expect_err("reject plaintext OpenAI destination");
-
+    #[tokio::test]
+    async fn updater_http_client_factory_enforces_application_requirements() {
+        let home = tempfile::tempdir().expect("temporary Dex home");
+        let requirements = home.path().join("requirements.toml");
+        std::fs::write(
+            &requirements,
+            r#"
+[application.network]
+enabled = true
+[application.network.domains]
+"bedrock-mantle.us-gov-west-1.api.aws" = "allow"
+"chatgpt.com" = "deny"
+"releases.openai.com" = "deny"
+"#,
+        )
+        .expect("write managed requirements");
+        let mut overrides = LoaderOverrides::without_managed_config_for_tests();
+        overrides.system_requirements_path = Some(requirements);
+        let config = ConfigBuilder::default()
+            .dex_home(home.path().to_path_buf())
+            .loader_overrides(overrides)
+            .build()
+            .await
+            .expect("load managed configuration");
+        let factory = updater_http_client_factory(Ok(config)).expect("updater configuration");
+        for host in ["chatgpt.com", "releases.openai.com", "unlisted.example"] {
             assert_eq!(
-                error.to_string(),
-                "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains or loopback hosts"
+                factory
+                    .network_policy()
+                    .acquire(&format!("https://{host}/").parse().expect("URL"))
+                    .err(),
+                Some(dex_http_client::NetworkPolicyDenied::Destination)
             );
         }
-    }
-
-    #[test]
-    fn exec_server_remote_api_key_auth_rejects_suffix_spoof() {
-        let error = validate_api_key_remote_host("https://service.openai.org.evil.example/api")
-            .expect_err("reject suffix spoof");
-
-        assert_eq!(
-            error.to_string(),
-            "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains or loopback hosts"
+        assert!(
+            factory
+                .network_policy()
+                .acquire(
+                    &"https://bedrock-mantle.us-gov-west-1.api.aws/"
+                        .parse()
+                        .expect("URL")
+                )
+                .is_ok()
         );
     }
 
@@ -3118,6 +3097,75 @@ mod tests {
         assert!(
             MultitoolCli::try_parse_from(["dex", "--profile", "nested/work", "resume"]).is_err()
         );
+    }
+
+    #[test]
+    fn worktree_flag_supports_interactive_exec_and_explicit_fork_positions() {
+        let arguments = [
+            vec!["dex", "--worktree"],
+            vec!["dex", "--worktree", "hello"],
+            vec!["dex", "--worktree", "exec", "hello"],
+            vec!["dex", "exec", "--worktree", "hello"],
+            vec![
+                "dex",
+                "fork",
+                "--worktree",
+                "019f1234-5678-7000-8000-000000000001",
+            ],
+            vec![
+                "dex",
+                "exec",
+                "fork",
+                "--worktree",
+                "019f1234-5678-7000-8000-000000000001",
+            ],
+        ];
+
+        for arguments in arguments {
+            let cli = MultitoolCli::try_parse_from(&arguments).expect("parse worktree command");
+            assert!(
+                reject_unsupported_worktree_for_subcommand(
+                    cli.interactive.shared.worktree,
+                    &cli.subcommand,
+                )
+                .is_ok(),
+                "supported worktree command should be accepted: {arguments:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_flag_rejects_unsupported_session_and_management_commands() {
+        let arguments = [
+            vec!["dex", "--worktree", "login"],
+            vec!["dex", "fork", "--worktree"],
+            vec!["dex", "fork", "--worktree", "--last"],
+            vec!["dex", "exec", "resume", "--worktree", "session"],
+            vec!["dex", "exec", "review", "--worktree"],
+            vec!["dex", "resume", "--worktree", "session"],
+            vec!["dex", "archive", "session", "--worktree"],
+            vec![
+                "dex",
+                "queue",
+                "--thread",
+                "session",
+                "--message",
+                "hi",
+                "--worktree",
+            ],
+        ];
+
+        let mut errors = Vec::new();
+        for arguments in arguments {
+            let cli = MultitoolCli::try_parse_from(&arguments).expect("parse shared worktree flag");
+            let error = reject_unsupported_worktree_for_subcommand(
+                cli.interactive.shared.worktree,
+                &cli.subcommand,
+            )
+            .expect_err("unsupported worktree command");
+            errors.push(format!("{}: {error}", arguments.join(" ")));
+        }
+        insta::assert_snapshot!("unsupported_worktree_commands", errors.join("\n"));
     }
 
     #[test]
@@ -3398,6 +3446,53 @@ mod tests {
     }
 
     #[test]
+    fn queue_help_lists_supported_options() {
+        let help = help_from_args(&["dex", "queue", "--help"]);
+        let (general, local) = help
+            .split_once("Local server options (without --remote):")
+            .unwrap();
+        assert!(general.contains("--message <TEXT>"));
+        assert!(!general.contains("--model"));
+        assert!(!general.contains("-c model="));
+        let local_flags = local
+            .lines()
+            .filter(|line| line.starts_with("  -") || line.starts_with("      --"))
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        insta::assert_snapshot!(local_flags.join("\n"), @"-C, --cd <DIR>");
+    }
+
+    #[test]
+    fn tcp_tunnel_is_hidden_and_accepts_its_control_input_contract() {
+        let root_help = help_from_args(&["dex", "--help"]);
+        assert!(!root_help.contains("tcp-tunnel"), "{root_help}");
+        let help = help_from_args(&["dex", "tcp-tunnel", "--help"]);
+        for option in [
+            "--target",
+            "--auth-token-stdin",
+            "--auth-token-updates-stdin",
+            "--connect-headers-stdin",
+        ] {
+            assert!(help.contains(option), "{help}");
+        }
+        let cli = MultitoolCli::try_parse_from([
+            "dex",
+            "tcp-tunnel",
+            "--proxy-url",
+            "https://proxy.example.org",
+            "--proxy-origins-file",
+            "/tmp/approved-origins",
+            "--target",
+            "[::1]:22",
+            "--auth-token-stdin",
+            "--auth-token-updates-stdin",
+            "--connect-headers-stdin",
+        ])
+        .expect("generic tunnel should parse");
+        assert!(matches!(cli.subcommand, Some(Subcommand::TcpTunnel(_))));
+    }
+
+    #[test]
     fn plugin_marketplace_help_uses_plugin_namespace() {
         let help = help_from_args(&["dex", "plugin", "marketplace", "--help"]);
         assert!(
@@ -3525,6 +3620,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sandbox_uninstall_respects_command_separator() {
+        let cli = MultitoolCli::try_parse_from(["dex", "sandbox", "uninstall"]).expect("parse");
+        assert!(matches!(
+            cli.subcommand,
+            Some(Subcommand::Sandbox(SandboxCommand {
+                subcommand: Some(SandboxSubcommand::Uninstall(_)),
+                ..
+            }))
+        ));
+
+        for args in [
+            vec!["dex", "sandbox", "--", "uninstall", "--help"],
+            vec![
+                "dex",
+                "sandbox",
+                "--profile",
+                "uninstall",
+                "--",
+                "uninstall",
+                "--help",
+            ],
+        ] {
+            let cli = MultitoolCli::try_parse_from(args).expect("parse forwarded command");
+            let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+                panic!("expected sandbox command");
+            };
+            assert!(command.subcommand.is_none());
+            assert_eq!(command.host.command, vec!["uninstall", "--help"]);
+        }
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
     fn sandbox_parses_permission_profile() {
@@ -3538,7 +3665,7 @@ mod tests {
         ])
         .expect("parse");
 
-        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+        let Some(Subcommand::Sandbox(SandboxCommand { host: command, .. })) = cli.subcommand else {
             panic!("expected sandbox command");
         };
 
@@ -3559,7 +3686,7 @@ mod tests {
         ])
         .expect("parse");
 
-        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+        let Some(Subcommand::Sandbox(SandboxCommand { host: command, .. })) = cli.subcommand else {
             panic!("expected sandbox command");
         };
 
@@ -3582,7 +3709,7 @@ mod tests {
             MultitoolCli::try_parse_from(["dex", "sandbox", "-P", ":workspace", "--", "echo"])
                 .expect("parse");
 
-        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+        let Some(Subcommand::Sandbox(SandboxCommand { host: command, .. })) = cli.subcommand else {
             panic!("expected sandbox command");
         };
 
@@ -3597,7 +3724,7 @@ mod tests {
             MultitoolCli::try_parse_from(["dex", "sandbox", "--profile", "work", "--", "echo"])
                 .expect("parse");
 
-        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+        let Some(Subcommand::Sandbox(SandboxCommand { host: command, .. })) = cli.subcommand else {
             panic!("expected sandbox command");
         };
 
@@ -3647,7 +3774,11 @@ mod tests {
         AppExitInfo {
             token_usage,
             thread_id,
-            resume_hint: dex_utils_cli::resume_hint(thread_name, thread_id),
+            resume_hint: thread_id.map(|thread_id| dex_tui::ResumableThread {
+                thread_id,
+                thread_name: thread_name.map(str::to_string),
+            }),
+            disconnect_info: None,
             update_action: None,
             exit_reason: ExitReason::UserRequested,
         }
@@ -3659,11 +3790,58 @@ mod tests {
             token_usage: TokenUsage::default(),
             thread_id: None,
             resume_hint: None,
+            disconnect_info: None,
             update_action: None,
             exit_reason: ExitReason::UserRequested,
         };
-        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
         assert!(lines.is_empty());
+    }
+
+    #[tokio::test]
+    async fn format_exit_messages_preserves_auth_env_through_tui_runner() {
+        let exit_info = run_tui_with_recovery(
+            || async {
+                let mut exit_info = sample_exit_info(
+                    Some("123e4567-e89b-12d3-a456-426614174000"),
+                    /*thread_name*/ None,
+                );
+                exit_info.disconnect_info = Some(dex_tui::DisconnectInfo {
+                    command: vec![
+                        "dex".to_string(),
+                        "--remote".to_string(),
+                        "wss://example.com:443/".to_string(),
+                    ],
+                    stop_hint: "press ctrl + x".to_string(),
+                });
+                Ok(exit_info)
+            },
+            Some("DEX_REMOTE_TOKEN"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            exit_info.format_exit_messages(/*color_enabled*/ false),
+            vec![
+                "Disconnected from this task. Any running work continues.",
+                "To reconnect, run:",
+                "  dex --remote wss://example.com:443/ --remote-auth-token-env DEX_REMOTE_TOKEN resume 123e4567-e89b-12d3-a456-426614174000",
+                "Stop the current turn: run dex --remote wss://example.com:443/ --remote-auth-token-env DEX_REMOTE_TOKEN agents, select this task, and press ctrl + x.",
+                "Token usage so far: total=2 input=0 output=2",
+            ]
+        );
+    }
+
+    #[test]
+    fn format_exit_messages_includes_session_id_without_resume_hint() {
+        let mut exit_info = sample_exit_info(
+            Some("123e4567-e89b-12d3-a456-426614174000"),
+            /*thread_name*/ None,
+        );
+        exit_info.token_usage = TokenUsage::default();
+        exit_info.resume_hint = None;
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
+        insta::assert_snapshot!(lines.join("\n"), @"Session ID: 123e4567-e89b-12d3-a456-426614174000");
     }
 
     #[test]
@@ -3672,10 +3850,11 @@ mod tests {
             token_usage: TokenUsage::default(),
             thread_id: Some(ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap()),
             resume_hint: None,
+            disconnect_info: None,
             update_action: None,
             exit_reason: ExitReason::Fatal("boom".to_string()),
         };
-        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
         assert_eq!(
             lines,
             vec!["Session ID: 123e4567-e89b-12d3-a456-426614174000".to_string()]
@@ -3689,32 +3868,31 @@ mod tests {
             /*thread_name*/ None,
         );
         exit_info.exit_reason = ExitReason::Fatal("boom".to_string());
-        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
         assert_eq!(
             lines,
             vec![
                 "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run dex resume 123e4567-e89b-12d3-a456-426614174000"
-                    .to_string(),
+                "To continue this session, run:".to_string(),
+                "  dex resume 123e4567-e89b-12d3-a456-426614174000".to_string(),
             ]
         );
     }
 
     #[test]
     fn format_exit_messages_includes_resume_hint_without_color() {
-        let exit_info = sample_exit_info(
-            Some("123e4567-e89b-12d3-a456-426614174000"),
-            /*thread_name*/ None,
-        );
-        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
-        assert_eq!(
-            lines,
-            vec![
-                "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run dex resume 123e4567-e89b-12d3-a456-426614174000"
-                    .to_string(),
-            ]
-        );
+        insta::allow_duplicates! {
+            for thread_name in [None, Some("")] {
+                let exit_info =
+                    sample_exit_info(Some("123e4567-e89b-12d3-a456-426614174000"), thread_name);
+                let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
+                insta::assert_snapshot!(lines.join("\n"), @"
+                Token usage: total=2 input=0 output=2
+                To continue this session, run:
+                  dex resume 123e4567-e89b-12d3-a456-426614174000
+                ");
+            }
+        }
     }
 
     #[test]
@@ -3723,9 +3901,15 @@ mod tests {
             Some("123e4567-e89b-12d3-a456-426614174000"),
             /*thread_name*/ None,
         );
-        let lines = format_exit_messages(exit_info, /*color_enabled*/ true);
-        assert_eq!(lines.len(), 2);
-        assert!(lines[1].contains("\u{1b}[36m"));
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ true);
+        assert_eq!(
+            lines,
+            vec![
+                "Token usage: total=2 input=0 output=2",
+                "To continue this session, run:",
+                "  \u{1b}[36mdex resume 123e4567-e89b-12d3-a456-426614174000\u{1b}[39m",
+            ]
+        );
     }
 
     #[test]
@@ -3734,12 +3918,29 @@ mod tests {
             Some("123e4567-e89b-12d3-a456-426614174000"),
             Some("my-thread"),
         );
-        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
+        insta::assert_snapshot!(lines.join("\n"), @"
+        Token usage: total=2 input=0 output=2
+        To continue this session, run:
+          dex resume 123e4567-e89b-12d3-a456-426614174000
+        Or run dex resume and select my-thread.
+        ");
+    }
+
+    #[test]
+    fn format_exit_messages_colors_commands_and_thread_name() {
+        let exit_info = sample_exit_info(
+            Some("123e4567-e89b-12d3-a456-426614174000"),
+            Some("my-thread"),
+        );
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ true);
         assert_eq!(
             lines,
             vec![
-                "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run dex resume, then select my-thread (123e4567-e89b-12d3-a456-426614174000)".to_string(),
+                "Token usage: total=2 input=0 output=2",
+                "To continue this session, run:",
+                "  \u{1b}[36mdex resume 123e4567-e89b-12d3-a456-426614174000\u{1b}[39m",
+                "Or run \u{1b}[36mdex resume\u{1b}[39m and select \u{1b}[36mmy-thread\u{1b}[39m.",
             ]
         );
     }
@@ -3753,6 +3954,21 @@ mod tests {
         assert!(interactive.resume_picker);
         assert!(!interactive.resume_last);
         assert_eq!(interactive.resume_session_id, None);
+    }
+
+    #[test]
+    fn resume_and_fork_preserve_no_daemon() {
+        for (command, finalize) in [
+            ("resume", finalize_resume_from_args as fn(&[&str]) -> TuiCli),
+            ("fork", finalize_fork_from_args as fn(&[&str]) -> TuiCli),
+        ] {
+            for args in [
+                ["dex", "--no-daemon", command, "--last"],
+                ["dex", command, "--last", "--no-daemon"],
+            ] {
+                assert!(finalize(&args).no_daemon);
+            }
+        }
     }
 
     #[test]
@@ -4024,15 +4240,6 @@ mod tests {
         assert!(cli.interactive.strict_config);
 
         let cli =
-            MultitoolCli::try_parse_from(["dex", "mcp-server", "--strict-config"]).expect("parse");
-        assert_matches!(
-            cli.subcommand,
-            Some(Subcommand::McpServer(McpServerCommand {
-                strict_config: true,
-            }))
-        );
-
-        let cli =
             MultitoolCli::try_parse_from(["dex", "review", "--strict-config", "--uncommitted"])
                 .expect("parse");
         assert_matches!(
@@ -4074,15 +4281,13 @@ mod tests {
         .expect("parse forward");
         assert!(cli.remote.remote.is_none());
         assert!(!cli.interactive.strict_config);
-        assert_matches!(cli.subcommand, Some(Subcommand::ExecServer(ExecServerCommand {
-            command: Some(ExecServerSubcommand::Forward { connect }),
-            remote: Some(remote),
-            environment_id: Some(environment_id),
-            name: Some(name),
-            strict_config: true,
-            use_agent_identity_auth: true,
-            ..
-        })) if connect == "ws://127.0.0.1:8765" && remote == "https://example.openai.com" && environment_id == "env-1" && name == "forwarded");
+        assert_matches!(
+            cli.subcommand,
+            Some(Subcommand::ExecServer(ExecServerCommand {
+                strict_config: true,
+                ..
+            }))
+        );
     }
 
     #[test]
@@ -4332,35 +4537,6 @@ mod tests {
     }
 
     #[test]
-    fn app_server_code_mode_host_url_parses_independently_of_listen_transport() {
-        let app_server = app_server_from_args(
-            [
-                "dex",
-                "app-server",
-                "--code-mode-host",
-                "wss://example.test/code-mode",
-                "--listen",
-                "ws://127.0.0.1:4500",
-            ]
-            .as_ref(),
-        );
-
-        assert_eq!(
-            app_server.code_mode_host.code_mode_host,
-            Some(
-                url::Url::parse("wss://example.test/code-mode")
-                    .expect("test endpoint should parse")
-            )
-        );
-        assert_eq!(
-            app_server.listen,
-            dex_app_server::AppServerTransport::WebSocket {
-                bind_address: "127.0.0.1:4500".parse().expect("valid socket address"),
-            }
-        );
-    }
-
-    #[test]
     fn app_server_grpc_code_mode_host_url_parses_independently_of_listen_transport() {
         let app_server = app_server_from_args(
             [
@@ -4385,7 +4561,13 @@ mod tests {
         for endpoint in [
             "ftp://127.0.0.1:8765",
             "ws://",
+            "ws://127.0.0.1:8765",
+            "wss://example.test/code-mode",
+            "ws://alice:secret@example.test/code-mode",
+            "wss://alice:secret@example.test/code-mode",
             "wss://example.test/code-mode#fragment",
+            "http://",
+            "https://example.test/#fragment",
             "https://example.test/code-mode",
             "http://alice:secret@example.test",
             "https://alice:secret@example.test",
@@ -4604,7 +4786,7 @@ mod tests {
         );
         assert_eq!(
             app_server.auth.ws_auth,
-            Some(dex_app_server::WebsocketAuthCliMode::CapabilityToken)
+            Some(dex_websocket_auth::WebsocketAuthCliMode::CapabilityToken)
         );
         assert_eq!(
             app_server.auth.ws_token_file,
@@ -4633,7 +4815,7 @@ mod tests {
         );
         assert_eq!(
             app_server.auth.ws_auth,
-            Some(dex_app_server::WebsocketAuthCliMode::SignedBearerToken)
+            Some(dex_websocket_auth::WebsocketAuthCliMode::SignedBearerToken)
         );
         assert_eq!(
             app_server.auth.ws_shared_secret_file,
@@ -4788,3 +4970,7 @@ mod tests {
             .expect_err("feature should be rejected")
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "daemon_update_tests.rs"]
+mod daemon_update_tests;

@@ -9,6 +9,8 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
+use dex_code_mode::RuntimeResponse;
+use dex_extension_api::CodeModeCellTiming;
 use dex_tools::ToolName;
 use dex_tools::ToolSpec;
 
@@ -17,9 +19,12 @@ use super::ExecContext;
 use super::WAIT_TOOL_NAME;
 use super::handle_runtime_response;
 use super::telemetry::CodeModeToolCallGuard;
+use super::telemetry::trace_id;
 use super::wait_spec::create_wait_tool;
 
-pub struct CodeModeWaitHandler;
+pub struct CodeModeWaitHandler {
+    spec: ToolSpec,
+}
 
 #[derive(Debug, Deserialize)]
 struct ExecWaitArgs {
@@ -51,22 +56,50 @@ impl ToolExecutor<ToolInvocation> for CodeModeWaitHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_wait_tool()
+        self.spec.clone()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> dex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> dex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
 
 impl CodeModeWaitHandler {
+    pub(crate) fn new(
+        description_override: Option<&str>,
+        parameters_override: Option<&str>,
+    ) -> Self {
+        Self {
+            spec: create_wait_tool(description_override, parameters_override),
+        }
+    }
+
+    // Default to interrupted if this future is dropped; telemetry::CodeModeToolCallGuard::finish
+    // overwrites this handler's captured span on explicit success or failure, including early errors.
+    #[tracing::instrument(
+        name = "code_mode.handler.wait",
+        level = "info",
+        skip_all,
+        fields(
+            conversation.id = %invocation.session.thread_id,
+            turn_id = invocation.turn.sub_id.as_str(),
+            call_id = trace_id(&invocation.call_id),
+            cell.id = tracing::field::Empty,
+            outcome = "interrupted",
+        )
+    )]
     async fn handle_call(
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        let handler_span = tracing::Span::current();
         let ToolInvocation {
             session,
             turn,
+            step_context,
             call_id,
             tool_name,
             payload,
@@ -74,11 +107,12 @@ impl CodeModeWaitHandler {
         } = invocation;
 
         let mut telemetry = CodeModeToolCallGuard::new(
-            session.services.analytics_events_client.clone(),
-            session.thread_id.to_string(),
+            &session,
             turn.sub_id.clone(),
+            turn.turn_metadata_state.clone(),
             call_id.clone(),
             WAIT_TOOL_NAME,
+            handler_span,
         );
         let result = match payload {
             ToolPayload::Function { arguments }
@@ -90,21 +124,29 @@ impl CodeModeWaitHandler {
                 })?;
                 let exec = ExecContext { session, turn };
                 let started_at = std::time::Instant::now();
+                telemetry.cell_id = Some(args.cell_id.clone());
                 let cell_id = dex_code_mode::CellId::new(args.cell_id);
                 let wait_response = if args.terminate {
                     exec.session
                         .services
                         .code_mode_service
-                        .terminate(cell_id)
+                        .terminate(dex_code_mode::TerminateRequest {
+                            cell_id: cell_id.clone(),
+                            max_output_tokens: args.max_tokens,
+                        })
                         .await
                 } else {
                     exec.session
                         .services
                         .code_mode_service
-                        .wait(dex_code_mode::WaitRequest {
-                            cell_id,
-                            yield_time_ms: args.yield_time_ms,
-                        })
+                        .wait(
+                            dex_code_mode::WaitRequest {
+                                cell_id: cell_id.clone(),
+                                yield_time_ms: args.yield_time_ms,
+                                max_output_tokens: args.max_tokens,
+                            },
+                            step_context.preempt.clone(),
+                        )
                         .await
                 }
                 .map_err(|error| {
@@ -113,17 +155,25 @@ impl CodeModeWaitHandler {
                 })?;
                 if let dex_code_mode::WaitOutcome::LiveCell(response) = &wait_response {
                     let runtime_cell_id = match response {
-                        dex_code_mode::RuntimeResponse::Yielded { cell_id, .. }
-                        | dex_code_mode::RuntimeResponse::Terminated { cell_id, .. }
-                        | dex_code_mode::RuntimeResponse::Result { cell_id, .. } => cell_id,
+                        RuntimeResponse::Yielded { cell_id, .. }
+                        | RuntimeResponse::Terminated { cell_id, .. }
+                        | RuntimeResponse::Result { cell_id, .. } => cell_id,
                     };
+                    tracing::Span::current().record("cell.id", trace_id(runtime_cell_id.as_str()));
                     telemetry.cell_id = Some(runtime_cell_id.to_string());
-                    if let Some(executed_tool_calls) =
-                        exec.session.services.executed_tool_calls.as_ref()
-                    {
-                        executed_tool_calls.register_cell(runtime_cell_id, &call_id);
-                    }
-                    if !matches!(response, dex_code_mode::RuntimeResponse::Yielded { .. }) {
+                    exec.session
+                        .services
+                        .executed_tool_calls
+                        .register_cell(runtime_cell_id, &call_id);
+                    if !matches!(response, RuntimeResponse::Yielded { .. }) {
+                        telemetry.record_cell_timing(
+                            runtime_cell_id,
+                            CodeModeCellTiming::WaitFinished {
+                                result_buffered_for: wait_response
+                                    .result_buffered_for()
+                                    .unwrap_or_default(),
+                            },
+                        );
                         exec.session
                             .services
                             .rollout_thread_trace
@@ -147,12 +197,24 @@ impl CodeModeWaitHandler {
                                 },
                             );
                     }
+                } else {
+                    telemetry.record_cell_timing(&cell_id, CodeModeCellTiming::CellUnavailable);
+                }
+                if let Some(code_mode_host_duration) = wait_response.code_mode_host_duration() {
+                    telemetry.record_code_mode_host_duration(code_mode_host_duration);
                 }
                 exec.session.services.elicitations.wait_until_clear().await;
-                handle_runtime_response(&exec, wait_response.into(), args.max_tokens, started_at)
-                    .await
-                    .map_err(FunctionCallError::RespondToModel)
-                    .map(boxed_tool_output)
+                let wall_time = wait_response
+                    .code_mode_host_duration()
+                    .unwrap_or_else(|| started_at.elapsed());
+                Ok(boxed_tool_output(handle_runtime_response(
+                    &step_context.settings.model_info,
+                    wait_response.into(),
+                    args.max_tokens,
+                    exec.session.services.code_mode_service.output_truncation(),
+                    wall_time,
+                    exec.turn.config.code_mode.experimental_show_cell_overhead,
+                )))
             }
             _ => Err(FunctionCallError::RespondToModel(format!(
                 "{WAIT_TOOL_NAME} expects JSON arguments"

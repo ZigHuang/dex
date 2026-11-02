@@ -1,0 +1,7 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "mermaid",
+    crate_name = "dex_mermaid",
+    test_data_extra = glob(["src/snapshots/**"]),
+)

@@ -76,7 +76,7 @@ async fn stalled_handshake_unblocks_remote_executor(
     let http_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(body_partial_json(json!({ "method": expected_method })))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
         .expect(1)
         .mount(&http_server)
         .await;
@@ -102,7 +102,9 @@ async fn stalled_handshake_unblocks_remote_executor(
     let error = client
         .initialize(
             params,
-            Some(Duration::from_millis(500)),
+            // Allow the request to reach the remote HTTP server on loaded CI
+            // workers before testing cancellation of its stalled response.
+            Some(Duration::from_secs(5)),
             Box::new(|_, _| {
                 async {
                     Ok(ElicitationResponse {
@@ -124,7 +126,7 @@ async fn stalled_handshake_unblocks_remote_executor(
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        exec_server.client.environment_info(),
+        exec_server.client.environment_status(),
     )
     .await
     .context("a timed-out handshake must not leave the serial executor blocked")??;

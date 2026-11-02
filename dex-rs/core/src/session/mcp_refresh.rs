@@ -22,6 +22,7 @@ impl McpRefresh {
         self.pending.store(true, Ordering::Release);
     }
 
+    #[cfg(test)]
     pub(super) fn is_pending(&self) -> bool {
         self.pending.load(Ordering::Acquire)
     }
@@ -53,3 +54,7 @@ impl Drop for McpRefreshInvalidationGuard<'_> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "mcp_refresh_tests.rs"]
+mod tests;

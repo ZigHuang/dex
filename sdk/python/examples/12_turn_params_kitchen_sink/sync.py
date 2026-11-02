@@ -14,7 +14,6 @@ from openai_dex import (
     Dex,
 )
 from openai_dex.types import (
-    Personality,
     ReasoningSummary,
 )
 
@@ -44,7 +43,6 @@ with Dex(config=runtime_config()) as dex:
     turn = thread.turn(
         PROMPT,
         output_schema=OUTPUT_SCHEMA,
-        personality=Personality.pragmatic,
         summary=SUMMARY,
     )
     result = turn.run()

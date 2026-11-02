@@ -16,7 +16,6 @@ from openai_dex import (
     AsyncDex,
 )
 from openai_dex.types import (
-    Personality,
     ReasoningSummary,
 )
 
@@ -48,7 +47,6 @@ async def main() -> None:
         turn = await thread.turn(
             PROMPT,
             output_schema=OUTPUT_SCHEMA,
-            personality=Personality.pragmatic,
             summary=SUMMARY,
         )
         result = await turn.run()

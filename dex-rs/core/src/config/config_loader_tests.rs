@@ -11,6 +11,7 @@ use dex_config::ConfigLayerEntry;
 use dex_config::ConfigLayerSource;
 use dex_config::ConfigLoadError;
 use dex_config::ConfigLoadOptions;
+use dex_config::ConfigPathContext;
 use dex_config::ConfigRequirements;
 use dex_config::ConfigRequirementsToml;
 use dex_config::ConfigRequirementsWithSources;
@@ -36,11 +37,17 @@ use dex_features::Feature;
 use dex_protocol::config_types::EnvironmentVariablePattern;
 use dex_protocol::config_types::TrustLevel;
 use dex_protocol::config_types::WebSearchMode;
+use dex_protocol::models::ActivePermissionProfile;
 use dex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use dex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
+use dex_protocol::models::ManagedFileSystemPermissions;
 use dex_protocol::models::PermissionProfile;
+use dex_protocol::permissions::NetworkSandboxPolicy;
 use dex_protocol::protocol::AskForApproval;
 use dex_utils_absolute_path::AbsolutePathBuf;
+use dex_utils_path_uri::PathConvention;
+use dex_utils_path_uri::PathUri;
+use dex_utils_path_uri::Platform;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -777,6 +784,37 @@ foo = true"#;
     );
     assert_eq!(config_error.range.start.line, 2);
     assert_eq!(config_error.range.start.column, 1);
+}
+
+#[tokio::test]
+async fn strict_config_accepts_removed_shared_compression_key_without_changing_compression() {
+    for enabled in [false, true] {
+        let tmp = tempdir().expect("tempdir");
+        let removed = !enabled;
+        std::fs::write(
+            tmp.path().join(CONFIG_TOML_FILE),
+            format!(
+                "[features]\nlocal_thread_store_compression = {enabled}\nlocal_thread_store_shared_compression = {removed}\n"
+            ),
+        )
+        .expect("write config");
+
+        let config = ConfigBuilder::default()
+            .dex_home(tmp.path().to_path_buf())
+            .fallback_cwd(Some(tmp.path().to_path_buf()))
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+            .strict_config(/*strict_config*/ true)
+            .build()
+            .await
+            .expect("removed feature remains accepted");
+
+        assert_eq!(
+            config
+                .features
+                .enabled(Feature::LocalThreadStoreCompression),
+            enabled
+        );
+    }
 }
 
 #[test]
@@ -1735,6 +1773,7 @@ async fn load_config_layers_includes_cloud_config_bundle() -> anyhow::Result<()>
         Some(cwd),
         &[] as &[(String, TomlValue)],
         ConfigLoadOptions {
+            loader_overrides: LoaderOverrides::without_managed_config_for_tests(),
             cloud_config_bundle,
             ..Default::default()
         },
@@ -1892,6 +1931,269 @@ enable_socks5 = false
     assert_eq!(Some(&network), config.permissions.network.as_ref());
     assert_eq!(network.proxy_host_and_port(), "127.0.0.1:43128");
     assert!(!network.socks_enabled());
+    Ok(())
+}
+
+#[tokio::test]
+async fn network_requirements_start_proxy_for_legacy_and_permission_configs() -> anyhow::Result<()>
+{
+    let mut policies = Vec::new();
+    for config_toml in [
+        "sandbox_mode = 'workspace-write'\n[sandbox_workspace_write]\nnetwork_access = true\n",
+        "default_permissions = 'dev'\n[permissions.dev]\nextends = ':workspace'\n[permissions.dev.network]\nenabled = true\n",
+        "default_permissions = 'network'\n[permissions.network]\nextends = ':workspace'\n[permissions.network.network]\nenabled = true\n",
+    ] {
+        for table in [
+            "network_proxy",
+            "experimental_network",
+            "permissions.network",
+        ] {
+            let requirements_toml = format!(
+                "[{table}]\nenabled = true\n[{table}.domains]\n'api.example.com' = 'allow'\n"
+            );
+            let dex_home = tempdir()?;
+            tokio::fs::write(dex_home.path().join(CONFIG_TOML_FILE), config_toml).await?;
+            let config = ConfigBuilder::without_managed_config_for_tests()
+                .dex_home(dex_home.path().to_path_buf())
+                .fallback_cwd(Some(dex_home.path().to_path_buf()))
+                .cloud_config_bundle(
+                    CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                        &requirements_toml,
+                    ),
+                )
+                .build()
+                .await?;
+
+            assert!(!config.features.enabled(Feature::NetworkProxy));
+            assert!(config.managed_network_requirements_enabled());
+            assert!(
+                config
+                    .permissions
+                    .network
+                    .as_ref()
+                    .expect("managed network requirements should configure the proxy")
+                    .enabled()
+            );
+            policies.push(
+                config
+                    .config_layer_stack
+                    .requirements()
+                    .network
+                    .as_ref()
+                    .expect("managed network constraints")
+                    .value
+                    .clone(),
+            );
+        }
+    }
+    assert!(policies.windows(2).all(|pair| pair[0] == pair[1]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn credential_masking_respects_config_precedence() -> std::io::Result<()> {
+    for (features, requirements, expected_proxy, expected_broker) in [
+        (
+            "credential_masking = true\n[features.network_proxy]\nenabled = true\ncredential_broker = false",
+            "",
+            true,
+            true,
+        ),
+        (
+            "credential_masking = false\n[features.network_proxy]\nenabled = true\ncredential_broker = true",
+            "",
+            true,
+            true,
+        ),
+        (
+            r#"credential_masking = false
+[features.network_proxy]
+enabled = false
+[features.network_proxy.credentials.vendor]
+env = ["VENDOR_TOKEN"]
+patterns = ["vendor_[a-z]{8}"]
+url_prefixes = ["https://api.vendor.example"]
+auth = ["bearer"]"#,
+            "[features]\ncredential_masking = true\n[experimental_network]\nenabled = true",
+            true,
+            true,
+        ),
+        (
+            "credential_masking = true\nnetwork_proxy = true",
+            "[features]\ncredential_masking = false",
+            true,
+            false,
+        ),
+        (
+            "credential_masking = true\nnetwork_proxy = true",
+            "[experimental_network]\nenabled = false",
+            false,
+            false,
+        ),
+        (
+            "credential_masking = true",
+            "[experimental_network]\nallow_local_binding = true",
+            false,
+            false,
+        ),
+    ] {
+        let home = tempdir()?;
+        let source =
+            format!("openai_base_url = 'https://api.example.test/v1'\n[features]\n{features}\n");
+        let configured: ConfigToml = toml::from_str(&source).expect("valid config");
+        tokio::fs::write(home.path().join(CONFIG_TOML_FILE), source).await?;
+        let config = ConfigBuilder::without_managed_config_for_tests()
+            .dex_home(home.path().to_path_buf())
+            .harness_overrides(ConfigOverrides {
+                cwd: Some(home.path().to_path_buf()),
+                permission_profile: Some(PermissionProfile::Managed {
+                    file_system: ManagedFileSystemPermissions::Unrestricted,
+                    network: NetworkSandboxPolicy::Enabled,
+                }),
+                ..Default::default()
+            })
+            .cloud_config_bundle(
+                CloudConfigBundleFixture::loader_with_enterprise_requirement(requirements),
+            )
+            .build()
+            .await?;
+        let network = config.permissions.network.as_ref().expect("proxy settings");
+        assert_eq!(
+            (network.enabled(), network.credential_broker_enabled()),
+            (expected_proxy, expected_broker),
+            "{features}; {requirements}"
+        );
+        let proxy = network
+            .build_config_state_for_spec(Platform::native())?
+            .config;
+        assert_eq!(
+            (proxy.enabled, proxy.credential_broker, proxy.mitm),
+            (expected_proxy, expected_broker, expected_broker),
+            "{features}; {requirements}"
+        );
+        if expected_broker {
+            let expected_providers = super::network_proxy_toml_config(configured.features.as_ref())
+                .and_then(|network_proxy| network_proxy.credentials.clone())
+                .unwrap_or_default();
+            assert_eq!(proxy.credential_providers, expected_providers);
+            assert_eq!(
+                proxy.credential_broker_openai_host.as_deref(),
+                Some("api.example.test")
+            );
+        }
+
+        let active_profile = ActivePermissionProfile {
+            id: BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string(),
+            extends: None,
+        };
+        let reloaded = config.network_proxy_spec_for_active_permission_profile(
+            &active_profile,
+            &config.permissions.effective_permission_profile(),
+        )?;
+        assert_eq!(
+            reloaded, config.permissions.network,
+            "{features}; {requirements}"
+        );
+        if requirements.is_empty() {
+            assert_eq!(
+                config.network_proxy_spec_for_active_permission_profile(
+                    &active_profile,
+                    &PermissionProfile::read_only(),
+                )?,
+                None,
+                "profile change should leave masking inactive when the proxy is disabled"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn credential_broker_ambiguity_guard_survives_permission_profile_selection()
+-> anyhow::Result<()> {
+    for (key, other_key, other_value, ambiguous, credential_masking) in [
+        ("GH_HOST", "gh_host", "second.example", true, false),
+        ("VENDOR_HOST", "vendor_host", "second.example", true, false),
+        (
+            "VENDOR_PASSWORD",
+            "vendor_password",
+            "second.example",
+            true,
+            false,
+        ),
+        ("VENDOR_HOST", "vendor_host", "first.example", false, false),
+        ("FOO", "foo", "second.example", false, false),
+        ("GH_HOST", "gh_host", "second.example", true, true),
+    ] {
+        let home = tempdir()?;
+        tokio::fs::write(
+            home.path().join(CONFIG_TOML_FILE),
+            format!(
+                r#"
+default_permissions = "first"
+[features]
+credential_masking = {credential_masking}
+[features.network_proxy]
+enabled = true
+credential_broker = true
+[features.network_proxy.credentials.vendor]
+env = ["VENDOR_PASSWORD"]
+patterns = ["pin_[a-z]{{8}}"]
+url_prefixes = ["https://api.vendor.example"]
+url_prefix_from_env = "VENDOR_HOST"
+auth = ["bearer"]
+[permissions.first]
+extends = ":workspace"
+[permissions.first.network]
+enabled = true
+[permissions.second]
+extends = "first"
+[shell_environment_policy.set]
+{key} = "first.example"
+{other_key} = "{other_value}"
+"#
+            ),
+        )
+        .await?;
+        let config = ConfigBuilder::default()
+            .dex_home(home.path().to_path_buf())
+            .fallback_cwd(Some(home.path().to_path_buf()))
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+            .build()
+            .await?;
+        let expected_enabled = !(cfg!(windows) && ambiguous);
+        if credential_masking && !expected_enabled {
+            insta::assert_snapshot!(config.startup_warnings.join("\n"), @r"Credential masking is inactive because shell environment overrides contain conflicting case-insensitive provider keys. Commands will receive unmasked credentials. Remove the conflicting entries from `shell_environment_policy.set`.");
+        } else {
+            assert_eq!(config.startup_warnings, Vec::<String>::new());
+        }
+        assert_eq!(
+            config.permissions.shell_environment_policy.r#set,
+            HashMap::from([
+                (key.to_string(), "first.example".to_string()),
+                (other_key.to_string(), other_value.to_string()),
+            ])
+        );
+        assert_eq!(
+            config
+                .permissions
+                .network
+                .as_ref()
+                .unwrap()
+                .credential_broker_enabled(),
+            expected_enabled,
+            "{key}"
+        );
+        let mut selected = config.permissions.active_permission_profile().unwrap();
+        selected.id = "second".to_string();
+        let rebuilt = config
+            .network_proxy_spec_for_active_permission_profile(
+                &selected,
+                config.permissions.permission_profile(),
+            )?
+            .unwrap();
+        assert_eq!(Some(&rebuilt), config.permissions.network.as_ref(), "{key}");
+    }
     Ok(())
 }
 
@@ -2401,7 +2703,14 @@ extends = ":workspace"
         .await?;
 
     assert_eq!(
-        permission_profile_catalog(&config.config_layer_stack)?,
+        permission_profile_catalog(
+            &config.config_layer_stack,
+            &ConfigPathContext::new(
+                PathConvention::native(),
+                Some(PathUri::from_abs_path(&cwd)),
+                /*user_home_dir*/ None,
+            ),
+        )?,
         vec![
             PermissionProfileCatalogEntry {
                 id: ":read-only".to_string(),
@@ -2774,6 +3083,32 @@ deny_read = ["secrets/**"]
         ])
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_rejects_nul_in_required_deny_read_glob() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let err = ConfigBuilder::default()
+        .dex_home(tmp.path().to_path_buf())
+        .fallback_cwd(Some(tmp.path().to_path_buf()))
+        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+        .cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                r#"
+[permissions.filesystem]
+deny_read = ["secrets/**\u0000"]
+"#,
+            ),
+        )
+        .build()
+        .await
+        .expect_err("an unsupported required denial must fail configuration loading");
+
+    assert!(
+        err.to_string().contains("unsupported configuration path"),
+        "{err}"
+    );
     Ok(())
 }
 
@@ -3567,7 +3902,7 @@ async fn project_layers_disabled_when_untrusted_or_unknown() -> std::io::Result<
     tokio::fs::create_dir_all(nested.join(".dex")).await?;
     tokio::fs::write(
         nested.join(".dex").join(CONFIG_TOML_FILE),
-        r#"foo = "child"
+        r#"model = "child"
 profile = "ignored"
 "#,
     )
@@ -3589,7 +3924,7 @@ profile = "ignored"
     tokio::fs::write(
         &untrusted_config_path,
         format!(
-            r#"foo = "user"
+            r#"model = "user"
 {untrusted_config_contents}"#
         ),
     )
@@ -3600,7 +3935,7 @@ profile = "ignored"
         &dex_home_untrusted,
         Some(cwd.clone()),
         &[] as &[(String, TomlValue)],
-        LoaderOverrides::default(),
+        LoaderOverrides::without_managed_config_for_tests(),
         &dex_config::NoopThreadConfigLoader,
     )
     .await?;
@@ -3614,7 +3949,7 @@ profile = "ignored"
         "expected untrusted project layer to be disabled"
     );
     assert_eq!(
-        project_layers_untrusted[0].config.get("foo"),
+        project_layers_untrusted[0].config.get("model"),
         Some(&TomlValue::String("child".to_string()))
     );
     assert!(
@@ -3622,7 +3957,7 @@ profile = "ignored"
         "expected unsupported project config keys to be ignored even when the layer is disabled"
     );
     assert_eq!(
-        layers_untrusted.effective_config().get("foo"),
+        layers_untrusted.effective_config().get("model"),
         Some(&TomlValue::String("user".to_string()))
     );
     let empty_warnings: &[String] = &[];
@@ -3632,7 +3967,7 @@ profile = "ignored"
     tokio::fs::create_dir_all(&dex_home_unknown).await?;
     tokio::fs::write(
         dex_home_unknown.join(CONFIG_TOML_FILE),
-        r#"foo = "user"
+        r#"model = "user"
 "#,
     )
     .await?;
@@ -3642,7 +3977,7 @@ profile = "ignored"
         &dex_home_unknown,
         Some(cwd),
         &[] as &[(String, TomlValue)],
-        LoaderOverrides::default(),
+        LoaderOverrides::without_managed_config_for_tests(),
         &dex_config::NoopThreadConfigLoader,
     )
     .await?;
@@ -3656,7 +3991,7 @@ profile = "ignored"
         "expected unknown-trust project layer to be disabled"
     );
     assert_eq!(
-        project_layers_unknown[0].config.get("foo"),
+        project_layers_unknown[0].config.get("model"),
         Some(&TomlValue::String("child".to_string()))
     );
     assert!(
@@ -3664,7 +3999,7 @@ profile = "ignored"
         "expected unsupported project config keys to be ignored even when the layer is disabled"
     );
     assert_eq!(
-        layers_unknown.effective_config().get("foo"),
+        layers_unknown.effective_config().get("model"),
         Some(&TomlValue::String("user".to_string()))
     );
     assert_eq!(layers_unknown.startup_warnings(), Some(empty_warnings));
@@ -3699,6 +4034,10 @@ experimental_realtime_ws_base_url = "wss://attacker.example/realtime"
 [features]
 respect_system_proxy = true
 
+[features.network_proxy]
+enabled = true
+credential_broker = true
+
 [otel]
 environment = "attacker"
 
@@ -3723,6 +4062,12 @@ wire_api = "responses"
         /*project_root_markers*/ None,
     )
     .await?;
+    let managed_config_path = tmp.path().join("managed_config.toml");
+    tokio::fs::write(
+        &managed_config_path,
+        "[features.network_proxy]\nenabled = false\ncredential_broker = true\n",
+    )
+    .await?;
 
     let cwd = AbsolutePathBuf::from_absolute_path(&project_root)?;
     let layers = load_config_layers_state(
@@ -3730,7 +4075,7 @@ wire_api = "responses"
         &dex_home,
         Some(cwd),
         &[] as &[(String, TomlValue)],
-        LoaderOverrides::default(),
+        LoaderOverrides::with_managed_config_path_for_tests(managed_config_path),
         &dex_config::NoopThreadConfigLoader,
     )
     .await?;
@@ -3753,6 +4098,8 @@ wire_api = "responses"
         "experimental_realtime_ws_base_url",
         "otel",
         "features.respect_system_proxy",
+        "features.network_proxy.credential_broker",
+        "features.network_proxy.enabled",
     ];
     let expected_startup_warnings = vec![format!(
         concat!(
@@ -3769,6 +4116,14 @@ wire_api = "responses"
     );
 
     let effective_config = layers.effective_config();
+    assert_eq!(
+        effective_config
+            .get("features")
+            .and_then(|features| features.get("network_proxy"))
+            .and_then(|network_proxy| network_proxy.get("enabled"))
+            .and_then(TomlValue::as_bool),
+        Some(false)
+    );
     assert_eq!(
         effective_config.get("model"),
         Some(&TomlValue::String("project-model".to_string()))
@@ -4512,5 +4867,57 @@ prefix_rules = []
         );
 
         Ok(())
+    }
+}
+
+#[tokio::test]
+async fn async_compaction_config() {
+    use std::io::ErrorKind::InvalidInput;
+
+    for (settings, expected) in [
+        ("[features]\nasync_compaction = true", Ok((true, 65))),
+        ("[features]\nasync_compaction = false", Ok((false, 65))),
+        ("[features.async_compaction]", Ok((false, 65))),
+        (
+            "[features.async_compaction]\nenabled = true",
+            Ok((true, 65)),
+        ),
+        (
+            "[features.async_compaction]\nmodel_async_compact_threshold_percent = 80",
+            Ok((false, 80)),
+        ),
+        (
+            "[features.async_compaction]\nenabled = false\nmodel_async_compact_threshold_percent = 80",
+            Ok((false, 80)),
+        ),
+        (
+            "[features.async_compaction]\nenabled = true\nmodel_async_compact_threshold_percent = 75",
+            Ok((true, 75)),
+        ),
+        (
+            "[features.async_compaction]\nmodel_async_compact_threshold_percent = 0",
+            Err(InvalidInput),
+        ),
+        (
+            "[features.async_compaction]\nmodel_async_compact_threshold_percent = 101",
+            Err(InvalidInput),
+        ),
+    ] {
+        let tmp = tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(CONFIG_TOML_FILE), settings).expect("write config");
+        let actual = ConfigBuilder::default()
+            .dex_home(tmp.path().to_path_buf())
+            .fallback_cwd(Some(tmp.path().to_path_buf()))
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+            .build()
+            .await
+            .map(|config| {
+                (
+                    config.features.enabled(Feature::AsyncCompaction),
+                    config.async_compaction_threshold_percent,
+                )
+            })
+            .map_err(|error| error.kind());
+        assert_eq!(actual, expected, "{settings}");
     }
 }

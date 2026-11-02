@@ -1,14 +1,21 @@
 pub(crate) mod command_runner;
 pub(crate) mod discovery;
 pub(crate) mod dispatcher;
+mod matcher;
 pub(crate) mod mcp_runner;
 pub(crate) mod output_parser;
+mod plugin_fingerprint;
+mod plugin_trust;
 pub(crate) mod schema_loader;
+
+pub(crate) use matcher::HookMatcher;
 
 use crate::events::compact::PostCompactRequest;
 use crate::events::compact::PreCompactOutcome;
 use crate::events::compact::PreCompactRequest;
 use crate::events::compact::StatelessHookOutcome;
+use crate::events::interrupt::InterruptOutcome;
+use crate::events::interrupt::InterruptRequest;
 use crate::events::permission_request::PermissionRequestOutcome;
 use crate::events::permission_request::PermissionRequestRequest;
 use crate::events::post_tool_use::PostToolUseOutcome;
@@ -38,7 +45,11 @@ use dex_protocol::protocol::HookSource;
 use dex_protocol::protocol::HookTrustStatus;
 use dex_utils_absolute_path::AbsolutePathBuf;
 use dex_utils_path_uri::PathUri;
+use serde_json::Map;
+use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,8 +63,11 @@ pub(crate) struct CommandShell {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfiguredHandler {
+    /// Internally admitted cleanup hook, enabled independently of per-hook state.
+    pub builtin: bool,
+    pub plugin_trust: Option<plugin_trust::PluginHookTrust>,
     pub event_name: dex_protocol::protocol::HookEventName,
-    pub matcher: Option<String>,
+    pub matcher: Option<HookMatcher>,
     pub timeout_sec: u64,
     pub status_message: Option<String>,
     pub additional_context_limit: AdditionalContextLimit,
@@ -66,9 +80,13 @@ pub(crate) struct ConfiguredHandler {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HandlerSourcePath {
     Local(AbsolutePathBuf),
+    Environment {
+        environment_id: String,
+        cwd: PathUri,
+        source_path: PathUri,
+    },
     /// Executor-scoped handlers are currently excluded from user-visible hook reporting
-    /// (events, summary, telemetry) because the only supported 1p hook is
-    /// coupled to executor-scoped execution. Their handlers are always executed async.
+    /// (events, summary, telemetry). Their handlers are always executed async.
     ///
     /// TODO: With CCA, all hooks will be executor-scoped, so user visibility
     /// (participation in lifecycle events and summaries) and execution behavior
@@ -76,9 +94,29 @@ pub(crate) enum HandlerSourcePath {
     ExecutorScoped {
         plugin_id: PluginId,
         environment_id: String,
+        mcp_environment_id: Option<String>,
+        mcp_metadata: Option<Box<Map<String, Value>>>,
         manifest_path: PathUri,
         source_relative_path: String,
     },
+}
+
+impl HandlerSourcePath {
+    /// Use the environment's working directory and withhold controller-owned transcript paths.
+    fn event_input<'a>(&self, input: &'a Value) -> Cow<'a, Value> {
+        match self {
+            Self::Environment { cwd, .. } => {
+                let mut input = input.clone();
+                input["cwd"] = Value::String(cwd.inferred_native_path_string());
+                input["transcript_path"] = Value::Null;
+                if let Some(path) = input.get_mut("agent_transcript_path") {
+                    *path = Value::Null;
+                }
+                Cow::Owned(input)
+            }
+            Self::Local(_) | Self::ExecutorScoped { .. } => Cow::Borrowed(input),
+        }
+    }
 }
 
 impl From<AbsolutePathBuf> for HandlerSourcePath {
@@ -91,6 +129,9 @@ impl std::fmt::Display for HandlerSourcePath {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Local(path) => write!(formatter, "{}", path.display()),
+            Self::Environment { source_path, .. } => {
+                write!(formatter, "{}", source_path.inferred_native_path_string())
+            }
             Self::ExecutorScoped {
                 environment_id,
                 manifest_path,
@@ -120,6 +161,7 @@ pub(crate) enum ConfiguredHandlerKind {
 
 #[derive(Debug)]
 pub(crate) struct HandlerRunResult {
+    pub context_metadata: dex_protocol::models::ContentItemMetadata,
     pub started_at: i64,
     pub completed_at: i64,
     pub duration_ms: i64,
@@ -130,6 +172,25 @@ pub(crate) struct HandlerRunResult {
 }
 
 impl ConfiguredHandler {
+    /// Internal memory work runs policy and executor hooks, not user or project hooks.
+    pub(crate) fn runs_for_memory_consolidation(&self) -> bool {
+        matches!(self.source_path, HandlerSourcePath::ExecutorScoped { .. })
+            || match self.source {
+                HookSource::User
+                | HookSource::Project
+                | HookSource::SessionFlags
+                | HookSource::Plugin => false,
+                HookSource::System
+                | HookSource::Mdm
+                | HookSource::CloudRequirements
+                | HookSource::CloudManagedConfig
+                | HookSource::LegacyManagedConfigFile
+                | HookSource::LegacyManagedConfigMdm
+                // Required hooks can have unknown attribution; retain them fail-closed.
+                | HookSource::Unknown => true,
+            }
+    }
+
     pub(crate) fn execution_mode(&self) -> HookExecutionMode {
         if matches!(self.source_path, HandlerSourcePath::ExecutorScoped { .. }) {
             return HookExecutionMode::Async;
@@ -163,12 +224,15 @@ impl ConfiguredHandler {
             dex_protocol::protocol::HookEventName::PostToolUse => "post-tool-use",
             dex_protocol::protocol::HookEventName::PreCompact => "pre-compact",
             dex_protocol::protocol::HookEventName::PostCompact => "post-compact",
+            dex_protocol::protocol::HookEventName::PreModelRequest => "pre-model-request",
+            dex_protocol::protocol::HookEventName::PostModelRequest => "post-model-request",
             dex_protocol::protocol::HookEventName::SessionStart => "session-start",
             dex_protocol::protocol::HookEventName::SessionEnd => "session-end",
             dex_protocol::protocol::HookEventName::UserPromptSubmit => "user-prompt-submit",
             dex_protocol::protocol::HookEventName::SubagentStart => "subagent-start",
             dex_protocol::protocol::HookEventName::SubagentStop => "subagent-stop",
             dex_protocol::protocol::HookEventName::Stop => "stop",
+            dex_protocol::protocol::HookEventName::Interrupt => "interrupt",
         }
     }
 
@@ -188,6 +252,8 @@ pub enum HookListEntryHandler {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookListEntry {
+    /// Builtin hooks remain available internally but are omitted from the public hooks list.
+    pub builtin: bool,
     pub key: String,
     pub event_name: HookEventName,
     pub handler: HookListEntryHandler,
@@ -198,6 +264,8 @@ pub struct HookListEntry {
     pub source_path: AbsolutePathBuf,
     pub source: HookSource,
     pub plugin_id: Option<String>,
+    /// The owning execution environment, if this hook came from its requirements.
+    pub environment_id: Option<String>,
     pub display_order: i64,
     pub enabled: bool,
     pub is_managed: bool,
@@ -207,9 +275,13 @@ pub struct HookListEntry {
 
 #[derive(Clone)]
 pub(crate) struct ClaudeHooksEngine {
-    pub(crate) handlers: Vec<ConfiguredHandler>,
-    warnings: Vec<String>,
-    required_load_errors: Vec<String>,
+    pub(crate) enabled: bool,
+    // Per-turn views share configuration; executor overlays copy handlers on mutation.
+    pub(crate) handlers: Arc<Vec<ConfiguredHandler>>,
+    /// Retain the session inventory without copying it for every hook dispatch.
+    pub(crate) hook_entries: Arc<Vec<HookListEntry>>,
+    pub(crate) warnings: Arc<[String]>,
+    required_load_errors: Arc<[String]>,
     pub(crate) command_runtime: CommandHookRuntime,
     pub(crate) mcp_executor: Arc<dyn HookMcpExecutor>,
 }
@@ -224,27 +296,39 @@ impl ClaudeHooksEngine {
         command_runtime: CommandHookRuntime,
         mcp_executor: Arc<dyn HookMcpExecutor>,
     ) -> Self {
-        if !enabled {
+        if !enabled && plugin_hook_sources.is_empty() {
             return Self {
-                handlers: Vec::new(),
-                warnings: Vec::new(),
-                required_load_errors: Vec::new(),
+                enabled,
+                handlers: Arc::default(),
+                hook_entries: Arc::default(),
+                warnings: Arc::default(),
+                required_load_errors: Arc::default(),
                 command_runtime,
                 mcp_executor,
             };
         }
 
         let _ = schema_loader::generated_hook_schemas();
-        let discovered = discovery::discover_handlers(
+        let mut discovered = discovery::discover_handlers(
             config_layer_stack,
             plugin_hook_sources,
             plugin_hook_load_warnings,
             bypass_hook_trust,
+            discovery::DiscoveryMode::Runtime,
         );
+        if !enabled {
+            discovered.handlers.retain(|handler| handler.builtin);
+            discovered.hook_entries.clear();
+            // Disabled ordinary hooks must not emit warnings or reject session startup.
+            discovered.warnings.clear();
+            discovered.required_load_errors.clear();
+        }
         Self {
-            handlers: discovered.handlers,
-            warnings: discovered.warnings,
-            required_load_errors: discovered.required_load_errors,
+            enabled,
+            handlers: Arc::new(discovered.handlers),
+            hook_entries: Arc::new(discovered.hook_entries),
+            warnings: discovered.warnings.into(),
+            required_load_errors: discovered.required_load_errors.into(),
             command_runtime,
             mcp_executor,
         }
@@ -255,69 +339,89 @@ impl ClaudeHooksEngine {
     }
 
     pub(crate) fn set_executor_hooks(&mut self, executor_hooks: Vec<ExecutorPluginHookSource>) {
-        self.handlers.retain(|handler| {
+        if executor_hooks.is_empty()
+            && !self.handlers.iter().any(|handler| {
+                matches!(
+                    handler.source_path,
+                    HandlerSourcePath::ExecutorScoped { .. }
+                )
+            })
+        {
+            return;
+        }
+
+        let handlers = Arc::make_mut(&mut self.handlers);
+        handlers.retain(|handler| {
             !matches!(
                 handler.source_path,
                 HandlerSourcePath::ExecutorScoped { .. }
             )
         });
 
-        // FIXME: Remove this restriction once executor hooks support multiple environments.
-        if executor_hooks.len() > 1 {
-            tracing::warn!(
-                executor_hook_count = executor_hooks.len(),
-                "multiple executor hooks found; only executing the first"
-            );
-        }
-        let Some(source) = executor_hooks.into_iter().next() else {
-            return;
-        };
-        let Some(handler) = source
-            .hooks
-            .stop
-            .into_iter()
-            .flat_map(|group| group.hooks)
-            .next()
-        else {
-            unreachable!("allowlisted executor hook source must contain a Stop handler");
-        };
-        let HookHandlerConfig::McpTool {
-            server,
-            tool,
-            input,
-            timeout_sec,
-            status_message,
-        } = handler
-        else {
-            unreachable!("allowlisted executor Stop handler must be an MCP tool");
-        };
-
-        let display_order = self
-            .handlers
+        let mut display_order = handlers
             .iter()
             .map(|handler| handler.display_order)
             .max()
             .map_or(0, |display_order| display_order.saturating_add(1));
-        self.handlers.push(ConfiguredHandler {
-            event_name: HookEventName::Stop,
-            matcher: None,
-            timeout_sec: timeout_sec.unwrap_or(5).max(1),
-            status_message,
-            additional_context_limit: Default::default(),
-            source_path: HandlerSourcePath::ExecutorScoped {
-                plugin_id: source.plugin_id,
-                environment_id: source.environment_id,
-                manifest_path: source.manifest_path,
-                source_relative_path: source.source_relative_path,
-            },
-            source: HookSource::Plugin,
-            display_order,
-            kind: ConfiguredHandlerKind::McpTool {
-                server,
-                tool,
-                input,
-            },
-        });
+        let mut seen_targets = HashSet::new();
+        for source in executor_hooks {
+            for (event_name, groups) in source.hooks.into_matcher_groups() {
+                let Some(handler) = groups.into_iter().flat_map(|group| group.hooks).next() else {
+                    continue;
+                };
+                let HookHandlerConfig::McpTool {
+                    server,
+                    tool,
+                    input,
+                    timeout_sec,
+                    status_message,
+                } = handler
+                else {
+                    unreachable!("allowlisted executor handler must be an MCP tool");
+                };
+
+                // Bundled plugins can share a cleanup target; run it once per event
+                // and MCP environment.
+                let target = (
+                    std::mem::discriminant(&event_name),
+                    source
+                        .mcp_environment_id
+                        .as_ref()
+                        .unwrap_or(&source.environment_id)
+                        .clone(),
+                    server.clone(),
+                    tool.clone(),
+                );
+                if !seen_targets.insert(target) {
+                    continue;
+                }
+                handlers.push(ConfiguredHandler {
+                    builtin: true,
+                    plugin_trust: None,
+                    event_name,
+                    matcher: None,
+                    timeout_sec: timeout_sec.unwrap_or(5).max(1),
+                    status_message,
+                    additional_context_limit: Default::default(),
+                    source_path: HandlerSourcePath::ExecutorScoped {
+                        plugin_id: source.plugin_id.clone(),
+                        environment_id: source.environment_id.clone(),
+                        mcp_environment_id: source.mcp_environment_id.clone(),
+                        mcp_metadata: source.mcp_metadata.clone().map(Box::new),
+                        manifest_path: source.manifest_path.clone(),
+                        source_relative_path: source.source_relative_path.clone(),
+                    },
+                    source: HookSource::Plugin,
+                    display_order,
+                    kind: ConfiguredHandlerKind::McpTool {
+                        server,
+                        tool,
+                        input,
+                    },
+                });
+                display_order = display_order.saturating_add(1);
+            }
+        }
     }
 
     pub(crate) fn required_load_errors(&self) -> &[String] {
@@ -451,6 +555,14 @@ impl ClaudeHooksEngine {
             .maybe_spill_prompt_fragments(outcome.continuation_fragments)
             .await;
         outcome
+    }
+
+    pub(crate) fn preview_interrupt(&self) -> Vec<HookRunSummary> {
+        crate::events::interrupt::preview(&self.handlers)
+    }
+
+    pub(crate) async fn run_interrupt(&self, request: InterruptRequest) -> InterruptOutcome {
+        crate::events::interrupt::run(self, request).await
     }
 }
 

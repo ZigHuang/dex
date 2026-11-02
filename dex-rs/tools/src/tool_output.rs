@@ -1,8 +1,9 @@
-use dex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use dex_protocol::models::FunctionCallOutputBody;
 use dex_protocol::models::FunctionCallOutputContentItem;
 use dex_protocol::models::FunctionCallOutputPayload;
+use dex_protocol::models::ImageReference;
 use dex_protocol::models::ResponseInputItem;
+use dex_utils_path_uri::PathUri;
 use serde_json::Value as JsonValue;
 
 use crate::ToolPayload;
@@ -17,10 +18,20 @@ pub trait ToolOutput: Send {
 
     fn success_for_logging(&self) -> bool;
 
+    /// Finalizes output using the same completed handler duration reported in tool-call logs.
+    /// Called before recording model-visible history; implementations must not measure time here.
+    fn set_handler_duration_ms(&mut self, _handler_duration_ms: u64) {}
+
     /// Whether this output contains external context that should disable memory generation when
     /// `memories.disable_on_external_context` is enabled.
     fn contains_external_context(&self) -> bool {
         false
+    }
+
+    /// Overrides history's fallback token limit after tool-specific truncation.
+    /// Include any serialization allowance; history uses this limit unchanged.
+    fn fallback_token_limit_override(&self) -> Option<usize> {
+        None
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem;
@@ -28,6 +39,13 @@ pub trait ToolOutput: Send {
     /// Returns the tool call id exposed to `PostToolUse` hooks for this output.
     fn post_tool_use_id(&self, call_id: &str) -> String {
         call_id.to_string()
+    }
+
+    /// Returns the original local execution cwd for hook input, including delayed
+    /// results. Remote commands return `None` to retain the host hook cwd.
+    /// This does not change the local directory used to launch the hook process.
+    fn post_tool_use_cwd(&self) -> Option<PathUri> {
+        None
     }
 
     /// Returns the tool input exposed to `PostToolUse` hooks for this output.
@@ -49,6 +67,11 @@ pub trait ToolOutput: Send {
     fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
         response_input_to_code_mode_result(self.to_response_item("", payload))
     }
+
+    /// Borrows original host-only metadata for recording, not for model output or logging.
+    fn tool_result_metadata(&self) -> Option<&JsonValue> {
+        None
+    }
 }
 
 impl<T> ToolOutput for Box<T>
@@ -63,8 +86,16 @@ where
         (**self).success_for_logging()
     }
 
+    fn set_handler_duration_ms(&mut self, handler_duration_ms: u64) {
+        (**self).set_handler_duration_ms(handler_duration_ms);
+    }
+
     fn contains_external_context(&self) -> bool {
         (**self).contains_external_context()
+    }
+
+    fn fallback_token_limit_override(&self) -> Option<usize> {
+        (**self).fallback_token_limit_override()
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -73,6 +104,10 @@ where
 
     fn post_tool_use_id(&self, call_id: &str) -> String {
         (**self).post_tool_use_id(call_id)
+    }
+
+    fn post_tool_use_cwd(&self) -> Option<PathUri> {
+        (**self).post_tool_use_cwd()
     }
 
     fn post_tool_use_input(&self, payload: &ToolPayload) -> Option<JsonValue> {
@@ -85,6 +120,10 @@ where
 
     fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
         (**self).code_mode_result(payload)
+    }
+
+    fn tool_result_metadata(&self) -> Option<&JsonValue> {
+        (**self).tool_result_metadata()
     }
 }
 
@@ -195,21 +234,7 @@ fn response_input_to_code_mode_result(response: ResponseInputItem) -> JsonValue 
         ResponseInputItem::Message { content, .. } => content_items_to_code_mode_result(
             &content
                 .into_iter()
-                .map(|item| match item {
-                    dex_protocol::models::ContentItem::InputText { text }
-                    | dex_protocol::models::ContentItem::OutputText { text } => {
-                        FunctionCallOutputContentItem::InputText { text }
-                    }
-                    dex_protocol::models::ContentItem::InputImage { image_url, detail } => {
-                        FunctionCallOutputContentItem::InputImage {
-                            image_url,
-                            detail: detail.or(Some(DEFAULT_IMAGE_DETAIL)),
-                        }
-                    }
-                    dex_protocol::models::ContentItem::InputAudio { audio_url } => {
-                        FunctionCallOutputContentItem::InputAudio { audio_url }
-                    }
-                })
+                .map(FunctionCallOutputContentItem::from)
                 .collect::<Vec<_>>(),
         ),
         ResponseInputItem::FunctionCallOutput { output, .. }
@@ -235,11 +260,14 @@ fn content_items_to_code_mode_result(items: &[FunctionCallOutputContentItem]) ->
                 FunctionCallOutputContentItem::InputText { text } if !text.trim().is_empty() => {
                     Some(text.clone())
                 }
-                FunctionCallOutputContentItem::InputImage { image_url, .. }
-                    if !image_url.trim().is_empty() =>
-                {
-                    Some(image_url.clone())
-                }
+                FunctionCallOutputContentItem::InputImage {
+                    image: ImageReference::Inline { image_url },
+                    ..
+                } if !image_url.trim().is_empty() => Some(image_url.clone()),
+                FunctionCallOutputContentItem::InputImage {
+                    image: ImageReference::File { file_id },
+                    ..
+                } if !file_id.trim().is_empty() => Some(file_id.clone()),
                 FunctionCallOutputContentItem::InputAudio { audio_url }
                     if !audio_url.trim().is_empty() =>
                 {
@@ -254,3 +282,7 @@ fn content_items_to_code_mode_result(items: &[FunctionCallOutputContentItem]) ->
             .join("\n"),
     )
 }
+
+#[cfg(test)]
+#[path = "tool_output_tests.rs"]
+mod tests;

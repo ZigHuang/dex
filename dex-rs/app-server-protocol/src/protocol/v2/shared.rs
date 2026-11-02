@@ -19,7 +19,6 @@ use schemars::schema::Schema;
 use schemars::schema::SchemaObject;
 use serde::Deserialize;
 use serde::Serialize;
-#[cfg(test)]
 use serde_json::Value as JsonValue;
 
 // Macro to declare a camelCased API v2 enum mirroring a core enum which
@@ -78,9 +77,15 @@ pub enum DexErrorInfo {
     ContextWindowExceeded,
     SessionBudgetExceeded,
     UsageLimitExceeded,
+    RateLimitExceeded,
+    FlexUnavailable,
     ServerOverloaded,
+    ModelNotFound,
+    // Capacity is unavailable on a route restricted by server policy.
+    PolicyCapacityUnavailable,
     CyberPolicy,
     MisalignmentPolicyViolation,
+    TooManyDenials,
     HttpConnectionFailed {
         #[serde(rename = "httpStatusCode")]
         #[ts(rename = "httpStatusCode")]
@@ -116,7 +121,32 @@ pub enum DexErrorInfo {
         #[ts(rename = "turnKind")]
         turn_kind: NonSteerableTurnKind,
     },
+    #[serde(
+        untagged,
+        serialize_with = "serialize_other_dex_error_info",
+        deserialize_with = "deserialize_other_dex_error_info"
+    )]
+    #[ts(type = "\"other\" | string | { [key: string]: unknown }")]
     Other,
+}
+
+fn serialize_other_dex_error_info<S>(serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str("other")
+}
+
+fn deserialize_other_dex_error_info<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match JsonValue::deserialize(deserializer)? {
+        JsonValue::String(_) | JsonValue::Object(_) => Ok(()),
+        _ => Err(serde::de::Error::custom(
+            "expected an error string or object",
+        )),
+    }
 }
 
 impl From<CoreDexErrorInfo> for DexErrorInfo {
@@ -125,11 +155,17 @@ impl From<CoreDexErrorInfo> for DexErrorInfo {
             CoreDexErrorInfo::ContextWindowExceeded => DexErrorInfo::ContextWindowExceeded,
             CoreDexErrorInfo::SessionBudgetExceeded => DexErrorInfo::SessionBudgetExceeded,
             CoreDexErrorInfo::UsageLimitExceeded => DexErrorInfo::UsageLimitExceeded,
+            CoreDexErrorInfo::RateLimitExceeded => DexErrorInfo::RateLimitExceeded,
+            CoreDexErrorInfo::FlexUnavailable => DexErrorInfo::FlexUnavailable,
             CoreDexErrorInfo::ServerOverloaded => DexErrorInfo::ServerOverloaded,
+            CoreDexErrorInfo::ModelNotFound => DexErrorInfo::ModelNotFound,
+            CoreDexErrorInfo::PolicyCapacityUnavailable => DexErrorInfo::PolicyCapacityUnavailable,
             CoreDexErrorInfo::CyberPolicy => DexErrorInfo::CyberPolicy,
+            CoreDexErrorInfo::BioPolicy => DexErrorInfo::Other,
             CoreDexErrorInfo::MisalignmentPolicyViolation => {
                 DexErrorInfo::MisalignmentPolicyViolation
             }
+            CoreDexErrorInfo::TooManyDenials => DexErrorInfo::TooManyDenials,
             CoreDexErrorInfo::HttpConnectionFailed { http_status_code } => {
                 DexErrorInfo::HttpConnectionFailed { http_status_code }
             }
@@ -139,6 +175,7 @@ impl From<CoreDexErrorInfo> for DexErrorInfo {
             CoreDexErrorInfo::InternalServerError => DexErrorInfo::InternalServerError,
             CoreDexErrorInfo::Unauthorized => DexErrorInfo::Unauthorized,
             CoreDexErrorInfo::BadRequest => DexErrorInfo::BadRequest,
+            CoreDexErrorInfo::InvalidPrompt => DexErrorInfo::Other,
             CoreDexErrorInfo::ThreadRollbackFailed => DexErrorInfo::ThreadRollbackFailed,
             CoreDexErrorInfo::SandboxError => DexErrorInfo::SandboxError,
             CoreDexErrorInfo::ResponseStreamDisconnected { http_status_code } => {

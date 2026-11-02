@@ -3,7 +3,7 @@
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_dex::TestDex;
-use core_test_support::test_dex::local_selections;
+use core_test_support::test_dex::local_requests;
 use core_test_support::test_dex::test_dex;
 use core_test_support::test_dex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -37,11 +37,6 @@ const SCHEMA: &str = r#"
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dex_returns_json_result_for_gpt5() -> anyhow::Result<()> {
-    dex_returns_json_result("gpt-5.4".to_string()).await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dex_returns_json_result_for_gpt5_dex() -> anyhow::Result<()> {
     dex_returns_json_result("gpt-5.4".to_string()).await
 }
 
@@ -87,7 +82,7 @@ async fn dex_returns_json_result(model: String) -> anyhow::Result<()> {
             text_elements: Vec::new(),
         }])
         .with_thread_settings(ThreadSettingsOverrides {
-            environments: Some(local_selections(cwd)),
+            environments: Some(local_requests(cwd)),
             approval_policy: Some(AskForApproval::Never),
             sandbox_policy: Some(sandbox_policy),
             permission_profile,

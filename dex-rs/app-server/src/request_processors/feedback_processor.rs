@@ -1,4 +1,5 @@
 use super::*;
+use dex_app_server_protocol::FeedbackSaveParams;
 
 pub(crate) struct FeedbackRequestProcessor;
 
@@ -21,5 +22,12 @@ impl FeedbackRequestProcessor {
         Err(invalid_request(
             "Feedback uploads are not supported by Dex.",
         ))
+    }
+
+    pub(crate) async fn feedback_save(
+        &self,
+        _params: FeedbackSaveParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        Err(invalid_request("Feedback capture is not supported by Dex."))
     }
 }

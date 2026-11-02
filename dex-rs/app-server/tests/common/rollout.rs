@@ -125,6 +125,7 @@ pub fn create_fake_rollout_with_token_usage(
                 total_tokens: 150,
                 dex_rollout_budget_units: None,
             },
+            last_usage_includes_reasoning: None,
             last_token_usage: TokenUsage {
                 input_tokens: 70,
                 cached_input_tokens: 10,
@@ -253,12 +254,17 @@ fn create_fake_rollout_with_source_and_parent_thread_id(
 
     // Build JSONL lines
     let meta = SessionMeta {
+        attached_thread: false,
+        creator_user_id: None,
+        creator_account_id: None,
         session_id,
         id: conversation_id,
         forked_from_id: None,
+        forked_from_ordinal_exclusive: None,
         parent_thread_id,
         timestamp: meta_rfc3339.to_string(),
         cwd: test_path_buf("/"),
+        runtime_workspace_roots: None,
         originator: "dex".to_string(),
         cli_version: "0.0.0".to_string(),
         source,
@@ -345,12 +351,17 @@ pub fn create_fake_rollout_with_text_elements(
 
     // Build JSONL lines
     let meta = SessionMeta {
+        attached_thread: false,
+        creator_user_id: None,
+        creator_account_id: None,
         session_id: conversation_id.into(),
         id: conversation_id,
         forked_from_id: None,
+        forked_from_ordinal_exclusive: None,
         parent_thread_id: None,
         timestamp: meta_rfc3339.to_string(),
         cwd: test_path_buf("/"),
+        runtime_workspace_roots: None,
         originator: "dex".to_string(),
         cli_version: "0.0.0".to_string(),
         source: SessionSource::Cli,

@@ -7,6 +7,7 @@ use dex_protocol::models::FunctionCallOutputBody;
 use dex_protocol::models::FunctionCallOutputContentItem;
 use dex_protocol::models::FunctionCallOutputPayload;
 use dex_protocol::models::ImageDetail;
+use dex_protocol::models::ImageReference;
 use dex_protocol::models::ResponseInputItem;
 use dex_protocol::openai_models::InputModality;
 use dex_utils_image::data_url_from_bytes;
@@ -14,12 +15,15 @@ use serde::Deserialize;
 
 use crate::function_tool::FunctionCallError;
 use crate::original_image_detail::can_request_original_image_detail;
+use crate::tools::context::ToolEnvironments;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
+use crate::tools::handlers::ToolEnvironmentArgs;
+use crate::tools::handlers::function_tool_environment;
 use crate::tools::handlers::parse_arguments;
-use crate::tools::handlers::resolve_tool_environment;
+use crate::tools::handlers::selected_executor;
 use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
 use crate::tools::handlers::view_image_spec::create_view_image_tool;
 use crate::tools::registry::CoreToolRuntime;
@@ -57,8 +61,6 @@ const VIEW_IMAGE_INVALID_MESSAGE: &str =
 #[derive(Deserialize)]
 struct ViewImageArgs {
     path: String,
-    #[serde(default)]
-    environment_id: Option<String>,
     detail: Option<String>,
 }
 
@@ -81,7 +83,10 @@ impl ToolExecutor<ToolInvocation> for ViewImageHandler {
         true
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> dex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> dex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
@@ -92,7 +97,8 @@ impl ViewImageHandler {
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         if !invocation
-            .turn
+            .step_context
+            .settings
             .model_info
             .input_modalities
             .contains(&InputModality::Image)
@@ -103,6 +109,7 @@ impl ViewImageHandler {
         }
 
         let ToolInvocation {
+            environments,
             session,
             turn,
             step_context,
@@ -120,11 +127,7 @@ impl ViewImageHandler {
             }
         };
 
-        let ViewImageArgs {
-            path,
-            environment_id,
-            detail,
-        } = parse_arguments(&arguments)?;
+        let ViewImageArgs { path, detail } = parse_arguments(&arguments)?;
         // Keep accepting previously supported detail hints after they disappear from the schema.
         let detail = match detail.as_deref() {
             None => None,
@@ -137,13 +140,7 @@ impl ViewImageHandler {
             }
         };
 
-        let Some(turn_environment) =
-            resolve_tool_environment(&step_context.environments, environment_id.as_deref())?
-        else {
-            return Err(FunctionCallError::RespondToModel(
-                "view_image is unavailable in this session".to_string(),
-            ));
-        };
+        let turn_environment = selected_executor(&environments, &step_context.environments)?;
         let path_uri = turn_environment.cwd().join(&path).map_err(|err| {
             FunctionCallError::RespondToModel(format!(
                 "unable to resolve image path `{path}` against environment cwd `{}`: {err}",
@@ -151,8 +148,7 @@ impl ViewImageHandler {
             ))
         })?;
         let model_visible_path = path_uri.inferred_native_path_string();
-        let sandbox = turn
-            .file_system_sandbox_context(/*additional_permissions*/ None, turn_environment);
+        let sandbox = turn_environment.sandbox_context(/*additional_permissions*/ None);
         let fs = turn_environment.environment.get_filesystem();
 
         let metadata = fs
@@ -183,7 +179,8 @@ impl ViewImageHandler {
             FunctionCallError::RespondToModel(VIEW_IMAGE_INVALID_MESSAGE.to_string())
         })?;
 
-        let can_request_original_detail = can_request_original_image_detail(&turn.model_info);
+        let can_request_original_detail =
+            can_request_original_image_detail(&step_context.settings.model_info);
         let use_original_detail = self.options.unified_image_budget
             || can_request_original_detail && matches!(detail, Some(ViewImageDetail::Original));
         let image_detail = if use_original_detail {
@@ -211,6 +208,13 @@ impl ViewImageHandler {
 }
 
 impl CoreToolRuntime for ViewImageHandler {
+    fn environments_for_input(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> Result<ToolEnvironments, FunctionCallError> {
+        function_tool_environment(invocation, |args: ToolEnvironmentArgs| args.environment_id)
+    }
+
     fn is_builtin_control_tool(&self) -> bool {
         true
     }
@@ -234,7 +238,9 @@ impl ToolOutput for ViewImageOutput {
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
         let body =
             FunctionCallOutputBody::ContentItems(vec![FunctionCallOutputContentItem::InputImage {
-                image_url: self.image_url.clone(),
+                image: ImageReference::Inline {
+                    image_url: self.image_url.clone(),
+                },
                 detail: Some(self.image_detail),
             }]);
         let output = FunctionCallOutputPayload {
@@ -273,6 +279,10 @@ mod tests {
     use crate::turn_diff_tracker::TurnDiffTracker;
     use core_test_support::TempDirExt;
     use dex_protocol::models::PermissionProfile;
+    use dex_protocol::permissions::FileSystemAccessMode;
+    use dex_protocol::permissions::FileSystemSandboxEntry;
+    use dex_protocol::permissions::FileSystemSandboxPolicy;
+    use dex_protocol::permissions::NetworkSandboxPolicy;
     use dex_utils_absolute_path::AbsolutePathBuf;
     use dex_utils_path_uri::PathUri;
     use image::ImageBuffer;
@@ -285,21 +295,23 @@ mod tests {
     use tokio::sync::Mutex;
 
     fn replace_primary_environment_cwd(turn: &mut crate::TurnContext, cwd: AbsolutePathBuf) {
-        let current = turn
-            .environments
+        let mut current = turn
+            .initial_environments
             .turn_environments()
             .next()
             .cloned()
             .expect("default local turn environment");
+        current.config_mut().workspace_roots.clear();
         let mut selection = current.selection;
         selection.cwd = PathUri::from_abs_path(&cwd);
         selection.workspace_roots.clear();
-        turn.environments.environments[0] = TurnEnvironmentState::Ready(TurnEnvironment::new(
-            selection,
-            current.config_origin,
-            current.environment,
-            current.shell,
-        ));
+        turn.initial_environments.environments[0] =
+            TurnEnvironmentState::Ready(TurnEnvironment::new(
+                selection,
+                current.config_origin,
+                current.environment,
+                current.shell,
+            ));
     }
 
     fn tiny_png() -> Vec<u8> {
@@ -360,12 +372,19 @@ mod tests {
             .permissions
             .set_permission_profile(PermissionProfile::Disabled)
             .expect("set thread permission profile");
-        let TurnEnvironmentState::Ready(environment) = &mut turn.environments.environments[0]
+        let TurnEnvironmentState::Ready(environment) =
+            &mut turn.initial_environments.environments[0]
         else {
             panic!("primary environment should be ready");
         };
         environment.config_mut().permission_profile =
-            PermissionProfileSnapshot::legacy(PermissionProfile::read_only());
+            PermissionProfileSnapshot::legacy(PermissionProfile::from_runtime_permissions(
+                &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry::new(
+                    image_cwd.into(),
+                    FileSystemAccessMode::Read,
+                )]),
+                NetworkSandboxPolicy::Restricted,
+            ));
         let turn = Arc::new(turn);
 
         let result = ViewImageHandler::default()
@@ -378,6 +397,8 @@ mod tests {
                 call_id: "call-view-image".to_string(),
                 tool_name: dex_tools::ToolName::plain("view_image"),
                 source: ToolCallSource::Direct,
+                native_call: None,
+                environments: Default::default(),
                 payload: ToolPayload::Function {
                     arguments: json!({ "path": "image.png" }).to_string(),
                 },
@@ -408,6 +429,8 @@ mod tests {
                 call_id: "call-view-image".to_string(),
                 tool_name: dex_tools::ToolName::plain("view_image"),
                 source: ToolCallSource::Direct,
+                native_call: None,
+                environments: Default::default(),
                 payload: ToolPayload::Function {
                     arguments: json!({ "path": "image.png", "detail": "low" }).to_string(),
                 },
@@ -432,7 +455,8 @@ mod tests {
         replace_primary_environment_cwd(&mut turn, image_cwd.clone());
         let image_path = image_cwd.join("image.png");
         std::fs::write(image_path.as_path(), tiny_png()).expect("write test image");
-        let TurnEnvironmentState::Ready(environment) = &mut turn.environments.environments[0]
+        let TurnEnvironmentState::Ready(environment) =
+            &mut turn.initial_environments.environments[0]
         else {
             panic!("primary environment should be ready");
         };
@@ -450,6 +474,8 @@ mod tests {
                 call_id: "call-view-image".to_string(),
                 tool_name: dex_tools::ToolName::plain("view_image"),
                 source: ToolCallSource::Direct,
+                native_call: None,
+                environments: Default::default(),
                 payload: ToolPayload::Function {
                     arguments: json!({ "path": "image.png", "detail": "high" }).to_string(),
                 },
@@ -469,7 +495,8 @@ mod tests {
         let image_path = image_cwd.join("not-an-image.txt");
         std::fs::write(image_path.as_path(), b"arbitrary file contents")
             .expect("write invalid image");
-        let TurnEnvironmentState::Ready(environment) = &mut turn.environments.environments[0]
+        let TurnEnvironmentState::Ready(environment) =
+            &mut turn.initial_environments.environments[0]
         else {
             panic!("primary environment should be ready");
         };
@@ -490,6 +517,8 @@ mod tests {
                     cell_id: "cell-1".to_string(),
                     runtime_tool_call_id: "tool-1".to_string(),
                 },
+                native_call: None,
+                environments: Default::default(),
                 payload: ToolPayload::Function {
                     arguments: json!({ "path": "not-an-image.txt" }).to_string(),
                 },

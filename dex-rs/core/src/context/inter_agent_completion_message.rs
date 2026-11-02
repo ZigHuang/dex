@@ -1,6 +1,9 @@
 use dex_protocol::AgentPath;
 
 use super::ContextualUserFragment;
+use dex_protocol::models::ContentItem;
+use dex_protocol::models::ContentItemKind;
+use dex_protocol::models::input_text;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InterAgentCompletionMessage {
@@ -20,6 +23,10 @@ impl InterAgentCompletionMessage {
 }
 
 impl ContextualUserFragment for InterAgentCompletionMessage {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("multi_agent.inter_agent_completion_message".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "assistant"
     }
@@ -32,10 +39,10 @@ impl ContextualUserFragment for InterAgentCompletionMessage {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        format!(
+    fn body(&self) -> ContentItem {
+        input_text(format!(
             "Message Type: FINAL_ANSWER\nTask name: {}\nSender: {}\nPayload:\n{}",
             self.task_name, self.sender, self.payload,
-        )
+        ))
     }
 }

@@ -1,5 +1,6 @@
 use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeReminder;
+use crate::context::CurrentTimeUnavailable;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -8,6 +9,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use dex_features::Feature;
 use dex_protocol::models::ResponseInputItem;
 use dex_tools::JsonSchema;
 use dex_tools::ResponsesApiNamespace;
@@ -26,7 +28,7 @@ struct CurrentTimeOutput(CurrentTimeReminder);
 
 impl ToolOutput for CurrentTimeOutput {
     fn log_output(&self) -> String {
-        self.0.body()
+        self.0.body().into_text().unwrap_or_default()
     }
 
     fn success_for_logging(&self) -> bool {
@@ -34,7 +36,8 @@ impl ToolOutput for CurrentTimeOutput {
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
-        FunctionToolOutput::from_text(self.0.body(), Some(true)).to_response_item(call_id, payload)
+        FunctionToolOutput::from_content(vec![self.0.body().into()], Some(true))
+            .to_response_item(call_id, payload)
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
@@ -49,6 +52,10 @@ pub struct CurrentTimeHandler;
 impl ToolExecutor<ToolInvocation> for CurrentTimeHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::namespaced(NAMESPACE, TOOL_NAME)
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
     }
 
     fn spec(&self) -> ToolSpec {
@@ -75,12 +82,15 @@ impl ToolExecutor<ToolInvocation> for CurrentTimeHandler {
                     },
                     "required": ["current_time"],
                     "additionalProperties": false
-                })),
+                }).into()),
             })],
         })
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> dex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> dex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             if !matches!(invocation.payload, ToolPayload::Function { .. }) {
                 return Err(FunctionCallError::RespondToModel(format!(
@@ -95,7 +105,21 @@ impl ToolExecutor<ToolInvocation> for CurrentTimeHandler {
                 .current_time(invocation.session.thread_id)
                 .await
                 .map_err(|err| {
-                    FunctionCallError::Fatal(format!("failed to read current time: {err:#}"))
+                    if invocation
+                        .turn
+                        .config
+                        .features
+                        .enabled(Feature::NonfatalClockReadErrors)
+                    {
+                        tracing::error!(
+                            thread_id = %invocation.session.thread_id,
+                            turn_id = %invocation.turn.sub_id,
+                            "failed to read current time for the clock tool; the clock provider may be stalled"
+                        );
+                        FunctionCallError::RespondToModel(CurrentTimeUnavailable::MESSAGE.to_string())
+                    } else {
+                        FunctionCallError::Fatal(format!("failed to read current time: {err:#}"))
+                    }
                 })?;
             Ok(boxed_tool_output(CurrentTimeOutput(
                 CurrentTimeReminder::new(current_time),
@@ -104,4 +128,8 @@ impl ToolExecutor<ToolInvocation> for CurrentTimeHandler {
     }
 }
 
-impl CoreToolRuntime for CurrentTimeHandler {}
+impl CoreToolRuntime for CurrentTimeHandler {
+    fn is_builtin_control_tool(&self) -> bool {
+        true
+    }
+}

@@ -9,7 +9,7 @@ workspace = true
 
 [dependencies]
 dex-protocol = { workspace = true }
-dex-utils-absolute-path = { workspace = true }
+dex-utils-path-uri = { workspace = true }
 
 [dev-dependencies]
 dex-utils-absolute-path = { workspace = true }

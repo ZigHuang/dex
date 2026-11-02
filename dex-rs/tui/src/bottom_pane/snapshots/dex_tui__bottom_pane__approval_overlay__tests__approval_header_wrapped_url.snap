@@ -1,0 +1,9 @@
+---
+source: tui/src/bottom_pane/approval_overlay.rs
+expression: visible
+---
+Reason:
+https://github.com/openai/dex/pu
+ll/12345?diff=split
+
+$ echo hi

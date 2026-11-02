@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use dex_core::config::Config;
+use dex_core::context::ContextualUserFragment;
+use dex_core::context::MemoryContextFragment;
 use dex_extension_api::ConfigContributor;
+use dex_extension_api::ContentItemKind;
 use dex_extension_api::ContextContributor;
 use dex_extension_api::ExtensionData;
 use dex_extension_api::ExtensionFuture;
@@ -12,6 +15,7 @@ use dex_extension_api::ThreadStartInput;
 use dex_extension_api::ToolContributor;
 use dex_features::Feature;
 use dex_otel::MetricsClient;
+use dex_protocol::MemoryVersion;
 use dex_utils_absolute_path::AbsolutePathBuf;
 
 use crate::local::LocalMemoriesBackend;
@@ -35,6 +39,7 @@ pub(crate) struct MemoriesExtensionConfig {
     pub(crate) enabled: bool,
     pub(crate) dedicated_tools: bool,
     pub(crate) dex_home: AbsolutePathBuf,
+    pub(crate) version: MemoryVersion,
 }
 
 impl MemoriesExtensionConfig {
@@ -43,6 +48,7 @@ impl MemoriesExtensionConfig {
             enabled: config.features.enabled(Feature::MemoryTool) && config.memories.use_memories,
             dedicated_tools: config.memories.dedicated_tools,
             dex_home: config.dex_home.clone(),
+            version: config.memories.version,
         }
     }
 }
@@ -61,10 +67,38 @@ impl ContextContributor for MemoriesExtension {
                 return Vec::new();
             }
 
-            build_memory_tool_developer_instructions(&config.dex_home)
-                .await
-                .map(PromptFragment::developer_policy)
+            let Some(instructions) =
+                build_memory_tool_developer_instructions(&config.dex_home, config.version).await
+            else {
+                return Vec::new();
+            };
+            let instructions = match config.version {
+                MemoryVersion::V1 => vec![instructions],
+                MemoryVersion::V2 => {
+                    // Keep the complete summary while respecting each fragment's byte cap.
+                    let mut remaining = instructions.as_str();
+                    let mut fragments = Vec::new();
+                    while !remaining.is_empty() {
+                        let end = remaining.floor_char_boundary(remaining.len().min(8_900));
+                        fragments.push(
+                            MemoryContextFragment::ReadInstructions(remaining[..end].to_string())
+                                .render()
+                                .into_text()
+                                .unwrap_or_default(),
+                        );
+                        remaining = &remaining[end..];
+                    }
+                    fragments
+                }
+            };
+            instructions
                 .into_iter()
+                .map(|instructions| {
+                    PromptFragment::developer_policy(
+                        instructions,
+                        ContentItemKind(MemoryContextFragment::READ_INSTRUCTIONS_KIND.to_string()),
+                    )
+                })
                 .collect()
         })
     }
@@ -91,7 +125,12 @@ impl ConfigContributor<Config> for MemoriesExtension {
         _previous_config: &Config,
         new_config: &Config,
     ) {
-        thread_store.insert(MemoriesExtensionConfig::from_config(new_config));
+        let mut config = MemoriesExtensionConfig::from_config(new_config);
+        if let Some(previous) = thread_store.get::<MemoriesExtensionConfig>() {
+            // The initial summary and retrieval tools must use the same namespace.
+            config.version = previous.version;
+        }
+        thread_store.insert(config);
     }
 }
 
@@ -100,7 +139,8 @@ impl ToolContributor for MemoriesExtension {
         &self,
         _session_store: &ExtensionData,
         thread_store: &ExtensionData,
-    ) -> Vec<Arc<dyn dex_extension_api::ToolExecutor<dex_extension_api::ToolCall>>> {
+    ) -> Vec<Arc<dyn for<'call> dex_extension_api::ToolExecutor<dex_extension_api::ToolCall<'call>>>>
+    {
         let Some(config) = thread_store.get::<MemoriesExtensionConfig>() else {
             return Vec::new();
         };
@@ -109,7 +149,12 @@ impl ToolContributor for MemoriesExtension {
         }
 
         tools::memory_tools(
-            LocalMemoriesBackend::from_dex_home(&config.dex_home),
+            LocalMemoriesBackend::from_memory_root(
+                config
+                    .dex_home
+                    .join(config.version.directory_name())
+                    .to_path_buf(),
+            ),
             self.metrics_client.clone(),
         )
     }

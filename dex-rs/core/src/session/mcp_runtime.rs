@@ -9,15 +9,16 @@ use super::*;
 use crate::mcp::McpRuntimeProjection;
 use dex_config::McpServerDisabledReason;
 use dex_config::McpServerTransportConfig;
+use dex_file_system::WindowsSandboxSelection;
 use dex_mcp::DEX_APPS_MCP_SERVER_NAME;
 use dex_mcp::ElicitationReviewerHandle;
-use dex_mcp::McpEnvironmentAuthority;
 use dex_mcp::McpServerRegistration;
 use dex_mcp::McpServerSource;
 use dex_mcp::McpStartupPolicy;
 use dex_mcp::PreparedMcpCall;
+use dex_mcp::ToolInfo;
+use dex_otel::auth_storage::AuthStorageOriginator;
 use dex_protocol::capabilities::SelectedCapabilityRoot;
-use dex_protocol::protocol::EnvironmentConfigState;
 use std::collections::HashSet;
 
 pub(super) struct McpDesiredState {
@@ -28,7 +29,7 @@ pub(super) struct McpDesiredState {
     pub(super) session_source: SessionSource,
     pub(super) environments: TurnEnvironmentSnapshot,
     pub(super) local_process_cwd: PathBuf,
-    pub(super) windows_sandbox_level: WindowsSandboxLevel,
+    pub(super) disabled_plugin_ids: Vec<String>,
 }
 
 impl Session {
@@ -36,15 +37,14 @@ impl Session {
         &self,
         current: &SessionConfiguration,
         next: &SessionConfiguration,
-        updates: &SessionSettingsUpdate,
     ) -> bool {
         current.cwd() != next.cwd()
-            || current.approval_policy.value() != next.approval_policy.value()
-            || current.approvals_reviewer != next.approvals_reviewer
+            || current.runtime_workspace_roots != next.runtime_workspace_roots
+            || current.step_settings.approval_policy.value()
+                != next.step_settings.approval_policy.value()
+            || current.step_settings.approvals_reviewer != next.step_settings.approvals_reviewer
             || current.permission_profile() != next.permission_profile()
-            || updates.environments.as_ref().is_some_and(|environments| {
-                environments.environments != self.services.turn_environments.selections()
-            })
+            || current.windows_sandbox_level != next.windows_sandbox_level
     }
 
     /// Waits on this session's refreshed server before tool execution is admitted.
@@ -59,42 +59,40 @@ impl Session {
     /// Captures this session's current MCP client and catalog for one tool call.
     pub(crate) async fn prepare_mcp_call(
         self: &Arc<Self>,
-        server: &str,
-        tool: &str,
+        advertised_tool: &ToolInfo,
     ) -> Option<PreparedMcpCall> {
         self.refresh_mcp_if_dirty().await;
         self.services
             .mcp_runtime
-            .current_binding_for_call(server)
-            .await?
-            .prepare_call(server, tool)
+            .prepare_call(advertised_tool)
+            .await
     }
 
-    pub(super) async fn latest_mcp_desired_state(&self, auth: Option<DexAuth>) -> McpDesiredState {
-        let session_configuration = {
+    pub(super) async fn latest_mcp_desired_state(
+        &self,
+        auth: Option<DexAuth>,
+        environments: TurnEnvironmentSnapshot,
+    ) -> McpDesiredState {
+        let (session_configuration, disabled_plugin_ids) = {
             let state = self.state.lock().await;
-            state.session_configuration.clone()
+            (
+                state.session_configuration.clone(),
+                state.active_disabled_plugin_ids.clone(),
+            )
         };
-        let environments = self.services.turn_environments.snapshot().await;
-        let cwd = environments
-            .primary()
-            .and_then(|environment| environment.cwd().to_abs_path().ok())
-            .unwrap_or_else(|| session_configuration.cwd().clone());
-        let config = self.build_per_turn_config(&session_configuration, cwd);
-        let local_process_cwd = environments
-            .local_environment_cwd()
-            .unwrap_or_else(|| session_configuration.cwd().clone())
-            .to_path_buf();
+        let config =
+            self.build_per_turn_config(&session_configuration, environments.local_selection());
+        let local_process_cwd = config.cwd.to_path_buf();
 
         McpDesiredState {
             config: Arc::new(config),
             auth,
             submit_id: self.next_internal_sub_id(),
-            originator: session_configuration.originator.clone(),
-            session_source: session_configuration.session_source.clone(),
+            originator: session_configuration.originator,
+            session_source: session_configuration.session_source,
             environments,
             local_process_cwd,
-            windows_sandbox_level: session_configuration.windows_sandbox_level,
+            disabled_plugin_ids,
         }
     }
 
@@ -104,15 +102,12 @@ impl Session {
         auth: Option<DexAuth>,
         mcp_projection: McpRuntimeProjection,
         resolved_environments: &TurnEnvironmentSnapshot,
-        mcp_runtime_cwd: PathBuf,
     ) -> anyhow::Result<()> {
-        let cwd = AbsolutePathBuf::from_absolute_path(mcp_runtime_cwd)
-            .unwrap_or_else(|_| session_configuration.cwd().clone());
-        let config = self.build_per_turn_config(session_configuration, cwd);
-        let local_process_cwd = resolved_environments
-            .local_environment_cwd()
-            .unwrap_or_else(|| session_configuration.cwd().clone())
-            .to_path_buf();
+        let config = self.build_per_turn_config(
+            session_configuration,
+            resolved_environments.local_selection(),
+        );
+        let local_process_cwd = config.cwd.to_path_buf();
         let desired = McpDesiredState {
             config: Arc::new(config),
             auth,
@@ -121,7 +116,7 @@ impl Session {
             session_source: session_configuration.session_source.clone(),
             environments: resolved_environments.clone(),
             local_process_cwd,
-            windows_sandbox_level: session_configuration.windows_sandbox_level,
+            disabled_plugin_ids: session_configuration.disabled_plugin_ids.clone(),
         };
         self.publish_mcp_runtime(
             &desired,
@@ -146,9 +141,13 @@ impl Session {
         mut projection: McpRuntimeProjection,
     ) -> BoxFuture<'a, McpRuntimeProjection> {
         Box::pin(async move {
-            if crate::guardian::is_guardian_reviewer_source(
-                &self.state.lock().await.session_configuration.session_source,
-            ) {
+            if self.isolation == dex_extension_api::SessionIsolation::Isolated
+                || self
+                    .services
+                    .mcp_thread_init
+                    .get::<crate::mcp::McpServersDisabled>()
+                    .is_some()
+            {
                 return projection;
             }
 
@@ -161,10 +160,22 @@ impl Session {
                 }
 
                 let environment_id = &selected.selection.environment_id;
-                let servers = match environment
+                let discovery = environment
                     .discover_http_mcp_servers(selected.cwd().clone())
-                    .await
-                {
+                    .await;
+                let outcome = if discovery.is_ok() {
+                    "success"
+                } else {
+                    "error"
+                };
+                // Count completed discovery attempts, including refreshes, before host policy
+                // or MCP startup determines whether the server's tools become available.
+                self.services.session_telemetry.counter(
+                    "dex.mcp.executor_discovery",
+                    /*inc*/ 1,
+                    &[("outcome", outcome)],
+                );
+                let servers = match discovery {
                     Ok(servers) => servers,
                     Err(error) => {
                         tracing::warn!(
@@ -176,6 +187,16 @@ impl Session {
                     }
                 };
                 for (name, mut server) in servers {
+                    let outcome = if server.enabled {
+                        "found"
+                    } else {
+                        "unavailable"
+                    };
+                    self.services.session_telemetry.counter(
+                        "dex.mcp.executor_discovery.server",
+                        /*inc*/ 1,
+                        &[("server_name", name.as_str()), ("outcome", outcome)],
+                    );
                     if name == DEX_APPS_MCP_SERVER_NAME
                         || !server.is_local_environment()
                         || projection
@@ -233,40 +254,16 @@ impl Session {
                     registered.insert(name.clone());
                     catalog
                         .get_or_insert_with(|| projection.config.mcp_server_catalog.to_builder())
-                        .register(McpServerRegistration::from_config(name, server));
+                        .register(McpServerRegistration::from_executor_config(name, server));
                 }
             }
 
             if let Some(catalog) = catalog {
-                let selections = self.services.turn_environments.selections();
+                let selections = environments.all_selections();
+                let environment_scope = McpEnvironmentScope::Selected(&selections);
                 projection.config.mcp_server_catalog =
                     catalog.build_with_environment_authority(|environment_id| {
-                        let Some(selection) = selections
-                            .iter()
-                            .find(|selection| selection.environment_id == environment_id)
-                        else {
-                            return if environment_id
-                                == dex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID
-                            {
-                                McpEnvironmentAuthority::Unrestricted
-                            } else {
-                                McpEnvironmentAuthority::SelectedPluginsOnly
-                            };
-                        };
-                        match &selection.config {
-                            EnvironmentConfigState::FromThread => {
-                                McpEnvironmentAuthority::Unrestricted
-                            }
-                            EnvironmentConfigState::Pending | EnvironmentConfigState::Failed(_) => {
-                                McpEnvironmentAuthority::Unavailable
-                            }
-                            EnvironmentConfigState::Ready(config) => config
-                                .mcp_policy
-                                .as_ref()
-                                .map_or(McpEnvironmentAuthority::Unrestricted, |policy| {
-                                    McpEnvironmentAuthority::Restricted(policy)
-                                }),
-                        }
+                        environment_scope.authority_for(environment_id)
                     });
             }
             projection
@@ -295,7 +292,9 @@ impl Session {
             ready_selected_capability_roots,
             elicitation_reviewer,
         );
-        self.services.mcp_runtime.replace(input).await;
+        AuthStorageOriginator::from_client_name(&desired.originator)
+            .scope(self.services.mcp_runtime.replace(input))
+            .await;
         self.services.thread_extension_data.insert(selected_plugins);
     }
 
@@ -329,29 +328,40 @@ impl Session {
             .environment_cwds
             .entry(dex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string())
             .or_insert_with(|| PathUri::from_abs_path(&desired.config.cwd));
-        let mcp_config = Arc::new(config);
-        let mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
-        let runtime_context = McpRuntimeContext::new(
-            self.services.turn_environments.environment_manager(),
-            desired.local_process_cwd.clone(),
-        )
-        .with_selected_environments(
-            desired
-                .environments
-                .turn_environments()
-                .map(|environment| {
-                    (
-                        environment.selection.environment_id.clone(),
-                        Arc::clone(&environment.environment),
-                    )
-                })
-                .collect(),
+        config.environment_use_mxc = desired
+            .environments
+            .turn_environments()
+            .map(|environment| {
+                (
+                    environment.selection.environment_id.clone(),
+                    environment.windows_sandbox_selection_for_turn_metadata()
+                        == WindowsSandboxSelection::Mxc,
+                )
+            })
+            .collect();
+        config
+            .environment_use_mxc
+            .entry(dex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string())
+            .or_insert(
+                cfg!(windows)
+                    && desired.config.effective_local_windows_sandbox_type()
+                        == SandboxType::WindowsMxc,
+            );
+        let mcp_servers = effective_mcp_servers(&config, auth.as_ref());
+        config.set_server_permission_profiles(
+            &mcp_servers,
+            desired.environments.turn_environments().map(|environment| {
+                (
+                    environment.selection.environment_id.clone(),
+                    environment.permission_profile_with_workspace_roots(),
+                )
+            }),
         );
-        let dex_apps_auth_manager =
-            dex_mcp::host_owned_dex_apps_enabled(&mcp_config, auth.as_ref())
-                .then(|| Arc::clone(&self.services.auth_manager));
-
+        let mcp_config = Arc::new(config);
+        let runtime_context =
+            self.mcp_runtime_context(&desired.environments, &desired.local_process_cwd);
         McpRuntimeInput {
+            network_policy_metadata: None,
             startup_policy: if matches!(desired.session_source, SessionSource::SubAgent(_)) {
                 McpStartupPolicy::LazyWhenCached
             } else {
@@ -370,7 +380,7 @@ impl Session {
             dex_apps_tools_cache_key: connector_runtime_context_key(auth.as_ref()),
             client_mcp_extensions: self.services.client_mcp_extensions.for_mcp_servers(),
             auth,
-            dex_apps_auth_manager,
+            auth_manager: Some(Arc::clone(&self.services.auth_manager)),
             elicitation_reviewer,
             elicitation_lifecycle: Some(self.mcp_elicitation_lifecycle()),
         }

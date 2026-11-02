@@ -15,19 +15,22 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 dex-apply-patch = { workspace = true }
+dex-async-utils = { workspace = true }
 dex-exec-server = { workspace = true }
 dex-install-context = { workspace = true }
 dex-linux-sandbox = { workspace = true }
 dex-sandboxing = { workspace = true }
-dex-shell-escalation = { workspace = true }
 dex-utils-absolute-path = { workspace = true }
 dex-utils-home-dir = { workspace = true }
+dex-utils-pty = { workspace = true }
 dotenvy = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [target.'cfg(windows)'.dependencies]
 dex-windows-sandbox = { workspace = true }
+pathdiff = { workspace = true }
 
 [dev-dependencies]
+dex-utils-cargo-bin = { workspace = true }
 pretty_assertions = { workspace = true }

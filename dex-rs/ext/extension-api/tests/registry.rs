@@ -5,8 +5,10 @@ use std::sync::Mutex;
 
 use dex_extension_api::ApprovalReviewContributor;
 use dex_extension_api::ConfigContributor;
+use dex_extension_api::ContentItemKind;
 use dex_extension_api::ContextContributor;
 use dex_extension_api::ContextualUserFragment;
+use dex_extension_api::ConversationHistorySnapshot;
 use dex_extension_api::ExtensionData;
 use dex_extension_api::ExtensionDataInit;
 use dex_extension_api::ExtensionEventSink;
@@ -16,7 +18,7 @@ use dex_extension_api::ExtensionRegistryBuilder;
 use dex_extension_api::ExtensionWarning;
 use dex_extension_api::McpServerContributionContext;
 use dex_extension_api::PromptFragment;
-use dex_extension_api::PromptSlot;
+use dex_extension_api::ResponseItem;
 use dex_extension_api::SkillInvocationContributor;
 use dex_extension_api::ThreadLifecycleContributor;
 use dex_extension_api::TokenUsageContributor;
@@ -29,15 +31,17 @@ use dex_extension_api::TurnInputContext;
 use dex_extension_api::TurnInputContributor;
 use dex_extension_api::TurnItemContributor;
 use dex_extension_api::TurnLifecycleContributor;
-use dex_extension_api::empty_extension_registry;
 use dex_protocol::items::HookPromptItem;
 use dex_protocol::items::TurnItem;
+use dex_protocol::protocol::EnvironmentConfigState;
 use dex_protocol::protocol::Event;
 use dex_protocol::protocol::EventMsg;
-use dex_protocol::protocol::ReviewDecision;
 use dex_protocol::protocol::SessionSource;
 use dex_protocol::protocol::SubAgentSource;
+use dex_protocol::protocol::TurnEnvironmentRequest;
+use dex_protocol::protocol::TurnEnvironmentSelection;
 use dex_protocol::protocol::WarningEvent;
+use dex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 
 struct AllContributors;
@@ -56,6 +60,7 @@ fn mcp_contribution_context_identifies_the_running_thread() {
         "dex_work_cca",
         &[],
         /*executor_capability_discovery*/ None,
+        /*executor_capability_discovery_v2*/ None,
     )
     .with_session_source(&session_source);
 
@@ -63,6 +68,45 @@ fn mcp_contribution_context_identifies_the_running_thread() {
     assert_eq!(
         McpServerContributionContext::global(&config).session_source(),
         None
+    );
+}
+
+#[test]
+fn mcp_context_preserves_selected_executor_order_and_unavailability() {
+    let config = ();
+    let environments = vec![
+        TurnEnvironmentSelection::new(
+            TurnEnvironmentRequest {
+                environment_id: "starting-primary".to_owned(),
+                cwd: PathUri::parse("file:///workspace").expect("workspace URI"),
+                workspace_roots: Vec::new(),
+                config: EnvironmentConfigState::Pending,
+            },
+            &[],
+        ),
+        TurnEnvironmentSelection::new(
+            TurnEnvironmentRequest {
+                environment_id: "ready-secondary".to_owned(),
+                cwd: PathUri::parse("file:///other").expect("workspace URI"),
+                workspace_roots: Vec::new(),
+                config: EnvironmentConfigState::FromThread,
+            },
+            &[],
+        ),
+    ];
+    let context = McpServerContributionContext::global(&config);
+    assert_eq!(context.selected_environments(), None);
+    assert_eq!(
+        context
+            .with_selected_environments(&[])
+            .selected_environments(),
+        Some([].as_slice())
+    );
+    assert_eq!(
+        context
+            .with_selected_environments(&environments)
+            .selected_environments(),
+        Some(environments.as_slice())
     );
 }
 
@@ -86,10 +130,36 @@ impl TokenUsageContributor for AllContributors {}
 
 impl SkillInvocationContributor for AllContributors {}
 
+struct ExecutorOnlySkillContributor;
+
+impl SkillInvocationContributor for ExecutorOnlySkillContributor {
+    fn requires_host_skill_discovery(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn host_skill_discovery_preserves_legacy_and_host_contributor_behavior() {
+    assert!(
+        ExtensionRegistryBuilder::<()>::new()
+            .build()
+            .requires_host_skill_discovery()
+    );
+
+    let mut executor_only = ExtensionRegistryBuilder::<()>::new();
+    executor_only.skill_invocation_contributor(Arc::new(ExecutorOnlySkillContributor));
+    assert!(!executor_only.build().requires_host_skill_discovery());
+
+    let mut mixed = ExtensionRegistryBuilder::<()>::new();
+    mixed.skill_invocation_contributor(Arc::new(ExecutorOnlySkillContributor));
+    mixed.skill_invocation_contributor(Arc::new(AllContributors));
+    assert!(mixed.build().requires_host_skill_discovery());
+}
+
 impl TurnInputContributor for AllContributors {
     fn contribute<'a>(
         &'a self,
-        input: TurnInputContext,
+        input: TurnInputContext<'a>,
         _extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
         _session_store: &'a ExtensionData,
         _thread_store: &'a ExtensionData,
@@ -108,7 +178,7 @@ impl ToolContributor for AllContributors {
         &self,
         _session_store: &ExtensionData,
         _thread_store: &ExtensionData,
-    ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
         Vec::new()
     }
 }
@@ -130,17 +200,23 @@ impl TurnItemContributor for AllContributors {
 }
 
 impl ApprovalReviewContributor for AllContributors {
-    fn contribute<'a>(
+    fn decide<'a>(
         &'a self,
-        _session_store: &'a ExtensionData,
-        _thread_store: &'a ExtensionData,
-        _prompt: &'a str,
-        _extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
-    ) -> ExtensionFuture<'a, Option<ReviewDecision>> {
-        Box::pin(async move {
-            let _self = self;
-            Some(ReviewDecision::ApprovedForSession)
-        })
+        _input: &'a dex_extension_api::ApprovalDecisionInput<'_>,
+    ) -> ExtensionFuture<'a, Option<dex_extension_api::ApprovalDecision>> {
+        Box::pin(async { Some(dex_extension_api::ApprovalDecision::AskUser) })
+    }
+}
+
+impl dex_extension_api::SynchronousApprovalReviewer for AllContributors {
+    fn review<'a>(
+        &'a self,
+        _reason: dex_protocol::approvals::GuardianReviewReason,
+        _async_approval: Option<dex_extension_api::ExtensionFuture<'a, ()>>,
+    ) -> ExtensionFuture<'a, Option<dex_protocol::protocol::ReviewDecision>> {
+        Box::pin(std::future::ready(Some(
+            dex_protocol::protocol::ReviewDecision::Approved,
+        )))
     }
 }
 
@@ -171,17 +247,42 @@ async fn build_round_trips_every_contributor_category() {
     assert_eq!(registry.tool_contributors().len(), 1);
     assert_eq!(registry.tool_lifecycle_contributors().len(), 1);
     assert_eq!(registry.turn_item_contributors().len(), 1);
+    let thread_store = ExtensionData::new("thread");
+    let input = dex_extension_api::ApprovalDecisionInput {
+        serving_assessment: None,
+        permissions: Some(&Default::default()),
+        approval_id: "approval-1",
+        tool_call_id: None,
+        action: &serde_json::Value::Null,
+        thread_id: dex_protocol::ThreadId::new(),
+        thread_store: &thread_store,
+        category: dex_protocol::openai_models::GuardianScope::Shell,
+        approval_policy: dex_protocol::protocol::AskForApproval::OnRequest,
+        approvals_reviewer: dex_protocol::config_types::ApprovalsReviewer::AutoReview,
+        require_guardian: false,
+        require_fresh_review: false,
+        full_access: false,
+        metrics: None,
+        synchronous_reviewer: &AllContributors,
+    };
     assert_eq!(
-        registry
-            .approval_review(
-                &ExtensionData::new("session"),
-                &ExtensionData::new("thread"),
-                "review this",
-                /*extension_metrics*/ None,
-            )
-            .await,
-        Some(ReviewDecision::ApprovedForSession)
+        registry.decide_approval(&input).await,
+        Some(dex_extension_api::ApprovalDecision::AskUser)
     );
+}
+
+impl ConversationHistorySnapshot for AllContributors {
+    fn history_version(&self) -> u64 {
+        0
+    }
+
+    fn user_message_revision(&self) -> u64 {
+        0
+    }
+
+    fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
+        Box::new(std::iter::empty())
+    }
 }
 
 struct NamedContextContributor(&'static str);
@@ -194,6 +295,7 @@ impl ContextContributor for NamedContextContributor {
     ) -> ExtensionFuture<'a, Vec<PromptFragment>> {
         Box::pin(std::future::ready(vec![PromptFragment::developer_policy(
             self.0,
+            ContentItemKind("test.thread_context".to_string()),
         )]))
     }
 }
@@ -205,10 +307,12 @@ impl ContextContributor for NamedTurnContextContributor {
         &'a self,
         _input: TurnContextContributionInput<'a>,
     ) -> ExtensionFuture<'a, Vec<PromptFragment>> {
-        Box::pin(std::future::ready(vec![PromptFragment::new(
-            PromptSlot::ContextualUser,
-            self.0,
-        )]))
+        Box::pin(std::future::ready(vec![
+            PromptFragment::developer_capability(
+                self.0,
+                ContentItemKind("test.turn_context".to_string()),
+            ),
+        ]))
     }
 }
 
@@ -289,10 +393,22 @@ async fn contributors_preserve_registration_order() {
     assert_eq!(
         fragments,
         vec![
-            PromptFragment::developer_policy("first"),
-            PromptFragment::developer_policy("second"),
-            PromptFragment::new(PromptSlot::ContextualUser, "turn-first"),
-            PromptFragment::new(PromptSlot::ContextualUser, "turn-second"),
+            PromptFragment::developer_policy(
+                "first",
+                ContentItemKind("test.thread_context".to_string()),
+            ),
+            PromptFragment::developer_policy(
+                "second",
+                ContentItemKind("test.thread_context".to_string()),
+            ),
+            PromptFragment::developer_capability(
+                "turn-first",
+                ContentItemKind("test.turn_context".to_string()),
+            ),
+            PromptFragment::developer_capability(
+                "turn-second",
+                ContentItemKind("test.turn_context".to_string()),
+            ),
         ]
     );
     assert_eq!(
@@ -301,92 +417,6 @@ async fn contributors_preserve_registration_order() {
             .expect("turn item calls lock")
             .as_slice(),
         ["first", "second"]
-    );
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct ApprovalCall {
-    contributor: &'static str,
-    session_id: String,
-    thread_id: String,
-    prompt: String,
-}
-
-struct RecordingApprovalContributor {
-    name: &'static str,
-    decision: Option<ReviewDecision>,
-    calls: Arc<Mutex<Vec<ApprovalCall>>>,
-}
-
-impl ApprovalReviewContributor for RecordingApprovalContributor {
-    fn contribute<'a>(
-        &'a self,
-        session_store: &'a ExtensionData,
-        thread_store: &'a ExtensionData,
-        prompt: &'a str,
-        _extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
-    ) -> ExtensionFuture<'a, Option<ReviewDecision>> {
-        Box::pin(async move {
-            self.calls
-                .lock()
-                .expect("approval calls lock should not be poisoned")
-                .push(ApprovalCall {
-                    contributor: self.name,
-                    session_id: session_store.level_id().to_string(),
-                    thread_id: thread_store.level_id().to_string(),
-                    prompt: prompt.to_string(),
-                });
-            self.decision.clone()
-        })
-    }
-}
-
-#[tokio::test]
-async fn approval_review_returns_first_claim_and_short_circuits() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let mut builder = ExtensionRegistryBuilder::<()>::new();
-    for (name, decision) in [
-        ("first", None),
-        ("second", Some(ReviewDecision::Approved)),
-        (
-            "third",
-            Some(ReviewDecision::denied("rejected by extension")),
-        ),
-    ] {
-        builder.approval_review_contributor(Arc::new(RecordingApprovalContributor {
-            name,
-            decision,
-            calls: Arc::clone(&calls),
-        }));
-    }
-    let registry = builder.build();
-
-    let decision = registry
-        .approval_review(
-            &ExtensionData::new("session-1"),
-            &ExtensionData::new("thread-1"),
-            "allow command?",
-            /*extension_metrics*/ None,
-        )
-        .await;
-
-    assert_eq!(decision, Some(ReviewDecision::Approved));
-    assert_eq!(
-        calls.lock().expect("approval calls lock").as_slice(),
-        [
-            ApprovalCall {
-                contributor: "first",
-                session_id: "session-1".to_string(),
-                thread_id: "thread-1".to_string(),
-                prompt: "allow command?".to_string(),
-            },
-            ApprovalCall {
-                contributor: "second",
-                session_id: "session-1".to_string(),
-                thread_id: "thread-1".to_string(),
-                prompt: "allow command?".to_string(),
-            },
-        ]
     );
 }
 
@@ -442,23 +472,6 @@ fn custom_event_sink_survives_registry_build() {
             ("registry".to_string(), "after".to_string()),
             ("thread".to_string(), "warning".to_string()),
         ]
-    );
-}
-
-#[tokio::test]
-async fn empty_registry_does_not_claim_approval_review() {
-    let registry = empty_extension_registry::<()>();
-
-    assert_eq!(
-        registry
-            .approval_review(
-                &ExtensionData::new("session"),
-                &ExtensionData::new("thread"),
-                "unclaimed",
-                /*extension_metrics*/ None,
-            )
-            .await,
-        None
     );
 }
 

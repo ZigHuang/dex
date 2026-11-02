@@ -1,4 +1,6 @@
 use super::*;
+use crate::session::tests::make_session_and_context_with_rx;
+use crate::session::tests::test_environment_id;
 use dex_models_manager::model_info::model_info_from_slug;
 use dex_protocol::approvals::NetworkPolicyAmendment;
 use pretty_assertions::assert_eq;
@@ -13,6 +15,7 @@ fn approval_resolution_rejects_denied_network_policy_amendment() {
             },
         },
         source: ApprovalResolutionSource::User,
+        cancellation_reason: None,
     };
 
     assert!(matches!(
@@ -26,6 +29,7 @@ fn approval_resolution_rejects_mcp_policy_amendment() {
     let resolution = ApprovalResolution {
         decision: ReviewDecision::ApprovedMcpPolicyAmendment,
         source: ApprovalResolutionSource::User,
+        cancellation_reason: None,
     };
 
     assert!(matches!(
@@ -39,6 +43,7 @@ fn approval_resolution_aborts_turn_when_approval_is_aborted() {
     let resolution = ApprovalResolution {
         decision: ReviewDecision::Abort,
         source: ApprovalResolutionSource::User,
+        cancellation_reason: None,
     };
 
     assert!(matches!(
@@ -66,6 +71,7 @@ fn approval_resolution_uses_acting_model_timeout_instructions() {
         let resolution = ApprovalResolution {
             decision: ReviewDecision::TimedOut,
             source: ApprovalResolutionSource::Guardian,
+            cancellation_reason: None,
         };
 
         assert!(matches!(
@@ -75,22 +81,224 @@ fn approval_resolution_uses_acting_model_timeout_instructions() {
     }
 }
 
-#[test]
-fn guardian_cwd_preserves_drive_shaped_local_posix_path() {
-    let native_cwd = AbsolutePathBuf::try_from(std::path::PathBuf::from("/C:/workspace"))
-        .expect("drive-shaped POSIX path should be absolute");
-    let cwd = PathUri::from_abs_path(&native_cwd);
+#[cfg(unix)]
+#[test_case::test_case(ApprovalsReviewer::User, dex_extension_api::ApprovalDecision::AskUser; "manual prompt")]
+#[test_case::test_case(ApprovalsReviewer::AutoReview, dex_extension_api::ApprovalDecision::Allow; "cached allow")]
+#[tokio::test]
+async fn non_utf8_cwd_preserves_approval_routing(
+    reviewer: ApprovalsReviewer,
+    decision: dex_extension_api::ApprovalDecision,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use dex_extension_api::ApprovalDecision;
+    use std::os::unix::ffi::OsStringExt;
 
-    assert_eq!(
-        guardian_cwd(dex_exec_server::LOCAL_ENVIRONMENT_ID, cwd)
-            .expect("local cwd should retain the host path convention"),
-        native_cwd
-    );
+    struct Contributor {
+        cwd: dex_utils_path_uri::LegacyAppPathString,
+        decision: ApprovalDecision,
+    }
+
+    impl dex_extension_api::ApprovalReviewContributor for Contributor {
+        fn decide<'a>(
+            &'a self,
+            input: &'a dex_extension_api::ApprovalDecisionInput<'_>,
+        ) -> dex_extension_api::ExtensionFuture<'a, Option<ApprovalDecision>> {
+            Box::pin(async move {
+                assert_eq!(input.action["cwd"], serde_json::json!(self.cwd));
+                Some(self.decision.clone())
+            })
+        }
+    }
+
+    let cwd = PathUri::from_abs_path(&AbsolutePathBuf::try_from(PathBuf::from(
+        std::ffi::OsString::from_vec(b"/tmp/non-utf8-\xe9".to_vec()),
+    ))?);
+    let (mut session, turn, events) = make_session_and_context_with_rx().await;
+    let mut extensions = dex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.approval_review_contributor(Arc::new(Contributor {
+        cwd: dex_utils_path_uri::LegacyAppPathString::from_path_uri(&cwd, PathConvention::Posix)?,
+        decision,
+    }));
+    Arc::get_mut(&mut session)
+        .context("session is uniquely owned")?
+        .services
+        .extensions = Arc::new(extensions.build());
+    *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+    let mut review_context = GuardianReviewContext::from(&turn);
+    review_context.approval_policy = AskForApproval::OnRequest;
+    review_context.approvals_reviewer = reviewer;
+    let context = ApprovalContext {
+        exec_requirement: None,
+        review_context,
+        cancellation_token: None,
+        call_id: "non-utf8-cwd".to_string(),
+        tool_name: ToolName::plain("exec_command"),
+        strict_auto_review: false,
+        approval_reason: None,
+        retry_reason: None,
+        network_approval_context: None,
+    };
+    let action = ApprovalAction::ExecCommand {
+        id: context.call_id.clone(),
+        environment_id: dex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        command: vec!["npm".to_string(), "install".to_string()],
+        hook_command: "npm install".to_string(),
+        cwd: cwd.clone(),
+        sandbox_permissions: if reviewer == ApprovalsReviewer::User {
+            SandboxPermissions::RequireEscalated
+        } else {
+            SandboxPermissions::UseDefault
+        },
+        additional_permissions: None,
+        justification: None,
+        tty: false,
+        proposed_execpolicy_amendment: None,
+    };
+    let prompt = session.request_user_approval(&action, &context);
+    let approval = session.request_reviewer_approval(&action, &context, prompt);
+    tokio::pin!(approval);
+    let expected = if reviewer == ApprovalsReviewer::User {
+        tokio::select! {
+            resolution = &mut approval => panic!("expected a user prompt, got {resolution:?}"),
+            event = events.recv() => {
+                let dex_protocol::protocol::EventMsg::ExecApprovalRequest(request) =
+                    event.context("receive user prompt")?.msg
+                else {
+                    panic!("expected a command approval prompt");
+                };
+                assert_eq!(request.cwd, dex_utils_path_uri::LegacyAppPathString::from(cwd));
+                assert_eq!(request.command, vec!["npm", "install"]);
+                session.notify_approval(&request.call_id, ReviewDecision::Approved).await;
+            }
+        }
+        ApprovalResolution {
+            decision: ReviewDecision::Approved,
+            source: ApprovalResolutionSource::User,
+            cancellation_reason: None,
+        }
+    } else {
+        ApprovalResolution {
+            decision: ReviewDecision::Approved,
+            source: ApprovalResolutionSource::Guardian,
+            cancellation_reason: None,
+        }
+    };
+    assert_eq!(approval.await, expected);
+    assert!(events.try_recv().is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_mcp_reviewer_override_takes_precedence_over_action_context() {
+    let (session, turn, events) = make_session_and_context_with_rx().await;
+    let action = ApprovalAction::McpToolCall {
+        id: "mcp-override".to_string(),
+        environment_id: test_environment_id(&turn).to_owned(),
+        server: "example".to_string(),
+        tool_name: "dangerous".to_string(),
+        arguments: None,
+        connector_id: None,
+        connector_name: None,
+        connector_description: None,
+        connected_account_email: None,
+        tool_title: None,
+        tool_description: None,
+        annotations: None,
+        hook_tool_name: HookToolName::new("mcp__example__dangerous"),
+        approval_policy: AskForApproval::OnRequest,
+        reviewer: ApprovalsReviewer::User,
+        approval_mode: AppToolApproval::Prompt,
+        allow_session_remember: false,
+        allow_persistent_approval: false,
+    };
+    let mut review_context = GuardianReviewContext::from(&turn);
+    review_context.approval_policy = AskForApproval::OnRequest;
+    review_context.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    let context = ApprovalContext {
+        exec_requirement: None,
+        review_context,
+        cancellation_token: None,
+        call_id: "mcp-override".to_string(),
+        tool_name: ToolName::plain("dangerous"),
+        strict_auto_review: false,
+        approval_reason: None,
+        retry_reason: None,
+        network_approval_context: None,
+    };
+
+    let prompt = session.request_user_approval(&action, &context);
+    tokio::select! {
+        resolution = session.request_reviewer_approval(&action, &context, prompt) => {
+            panic!("expected a user approval request, got {resolution:?}");
+        }
+        event = events.recv() => {
+            let dex_protocol::protocol::EventMsg::ElicitationRequest(request) =
+                event.expect("receive user approval request").msg
+            else {
+                panic!("expected an MCP user approval request");
+            };
+            assert_eq!(request.server_name, "example");
+            assert_eq!(
+                request.id,
+                dex_protocol::mcp::RequestId::String(
+                    "mcp_tool_call_approval_mcp-override".to_string()
+                )
+            );
+        }
+    }
 }
 
 #[test]
-fn guardian_cwd_rejects_foreign_remote_path() {
-    let cwd = PathUri::parse("file:///C:/workspace").expect("valid Windows path URI");
-
-    assert!(guardian_cwd(dex_exec_server::REMOTE_ENVIRONMENT_ID, cwd).is_err());
+fn network_hook_cwd_overrides_only_local_commands() {
+    let local_cwd = AbsolutePathBuf::try_from(std::env::temp_dir()).unwrap();
+    for (environment_id, uri) in [
+        (dex_exec_server::LOCAL_ENVIRONMENT_ID, None),
+        (
+            dex_exec_server::LOCAL_ENVIRONMENT_ID,
+            Some("file:///local/repo"),
+        ),
+        ("remote", None),
+        ("remote", Some("file:///remote/repo")),
+        ("remote", Some("file:///C:/remote/repo")),
+    ] {
+        let expected_cwd = uri.map_or_else(
+            || PathUri::from_abs_path(&local_cwd),
+            |uri| PathUri::parse(uri).unwrap(),
+        );
+        let action = ApprovalAction::NetworkAccess {
+            id: "network-1".into(),
+            turn_id: "turn-1".into(),
+            environment_id: environment_id.into(),
+            target: "https://example.com:443".into(),
+            host: "example.com".into(),
+            protocol: NetworkApprovalProtocol::Https,
+            port: 443,
+            trigger: uri.map(|_| GuardianNetworkAccessTrigger {
+                call_id: "exec-1".into(),
+                tool_name: "exec_command".into(),
+                command: vec!["curl".into(), "https://example.com".into()],
+                cwd: expected_cwd.clone(),
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                additional_permissions: None,
+                justification: None,
+                tty: None,
+            }),
+            hook_command: "curl https://example.com".into(),
+            hook_run_id: "hook-1".into(),
+            command: vec!["network-access".into(), "https://example.com:443".into()],
+            cwd: local_cwd.clone(),
+        };
+        assert_eq!(
+            action.permission_request_payload(),
+            PermissionRequestPayload {
+                tool_name: HookToolName::bash(),
+                tool_input: serde_json::json!({
+                    "command": "curl https://example.com",
+                    "description": "network-access https://example.com:443",
+                }),
+                tool_cwd: (environment_id == dex_exec_server::LOCAL_ENVIRONMENT_ID)
+                    .then_some(expected_cwd),
+            }
+        );
+    }
 }

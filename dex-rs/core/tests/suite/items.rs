@@ -18,7 +18,7 @@ use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_dex::TestDex;
-use core_test_support::test_dex::local_selections;
+use core_test_support::test_dex::local_requests;
 use core_test_support::test_dex::test_dex;
 use core_test_support::test_dex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -26,12 +26,13 @@ use core_test_support::wait_for_event_match;
 use dex_core::TurnInputRequest;
 use dex_features::Feature;
 use dex_history::RolloutItem;
-use dex_history::RolloutLine;
 use dex_protocol::config_types::CollaborationMode;
 use dex_protocol::config_types::ModeKind;
 use dex_protocol::config_types::Settings;
 use dex_protocol::items::AgentMessageContent;
 use dex_protocol::items::TurnItem;
+use dex_protocol::models::ImageDetail;
+use dex_protocol::models::ImageReference;
 use dex_protocol::models::PermissionProfile;
 use dex_protocol::models::WebSearchAction;
 use dex_protocol::protocol::AskForApproval;
@@ -58,7 +59,7 @@ fn disabled_plan_turn(
         text_elements: Vec::new(),
     }])
     .with_thread_settings(ThreadSettingsOverrides {
-        environments: Some(local_selections(cwd)),
+        environments: Some(local_requests(cwd)),
         approval_policy: Some(AskForApproval::Never),
         sandbox_policy: Some(sandbox_policy),
         permission_profile,
@@ -82,12 +83,20 @@ async fn user_message_item_is_emitted() -> anyhow::Result<()> {
         ByteRange { start: 0, end: 6 },
         Some("<file>".into()),
     )];
-    let expected_input = UserInput::Text {
-        text: "please inspect sample.txt".into(),
-        text_elements: text_elements.clone(),
-    };
+    let expected_input = vec![
+        UserInput::Text {
+            text: "please inspect sample.txt".into(),
+            text_elements: text_elements.clone(),
+        },
+        UserInput::Image {
+            image: ImageReference::File {
+                file_id: "file_123".into(),
+            },
+            detail: Some(ImageDetail::High),
+        },
+    ];
 
-    dex.start_or_steer_turn(TurnInputRequest::user_input(vec![expected_input.clone()]))
+    dex.start_or_steer_turn(TurnInputRequest::user_input(expected_input.clone()))
         .await?;
 
     let started_item = wait_for_event_match(&dex, |ev| match ev {
@@ -108,8 +117,8 @@ async fn user_message_item_is_emitted() -> anyhow::Result<()> {
     .await;
 
     assert_eq!(started_item.id, completed_item.id);
-    assert_eq!(started_item.content, vec![expected_input.clone()]);
-    assert_eq!(completed_item.content, vec![expected_input]);
+    assert_eq!(started_item.content, expected_input);
+    assert_eq!(completed_item.content, started_item.content);
 
     let legacy_message = wait_for_event_match(&dex, |ev| match ev {
         EventMsg::UserMessage(event) => Some(event.clone()),
@@ -118,6 +127,12 @@ async fn user_message_item_is_emitted() -> anyhow::Result<()> {
     .await;
     assert_eq!(legacy_message.message, "please inspect sample.txt");
     assert_eq!(legacy_message.text_elements, text_elements);
+    assert_eq!(legacy_message.file_ids, Some(vec!["file_123".into()]));
+    assert_eq!(
+        legacy_message.file_id_details,
+        vec![Some(ImageDetail::High)]
+    );
+
     Ok(())
 }
 
@@ -356,7 +371,7 @@ async fn web_search_item_is_emitted() -> anyhow::Result<()> {
     let rollout = std::fs::read_to_string(rollout_path)?;
     let persisted_completion = rollout
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(dex_rollout::parse_rollout_line)
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .find_map(|line| match line.item {

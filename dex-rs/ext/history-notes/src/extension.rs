@@ -1,10 +1,17 @@
 use std::sync::Arc;
 
+use dex_analytics::AnalyticsEventsClient;
+use dex_analytics::ThreadHintStatus;
+use dex_analytics::ThreadHintStatusEvent;
 use dex_core::config::Config;
 use dex_extension_api::ConfigContributor;
+use dex_extension_api::ContentItemKind;
+use dex_extension_api::ContextContributor;
 use dex_extension_api::ExtensionData;
 use dex_extension_api::ExtensionFuture;
 use dex_extension_api::ExtensionRegistryBuilder;
+use dex_extension_api::PromptFragment;
+use dex_extension_api::PromptSlot;
 use dex_extension_api::ThreadLifecycleContributor;
 use dex_extension_api::ThreadStartInput;
 use dex_extension_api::ToolCall;
@@ -13,10 +20,17 @@ use dex_extension_api::ToolExecutor;
 use dex_login::AuthManager;
 use dex_model_provider::create_model_provider;
 use dex_protocol::AgentPath;
+use dex_protocol::openai_models::HistoryToolMessages;
+use dex_protocol::openai_models::NotesToolMessages;
+use dex_utils_output_truncation::TruncationPolicy;
+use serde_json::json;
 
 use crate::backend::HistoryNotesBackend;
 use crate::tools::HistoryNotesAction;
 use crate::tools::HistoryNotesTool;
+
+// Bound model context even when note paths are unusually long.
+const MAX_THREAD_HINT_BYTES: usize = 4_000;
 
 struct HistoryNotesExtension {
     auth_manager: Arc<AuthManager>,
@@ -40,10 +54,13 @@ impl HistoryNotesExtension {
             && self.auth_manager.current_auth_uses_dex_backend()
         {
             thread_store.insert(HistoryNotesExtensionConfig {
-                backend: HistoryNotesBackend::new(create_model_provider(
-                    config.model_provider.clone(),
-                    Some(self.auth_manager.clone()),
-                )),
+                backend: HistoryNotesBackend::new(
+                    create_model_provider(
+                        config.model_provider.clone(),
+                        Some(self.auth_manager.clone()),
+                    ),
+                    config.http_client_factory(),
+                ),
             });
         } else {
             thread_store.remove::<HistoryNotesExtensionConfig>();
@@ -82,12 +99,103 @@ impl ConfigContributor<Config> for HistoryNotesExtension {
     }
 }
 
+impl ContextContributor for HistoryNotesExtension {
+    fn contribute_thread_context<'a>(
+        &'a self,
+        session_store: &'a ExtensionData,
+        thread_store: &'a ExtensionData,
+    ) -> ExtensionFuture<'a, Vec<PromptFragment>> {
+        Box::pin(async move {
+            let Some(config) = thread_store.get::<HistoryNotesExtensionConfig>() else {
+                return Vec::new();
+            };
+            let Some(identity) = thread_store.get::<HistoryNotesAgentIdentity>() else {
+                return Vec::new();
+            };
+            let track_status = |status| {
+                if let Some(analytics) = session_store.get::<AnalyticsEventsClient>() {
+                    analytics.track_thread_hint_status(ThreadHintStatusEvent {
+                        thread_id: thread_store.level_id().to_string(),
+                        status,
+                        occurred_at_ms: dex_analytics::now_unix_millis(),
+                    });
+                }
+            };
+            let Ok(result) = config
+                .backend
+                .call(
+                    "alpha/notes/v2/thread_hint",
+                    session_store.level_id(),
+                    &identity.agent_name,
+                    json!({}),
+                    TruncationPolicy::Bytes(MAX_THREAD_HINT_BYTES),
+                )
+                .await
+            else {
+                track_status(ThreadHintStatus::Failed);
+                return Vec::new();
+            };
+            let Some(text) = result.get("text").and_then(serde_json::Value::as_str) else {
+                track_status(ThreadHintStatus::Failed);
+                return Vec::new();
+            };
+            if text.len() > MAX_THREAD_HINT_BYTES {
+                track_status(ThreadHintStatus::Failed);
+                return Vec::new();
+            }
+            track_status(ThreadHintStatus::Succeeded);
+            if text.is_empty() {
+                return Vec::new();
+            }
+            vec![PromptFragment::tool(
+                PromptSlot::ContextWindow,
+                text,
+                ContentItemKind("notes.thread_hint".to_string()),
+                "notes".to_string(),
+            )]
+        })
+    }
+}
+
 impl ToolContributor for HistoryNotesExtension {
     fn tools(
         &self,
         session_store: &ExtensionData,
         thread_store: &ExtensionData,
-    ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
+        self.tools_with_messages(
+            session_store,
+            thread_store,
+            /*history_messages*/ None,
+            /*notes_messages*/ None,
+        )
+    }
+
+    fn tools_for_step(
+        &self,
+        session_store: &ExtensionData,
+        thread_store: &ExtensionData,
+        step_store: &ExtensionData,
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
+        let history_messages = step_store.get::<HistoryToolMessages>();
+        let notes_messages = step_store.get::<NotesToolMessages>();
+        self.tools_with_messages(
+            session_store,
+            thread_store,
+            history_messages.as_deref(),
+            notes_messages.as_deref(),
+        )
+    }
+}
+
+impl HistoryNotesExtension {
+    fn tools_with_messages(
+        &self,
+        session_store: &ExtensionData,
+        thread_store: &ExtensionData,
+        history_messages: Option<&HistoryToolMessages>,
+        notes_messages: Option<&NotesToolMessages>,
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
         let Some(config) = thread_store.get::<HistoryNotesExtensionConfig>() else {
             return Vec::new();
         };
@@ -103,7 +211,9 @@ impl ToolContributor for HistoryNotesExtension {
                     config.backend.clone(),
                     session_store.level_id().to_string(),
                     identity.agent_name.clone(),
-                )) as Arc<dyn ToolExecutor<ToolCall>>
+                    history_messages,
+                    notes_messages,
+                )) as Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>
             })
             .collect()
     }
@@ -114,5 +224,6 @@ pub fn install(registry: &mut ExtensionRegistryBuilder<Config>, auth_manager: Ar
     let extension = Arc::new(HistoryNotesExtension { auth_manager });
     registry.thread_lifecycle_contributor(extension.clone());
     registry.config_contributor(extension.clone());
+    registry.prompt_contributor(extension.clone());
     registry.tool_contributor(extension);
 }

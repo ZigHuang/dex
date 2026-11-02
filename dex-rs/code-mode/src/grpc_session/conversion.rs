@@ -1,5 +1,8 @@
+use std::time::Duration;
+
 use dex_code_mode_protocol::CellId;
 use dex_code_mode_protocol::CodeModeNestedToolCall;
+use dex_code_mode_protocol::CodeModeOutputTruncation;
 use dex_code_mode_protocol::CodeModeToolKind;
 use dex_code_mode_protocol::ExecuteRequest;
 use dex_code_mode_protocol::FunctionCallOutputContentItem;
@@ -9,6 +12,19 @@ use dex_code_mode_protocol::ToolDefinition;
 use dex_code_mode_protocol::WaitOutcome;
 use dex_code_mode_protocol::grpc;
 use dex_protocol::ToolName;
+
+pub(super) fn output_budget(
+    mode: CodeModeOutputTruncation,
+    max_output_tokens: Option<usize>,
+) -> Result<Option<u64>, String> {
+    match mode {
+        CodeModeOutputTruncation::Client => Ok(None),
+        CodeModeOutputTruncation::Server => max_output_tokens
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|error| format!("invalid code-mode output token limit: {error}")),
+    }
+}
 
 pub(super) fn execute_request(
     session_id: &str,
@@ -89,6 +105,7 @@ pub(super) fn tool_call(call: grpc::ToolCall) -> Result<CodeModeNestedToolCall, 
 }
 
 pub(super) fn runtime_response(outcome: grpc::ExecutionOutcome) -> Result<RuntimeResponse, String> {
+    let code_mode_host_duration = Some(Duration::from_nanos(outcome.code_mode_host_duration_ns));
     super::validate_identifier(&outcome.cell_id, "cell ID")?;
     let cell_id = CellId::new(outcome.cell_id);
     let content_items = outcome
@@ -96,38 +113,60 @@ pub(super) fn runtime_response(outcome: grpc::ExecutionOutcome) -> Result<Runtim
         .into_iter()
         .map(content_item)
         .collect::<Result<Vec<_>, _>>()?;
-    match outcome
+    let response = match outcome
         .outcome
         .ok_or_else(|| "code-mode execution omitted its outcome".to_string())?
     {
-        grpc::execution_outcome::Outcome::Yielded(_) => Ok(RuntimeResponse::Yielded {
+        grpc::execution_outcome::Outcome::Yielded(_) => RuntimeResponse::Yielded {
             cell_id,
             content_items,
-        }),
-        grpc::execution_outcome::Outcome::Terminated(_) => Ok(RuntimeResponse::Terminated {
+            code_mode_host_duration,
+        },
+        grpc::execution_outcome::Outcome::Terminated(_) => RuntimeResponse::Terminated {
             cell_id,
             content_items,
-        }),
-        grpc::execution_outcome::Outcome::Completed(completed) => Ok(RuntimeResponse::Result {
+            code_mode_host_duration,
+        },
+        grpc::execution_outcome::Outcome::Completed(completed) => RuntimeResponse::Result {
             cell_id,
             content_items,
             error_text: completed.error_text,
-        }),
-    }
+            result_buffered_for: Duration::ZERO,
+            code_mode_host_duration,
+        },
+    };
+    Ok(response)
 }
 
-pub(super) fn wait_outcome(response: grpc::WaitResponse) -> Result<WaitOutcome, String> {
-    match response
+pub(super) fn wait_outcome(
+    response: tonic::Response<grpc::WaitResponse>,
+) -> Result<WaitOutcome, String> {
+    let (metadata, response, _) = response.into_parts();
+    let outcome = match response
         .state
         .ok_or_else(|| "code-mode wait omitted its outcome".to_string())?
     {
         grpc::wait_response::State::LiveCell(response) => {
-            runtime_response(response).map(WaitOutcome::LiveCell)
+            let mut response = runtime_response(response)?;
+            if let RuntimeResponse::Result {
+                result_buffered_for,
+                ..
+            } = &mut response
+            {
+                // Older hosts may omit this metadata, including for completed results.
+                *result_buffered_for = metadata
+                    .get(grpc::RESULT_BUFFERED_FOR_NS_METADATA)
+                    .and_then(|value| value.to_str().ok()?.parse().ok())
+                    .map(Duration::from_nanos)
+                    .unwrap_or_default();
+            }
+            WaitOutcome::LiveCell(response)
         }
         grpc::wait_response::State::MissingCell(response) => {
-            runtime_response(response).map(WaitOutcome::MissingCell)
+            WaitOutcome::MissingCell(runtime_response(response)?)
         }
-    }
+    };
+    Ok(outcome)
 }
 
 fn content_item(item: grpc::ContentItem) -> Result<FunctionCallOutputContentItem, String> {

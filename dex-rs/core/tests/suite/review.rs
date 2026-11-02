@@ -4,7 +4,7 @@ use core_test_support::responses::ResponseMock;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
-use core_test_support::test_dex::local_selections;
+use core_test_support::test_dex::local_requests;
 use core_test_support::test_dex::test_dex;
 use core_test_support::wait_for_event;
 use dex_core::DexThread;
@@ -16,10 +16,14 @@ use dex_core::find_thread_path_by_id_str;
 use dex_exec_server::CreateDirectoryOptions;
 use dex_features::Feature;
 use dex_history::RolloutItem;
-use dex_history::RolloutLine;
 use dex_login::DexAuth;
 use dex_protocol::config_types::ApprovalsReviewer;
+use dex_protocol::config_types::CollaborationMode;
+use dex_protocol::config_types::ModeKind;
+use dex_protocol::config_types::Personality;
+use dex_protocol::config_types::ReasoningSummary;
 use dex_protocol::config_types::ServiceTier;
+use dex_protocol::config_types::Settings;
 use dex_protocol::items::TurnItem;
 use dex_protocol::models::ContentItem;
 use dex_protocol::models::PermissionProfile;
@@ -40,7 +44,7 @@ use dex_protocol::protocol::ReviewOutputEvent;
 use dex_protocol::protocol::ReviewRequest;
 use dex_protocol::protocol::ReviewTarget;
 use dex_protocol::protocol::ThreadSettingsOverrides;
-use dex_protocol::protocol::TurnEnvironmentSelections;
+use dex_protocol::protocol::TurnEnvironmentRequests;
 use dex_protocol::review_format::render_review_output_text;
 use dex_protocol::user_input::UserInput;
 use pretty_assertions::assert_eq;
@@ -51,6 +55,7 @@ use tempfile::TempDir;
 use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
 use wiremock::MockServer;
+use wiremock::ResponseTemplate;
 
 /// Verify that submitting `Op::Review` emits review item lifecycle,
 /// legacy review events, and TurnComplete when the model returns a structured review payload.
@@ -203,7 +208,7 @@ async fn review_op_emits_lifecycle_and_review_output() {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .find_map(|line| {
-            let rollout_line: RolloutLine = serde_json::from_str(line).expect("rollout line");
+            let rollout_line = dex_rollout::parse_rollout_line(line).expect("rollout line");
             match rollout_line.item {
                 RolloutItem::SessionMeta(session_meta) => Some(session_meta.meta.id.to_string()),
                 _ => None,
@@ -245,7 +250,7 @@ async fn review_op_emits_lifecycle_and_review_output() {
             continue;
         }
         let v: serde_json::Value = serde_json::from_str(line).expect("jsonl line");
-        let rl: RolloutLine = serde_json::from_value(v).expect("rollout line");
+        let rl = dex_rollout::decode_rollout_line(v).expect("rollout line");
         if let RolloutItem::ResponseItem(envelope) = rl.item
             && let ResponseItem::Message { role, content, .. } = envelope.item
         {
@@ -262,7 +267,7 @@ async fn review_op_emits_lifecycle_and_review_output() {
                 }
             } else if role == "assistant" {
                 for c in content {
-                    if let ContentItem::OutputText { text } = c {
+                    if let ContentItem::OutputText { text, .. } = c {
                         if text.contains("<user_action>") {
                             saw_assistant_xml = true;
                         }
@@ -290,6 +295,50 @@ async fn review_op_emits_lifecycle_and_review_output() {
 
     let _dex_home_guard = dex_home;
     server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_overload_preserves_lifecycle_order() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    responses::mount_response_once(
+        &server,
+        ResponseTemplate::new(503)
+            .set_body_json(serde_json::json!({ "error": { "code": "server_is_overloaded" } })),
+    )
+    .await;
+    let dex = new_conversation_for_server(&server, Arc::new(TempDir::new().unwrap()), |config| {
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
+    })
+    .await;
+
+    dex.submit(Op::Review {
+        review_request: ReviewRequest {
+            target: ReviewTarget::UncommittedChanges,
+            user_facing_hint: None,
+        },
+    })
+    .await
+    .unwrap();
+
+    let mut lifecycle = Vec::new();
+    loop {
+        let event = match wait_for_event(&dex, |_| true).await {
+            EventMsg::EnteredReviewMode(_) => "entered",
+            EventMsg::Error(_) => "error",
+            EventMsg::ExitedReviewMode(_) => "exited",
+            EventMsg::TurnComplete(_) => "complete",
+            _ => continue,
+        };
+        lifecycle.push(event);
+        if event == "complete" {
+            break;
+        }
+    }
+
+    assert_eq!(lifecycle, ["entered", "error", "exited", "complete"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -572,6 +621,8 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
 
     fn model_defaults(guidance_message: &str) -> ModelTokenBudgetConfig {
         ModelTokenBudgetConfig {
+            enabled: false,
+            use_history_notes_extension: false,
             reminder_threshold_tokens: 6_144,
             reminder_message_template: "Reminder: {n_remaining} tokens remain.".to_string(),
             guidance_message: guidance_message.to_string(),
@@ -624,6 +675,10 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
             config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
             config
                 .features
+                .enable(Feature::FastMode)
+                .expect("enable FastMode");
+            config
+                .features
                 .enable(Feature::TokenBudget)
                 .expect("token budget should be available");
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
@@ -659,20 +714,29 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
     core_test_support::submit_thread_settings(
         &dex,
         ThreadSettingsOverrides {
-            environments: Some(TurnEnvironmentSelections::new(
+            environments: Some(TurnEnvironmentRequests::new(
                 updated_cwd.clone(),
-                vec![selection],
+                vec![selection.into_request()],
             )),
             approval_policy: Some(AskForApproval::Never),
             approvals_reviewer: Some(ApprovalsReviewer::User),
             permission_profile: Some(PermissionProfile::Disabled),
-            effort: Some(Some(ReasoningEffort::XHigh)),
+            personality: Some(Personality::Friendly),
+            collaboration_mode: Some(CollaborationMode {
+                mode: ModeKind::Plan,
+                settings: Settings {
+                    model: "gpt-5.2".to_string(),
+                    reasoning_effort: Some(ReasoningEffort::XHigh),
+                    developer_instructions: Some("Parent planning instructions".to_string()),
+                },
+            }),
             ..Default::default()
         },
     )
     .await
     .expect("updated thread permissions should be accepted");
 
+    let stored_settings = dex.thread_settings_snapshot().await;
     dex.submit(Op::Review {
         review_request: ReviewRequest {
             target: ReviewTarget::Custom {
@@ -685,6 +749,7 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
     .expect("review should start");
     wait_for_event(&dex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
+    assert_eq!(dex.thread_settings_snapshot().await, stored_settings);
     let request = request_log.single_request();
     assert_eq!(request.body_json()["reasoning"]["effort"], "medium");
     assert_eq!(
@@ -736,8 +801,8 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
     let review_session_cwd = review_rollout
         .lines()
         .find_map(|line| {
-            let rollout_line: RolloutLine =
-                serde_json::from_str(line).expect("review rollout line should be valid");
+            let rollout_line =
+                dex_rollout::parse_rollout_line(line).expect("review rollout line should be valid");
             match rollout_line.item {
                 RolloutItem::SessionMeta(session_meta) => Some(session_meta.meta.cwd),
                 _ => None,
@@ -745,21 +810,163 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
         })
         .expect("review rollout should contain session metadata");
     assert_eq!(review_session_cwd, updated_cwd.as_path());
-    let review_approvals_reviewer = review_rollout
+    let review_context = review_rollout
         .lines()
         .filter_map(|line| {
-            let rollout_line: RolloutLine =
-                serde_json::from_str(line).expect("review rollout line should be valid");
+            let rollout_line =
+                dex_rollout::parse_rollout_line(line).expect("review rollout line should be valid");
             match rollout_line.item {
-                RolloutItem::TurnContext(turn_context) => turn_context.approvals_reviewer,
+                RolloutItem::TurnContext(turn_context) => Some(turn_context),
                 _ => None,
             }
         })
-        .next_back();
-    assert_eq!(review_approvals_reviewer, Some(ApprovalsReviewer::User));
+        .next_back()
+        .expect("review rollout should contain turn context");
+    assert_eq!(
+        review_context.approvals_reviewer,
+        Some(ApprovalsReviewer::User)
+    );
+    // The review delegate still starts in its own default mode, not the parent's Plan mode.
+    assert_eq!(
+        review_context.collaboration_mode,
+        Some(CollaborationMode {
+            mode: ModeKind::Default,
+            settings: Settings {
+                model: "gpt-5.4".to_string(),
+                reasoning_effort: Some(ReasoningEffort::Medium),
+                developer_instructions: None,
+            },
+        })
+    );
 
     let _dex_home_guard = dex_home;
     server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_preserves_flex_tier_when_fast_mode_disabled() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let (server, request_log) =
+        start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 1).await;
+    let test = test_dex()
+        .with_model_info_override("gpt-5.4", |model| {
+            model.service_tiers = vec![ModelServiceTier {
+                id: ServiceTier::Flex.request_value().to_string(),
+                name: "Flex".to_string(),
+                description: "Flexible processing".to_string(),
+            }];
+        })
+        .with_config(|config| {
+            config
+                .features
+                .disable(Feature::FastMode)
+                .expect("disable FastMode");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    core_test_support::submit_thread_settings(
+        &test.dex,
+        ThreadSettingsOverrides {
+            service_tier: Some(Some(ServiceTier::Flex.request_value().to_string())),
+            ..Default::default()
+        },
+    )
+    .await?;
+    test.dex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "review the changes".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await?;
+    wait_for_event(&test.dex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert_eq!(
+        test.dex
+            .thread_settings_snapshot()
+            .await
+            .service_tier
+            .as_deref(),
+        Some("flex")
+    );
+    assert_eq!(
+        request_log.single_request().body_json().get("service_tier"),
+        Some(&serde_json::json!("flex"))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_resolves_inherited_summary_preferences() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let (server, request_log) =
+        start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 2).await;
+    let test = test_dex()
+        .with_model_info_override("gpt-5.2", |model| {
+            model.default_reasoning_summary = ReasoningSummary::Auto;
+        })
+        .with_model_info_override("gpt-5.4", |model| {
+            model.default_reasoning_summary = ReasoningSummary::Detailed;
+        })
+        .with_model("gpt-5.2")
+        .with_config(|config| {
+            config.review_model = Some("gpt-5.4".to_string());
+            config.model_reasoning_summary = None;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    // First follow the review model's default, then use a preference updated on the thread.
+    for summary in [None, Some(ReasoningSummary::Concise)] {
+        if let Some(summary) = summary {
+            core_test_support::submit_thread_settings(
+                &test.dex,
+                ThreadSettingsOverrides {
+                    summary: Some(summary),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        let stored_settings = test.dex.thread_settings_snapshot().await;
+        test.dex
+            .submit(Op::Review {
+                review_request: ReviewRequest {
+                    target: ReviewTarget::Custom {
+                        instructions: "review the changes".to_string(),
+                    },
+                    user_facing_hint: None,
+                },
+            })
+            .await?;
+        wait_for_event(&test.dex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        assert_eq!(test.dex.thread_settings_snapshot().await, stored_settings);
+    }
+    let actual = request_log
+        .requests()
+        .iter()
+        .map(|request| {
+            let body = request.body_json();
+            serde_json::json!([body["model"], body["reasoning"]["summary"]])
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            serde_json::json!(["gpt-5.4", "detailed"]),
+            serde_json::json!(["gpt-5.4", "concise"]),
+        ]
+    );
+    Ok(())
 }
 
 /// Ensure that when a custom `review_model` is set in the config, the review
@@ -843,7 +1050,7 @@ async fn review_uses_custom_review_model_from_config() {
 }
 
 /// Ensure that when `review_model` is not set in the config, the review request
-/// uses the session model.
+/// uses the session model without exposing disabled clock tools or reminders.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_uses_session_model_when_review_model_unset() {
     skip_if_no_network!();
@@ -856,7 +1063,7 @@ async fn review_uses_session_model_when_review_model_unset() {
         .with_config(|config| {
             config.model = Some("gpt-5.4".to_string());
             config.review_model = None;
-            config.model_reasoning_effort = Some(ReasoningEffort::Max);
+            config.model_reasoning_effort = Some(ReasoningEffort::Persistent);
         })
         .build_with_auto_env(&server)
         .await
@@ -891,7 +1098,12 @@ async fn review_uses_session_model_when_review_model_unset() {
     assert_eq!(request.path(), "/v1/responses");
     let body = request.body_json();
     assert_eq!(body["model"].as_str().unwrap(), "gpt-5.4");
-    assert_eq!(body["reasoning"]["effort"].as_str(), Some("max"));
+    assert_eq!(body["reasoning"]["effort"].as_str(), Some("disabled"));
+    assert_eq!(
+        ["curr_time", "sleep"].map(|name| request.tool_by_name("clock", name).is_some()),
+        [false, false]
+    );
+    assert!(!request.has_content_kinds(&["current_time.reminder"]));
 
     let _dex_home_guard = dex_home;
     server.verify().await;
@@ -936,6 +1148,8 @@ async fn review_input_isolated_from_parent_history() {
 
         // Prior user message (enveloped response_item)
         let user = dex_protocol::models::ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![dex_protocol::models::ContentItem::InputText {
@@ -956,9 +1170,13 @@ async fn review_input_isolated_from_parent_history() {
 
         // Prior assistant message (enveloped response_item)
         let assistant = dex_protocol::models::ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "assistant".to_string(),
             content: vec![dex_protocol::models::ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: "parent: assistant reply".to_string(),
             }],
             phase: None,
@@ -1038,8 +1256,8 @@ async fn review_input_isolated_from_parent_history() {
         "user message should only contain the raw review prompt"
     );
 
-    // Ensure the REVIEW_PROMPT rubric is sent via instructions.
-    let instructions = body["instructions"].as_str().expect("instructions string");
+    // Ensure the REVIEW_PROMPT rubric is sent as the base instructions.
+    let instructions = request.instructions_text();
     assert_eq!(instructions, REVIEW_PROMPT);
 
     // Also verify that a user interruption note was recorded in the rollout.
@@ -1051,7 +1269,7 @@ async fn review_input_isolated_from_parent_history() {
             continue;
         }
         let v: serde_json::Value = serde_json::from_str(line).expect("jsonl line");
-        let rl: RolloutLine = serde_json::from_value(v).expect("rollout line");
+        let rl = dex_rollout::decode_rollout_line(v).expect("rollout line");
         if let RolloutItem::ResponseItem(envelope) = rl.item
             && let ResponseItem::Message { role, content, .. } = envelope.item
             && role == "user"
@@ -1228,7 +1446,7 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
     core_test_support::submit_thread_settings(
         &dex,
         ThreadSettingsOverrides {
-            environments: Some(local_selections(repo_path.to_path_buf().abs())),
+            environments: Some(local_requests(repo_path.to_path_buf().abs())),
             ..Default::default()
         },
     )

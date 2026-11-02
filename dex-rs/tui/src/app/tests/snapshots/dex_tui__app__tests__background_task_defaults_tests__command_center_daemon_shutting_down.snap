@@ -1,0 +1,13 @@
+---
+source: tui/src/app/tests/background_task_defaults_tests.rs
+expression: "crate::chatwidget::tests::helpers::render_bottom_popup(&app.chat_widget, 80,)"
+---
+  Dex's background server is shutting down
+  New sessions are paused while active turns finish or are canceled. The
+  default shutdown wait is up to one minute. If the server restarts, Dex will
+  reconnect automatically.
+
+
+› 1. Return to command center
+
+  enter select · esc back

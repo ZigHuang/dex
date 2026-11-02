@@ -1,6 +1,6 @@
 #![cfg(not(target_os = "windows"))]
 
-use core_test_support::test_dex::local_selections;
+use core_test_support::test_dex::local_requests;
 use dex_core::TurnInputRequest;
 use std::sync::Arc;
 use std::time::Duration;
@@ -115,7 +115,7 @@ async fn refresh_models_on_models_etag_mismatch_and_avoid_duplicate_models_fetch
             text_elements: Vec::new(),
         }])
         .with_thread_settings(ThreadSettingsOverrides {
-            environments: Some(local_selections(cwd_path)),
+            environments: Some(local_requests(cwd_path)),
             approval_policy: Some(AskForApproval::Never),
             sandbox_policy: Some(sandbox_policy),
             permission_profile,

@@ -13,11 +13,13 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+dex-utils-process = { workspace = true }
 anyhow = { workspace = true }
 dex-analytics = { workspace = true }
 dex-app-server-protocol = { workspace = true }
 dex-config = { workspace = true }
 dex-connectors = { workspace = true }
+dex-core-plugin-common = { workspace = true }
 dex-exec-server = { workspace = true }
 dex-git-utils = { workspace = true }
 dex-hooks = { workspace = true }
@@ -41,7 +43,6 @@ flate2 = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
 regex = { workspace = true }
-semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
@@ -57,14 +58,13 @@ url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 zip = { workspace = true }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-which = { workspace = true }
-
 [dev-dependencies]
 dex-exec-server-test-support = { workspace = true }
+dex-utils-cargo-bin = { workspace = true }
 libc = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
 wiremock = { workspace = true }

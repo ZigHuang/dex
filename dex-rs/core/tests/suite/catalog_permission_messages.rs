@@ -13,6 +13,7 @@ use dex_login::DexAuth;
 use dex_models_manager::manager::RefreshStrategy;
 use dex_models_manager::model_info::model_info_from_slug;
 use dex_protocol::models::PermissionProfile;
+use dex_protocol::openai_models::ApprovalMessages;
 use dex_protocol::openai_models::ModelMessages;
 use dex_protocol::openai_models::ModelsResponse;
 use dex_protocol::openai_models::PermissionMessages;
@@ -21,28 +22,49 @@ use dex_protocol::protocol::EventMsg;
 use dex_protocol::protocol::ThreadSettingsOverrides;
 use dex_protocol::user_input::UserInput;
 use pretty_assertions::assert_eq;
+use std::fs;
+use test_case::test_case;
 use wiremock::MockServer;
 
+#[test_case(Some("Catalog approval instructions."), "Catalog approved prefixes: {{ approved_prefixes }}", Some(r#"Catalog approved prefixes: - ["echo"]"#); "catalog_prefixes")]
+#[test_case(None, "", None; "empty_catalog_prefixes")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn catalog_permission_message_loaded_from_remote_models_is_sent() -> Result<()> {
+async fn catalog_permission_message_loaded_from_remote_models_is_sent(
+    catalog_approval: Option<&str>,
+    prefix_template: &str,
+    expected_prefix_line: Option<&str>,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = MockServer::start().await;
     let model_slug = "remote-catalog-permissions-model";
     let mut model = model_info_from_slug(model_slug);
     model.model_messages = Some(ModelMessages {
+        apps: None,
+        content_filter_guidance: None,
+        persistent_instructions: None,
+        tools: None,
         instructions_template: None,
-        instructions_variables: None,
-        approvals: None,
+        approvals: catalog_approval.map(|on_request| ApprovalMessages {
+            on_request: Some(on_request.to_string()),
+            on_request_auto_review: None,
+            never: None,
+            unless_trusted: None,
+            granular: None,
+            ..Default::default()
+        }),
         collaboration_modes: None,
         auto_review: None,
         permissions: Some(PermissionMessages {
             danger_full_access: None,
             workspace_write: None,
             read_only: Some("remote catalog permissions: {{ network_access }}".to_string()),
+            approved_prefixes: Some(prefix_template.to_string()),
+            ..PermissionMessages::default()
         }),
         multi_agent: None,
         token_budget: None,
+        confirmation_policies: None,
         guardian_v2: None,
     });
     let models_mock = mount_models_once(
@@ -60,7 +82,14 @@ async fn catalog_permission_message_loaded_from_remote_models_is_sent() -> Resul
     let mut builder = test_dex()
         .with_auth(DexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
-            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            let rules_dir = config.dex_home.join("rules");
+            fs::create_dir_all(&rules_dir).expect("create rules directory");
+            fs::write(
+                rules_dir.join("approved.rules"),
+                r#"prefix_rule(pattern=["echo"], decision="allow")"#,
+            )
+            .expect("write approved prefix");
             config
                 .permissions
                 .set_permission_profile(PermissionProfile::read_only())
@@ -102,12 +131,18 @@ async fn catalog_permission_message_loaded_from_remote_models_is_sent() -> Resul
         .filter(|text| text.contains("<permissions instructions>"))
         .map(|text| text.replace("\r\n", "\n"))
         .collect::<Vec<_>>();
+    let [permissions]: [String; 1] = permissions.try_into().expect("one permission fragment");
+    assert!(
+        permissions
+            .starts_with("<permissions instructions>\nremote catalog permissions: restricted\n")
+    );
+    assert!(permissions.contains(catalog_approval.unwrap_or("prefix_rule")));
     assert_eq!(
-        permissions,
-        vec![
-            "<permissions instructions>\nremote catalog permissions: restricted\nApproval policy is currently never. Do not provide the `sandbox_permissions` for any reason, commands will be rejected.\n</permissions instructions>"
-                .to_string()
-        ]
+        permissions
+            .lines()
+            .filter(|line| line.contains(r#"["echo"]"#))
+            .collect::<Vec<_>>(),
+        expected_prefix_line.into_iter().collect::<Vec<_>>()
     );
     Ok(())
 }

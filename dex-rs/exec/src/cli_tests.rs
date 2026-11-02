@@ -11,6 +11,8 @@ fn resume_parses_prompt_after_global_flags() {
         "--json",
         "--model",
         "gpt-5.2-dex",
+        "--cyber-access-program",
+        "daybreak_blue",
         "--dangerously-bypass-approvals-and-sandbox",
         "--skip-git-repo-check",
         "--ephemeral",
@@ -22,6 +24,10 @@ fn resume_parses_prompt_after_global_flags() {
     assert!(cli.ephemeral);
     assert!(cli.ignore_user_config);
     assert!(cli.ignore_rules);
+    assert_eq!(
+        cli.cyber_access_program,
+        Some(CyberAccessProgramCliArg::DaybreakBlue)
+    );
     let Some(Command::Resume(args)) = cli.command else {
         panic!("expected resume command");
     };
@@ -71,6 +77,8 @@ fn fork_parses_prompt_after_global_flags() {
         "--json",
         "--model",
         "gpt-5.2-dex",
+        "--thread-source",
+        "automated_review",
         "--skip-git-repo-check",
         "--ephemeral",
         PROMPT,
@@ -78,6 +86,10 @@ fn fork_parses_prompt_after_global_flags() {
 
     assert!(cli.json);
     assert!(cli.ephemeral);
+    assert_eq!(
+        cli.thread_source,
+        Some(ThreadSource::Feature("automated_review".to_string()))
+    );
     let Some(Command::Fork(args)) = cli.command else {
         panic!("expected fork command");
     };
@@ -120,4 +132,22 @@ fn approve_for_me_flag_conflicts_with_other_sandbox_modes() {
         let error = Cli::try_parse_from(args).expect_err("flags should conflict");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
+}
+
+#[test]
+fn worktree_flag_is_accepted_after_fork_subcommand() {
+    let cli = Cli::try_parse_from(["dex-exec", "fork", "session-id", "--worktree"])
+        .expect("worktree should be a global exec argument");
+
+    assert!(cli.worktree);
+    assert!(matches!(cli.command, Some(Command::Fork(_))));
+}
+
+#[test]
+fn worktree_flag_is_accepted_before_fork_subcommand() {
+    let cli = Cli::try_parse_from(["dex-exec", "--worktree", "fork", "session-id"])
+        .expect("worktree should be accepted before the fork subcommand");
+
+    assert!(cli.worktree);
+    assert!(matches!(cli.command, Some(Command::Fork(_))));
 }

@@ -67,7 +67,9 @@ impl SessionTask for ReviewTask {
         for item in input {
             match item {
                 TurnInput::UserInput { mut content, .. } => user_input.append(&mut content),
-                TurnInput::ResponseItem(_) | TurnInput::InterAgentCommunication(_) => {}
+                TurnInput::ResponseItem(_)
+                | TurnInput::FunctionCallOutput(_)
+                | TurnInput::InterAgentCommunication(_) => {}
             }
         }
 
@@ -121,7 +123,7 @@ async fn start_review_conversation(
     let model = config
         .review_model
         .clone()
-        .unwrap_or_else(|| ctx.model_info.slug.clone());
+        .unwrap_or_else(|| ctx.model_info().slug.clone());
     sub_agent_config.model = Some(model);
     (run_dex_thread_one_shot(
         sub_agent_config,
@@ -236,7 +238,10 @@ pub(crate) async fn exit_review_mode(
     session
         .record_conversation_items(
             &ctx,
+            ctx.model_info(),
             &[ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: Some(ResponseItemId::new("msg")),
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText { text: user_message }],
@@ -255,10 +260,15 @@ pub(crate) async fn exit_review_mode(
     session
         .record_response_item_and_emit_turn_item(
             ctx.as_ref(),
+            ctx.model_info(),
             ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: Some(ResponseItemId::new("msg")),
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: assistant_message,
                 }],
                 phase: None,

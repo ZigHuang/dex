@@ -1,10 +1,13 @@
+use dex_app_server_protocol::ModelProviderError;
 use dex_arg0::Arg0DispatchPaths;
-use dex_cloud_config::cloud_config_bundle_loader;
+use dex_cloud_config::managed_config_bundle_loader;
 use dex_config::CloudConfigBundleLoader;
 use dex_config::ConfigLayerStack;
 use dex_config::LoaderOverrides;
 use dex_config::ThreadConfigLoader;
+use dex_config::apply_default_gcp_auth;
 use dex_config::loader::load_config_layers_state;
+use dex_config::loader::load_managed_requirements_state;
 use dex_core::config::Config;
 use dex_core::config::ConfigBuilder;
 use dex_core::config::ConfigOverrides;
@@ -12,6 +15,12 @@ use dex_exec_server::LOCAL_FS;
 use dex_features::feature_for_key;
 use dex_login::AuthManager;
 use dex_login::default_client::set_default_client_residency_requirement;
+use dex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
+use dex_model_provider_info::AMAZON_BEDROCK_RUNTIME_PROVIDER_ID;
+use dex_model_provider_info::GCP_PROVIDER_ID;
+use dex_model_provider_info::OPENAI_PROVIDER_ID;
+use dex_model_provider_info::built_in_model_providers;
+use dex_model_provider_info::merge_configured_model_providers;
 use dex_utils_absolute_path::AbsolutePathBuf;
 use dex_utils_json_to_toml::json_to_toml;
 use std::collections::BTreeMap;
@@ -20,10 +29,15 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use toml::Value as TomlValue;
 use tracing::instrument;
 use tracing::warn;
+
+#[path = "application_network.rs"]
+pub(crate) mod application_network;
 
 /// Shared app-server entry point for loading effective Dex configuration.
 #[derive(Clone)]
@@ -36,6 +50,43 @@ pub(crate) struct ConfigManager {
     cloud_config_bundle: Arc<RwLock<CloudConfigBundleLoader>>,
     arg0_paths: Arg0DispatchPaths,
     thread_config_loader: Arc<dyn ThreadConfigLoader>,
+    network_policy: dex_http_client::NetworkPolicyController,
+    local_network_policy: dex_http_client::NetworkPolicyController,
+    network_policy_reload: Arc<tokio::sync::Semaphore>,
+    network_policy_snapshot: Arc<RwLock<Option<Arc<ApplicationPolicySnapshot>>>>,
+    /// Captured before config loading so a reload also revokes pending startups.
+    mcp_ema_cancellation: Arc<Mutex<EmaCancellationRoots>>,
+}
+
+#[derive(Default)]
+struct EmaCancellationRoots {
+    startup: CancellationToken,
+    lifetime: CancellationToken,
+}
+
+/// Startup configuration, including whether loading had to fall back to defaults.
+pub(crate) struct StartupConfig {
+    pub(crate) config: Config,
+    pub(crate) used_defaults: bool,
+}
+
+/// Local auth authority and the cloud-backed configuration loaded with it.
+pub(crate) struct CloudStartupConfig {
+    pub(crate) bootstrap: Config,
+    pub(crate) config: std::io::Result<Config>,
+}
+
+/// Configuration and policy must finish loading against the same account and cloud snapshot.
+pub(crate) struct ApplicationPolicyLoad {
+    cloud_config: CloudConfigBundleLoader,
+    snapshot: Arc<ApplicationPolicySnapshot>,
+}
+
+#[derive(PartialEq, Eq)]
+struct ApplicationPolicySnapshot {
+    revision: dex_http_client::NetworkPolicyRevision,
+    policy: dex_http_client::DestinationPolicy,
+    cloud: Option<dex_config::CloudConfigBundle>,
 }
 
 impl ConfigManager {
@@ -48,6 +99,7 @@ impl ConfigManager {
         arg0_paths: Arg0DispatchPaths,
         thread_config_loader: Arc<dyn ThreadConfigLoader>,
     ) -> Self {
+        let network_policy = dex_http_client::NetworkPolicyController::default();
         Self {
             dex_home,
             cli_overrides: Arc::new(RwLock::new(cli_overrides)),
@@ -57,11 +109,54 @@ impl ConfigManager {
             cloud_config_bundle: Arc::new(RwLock::new(cloud_config_bundle)),
             arg0_paths,
             thread_config_loader,
+            network_policy,
+            local_network_policy: Default::default(),
+            network_policy_reload: Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
+            network_policy_snapshot: Arc::default(),
+            mcp_ema_cancellation: Arc::default(),
         }
     }
 
     pub(crate) fn dex_home(&self) -> &Path {
         self.dex_home.as_path()
+    }
+
+    /// Explicit account, policy-owner, and enterprise-login changes revoke cached access.
+    pub(crate) fn revoke_mcp_ema(&self) {
+        let mut current = self
+            .mcp_ema_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.startup.cancel();
+        current.lifetime.cancel();
+        *current = EmaCancellationRoots::default();
+    }
+
+    /// Published threads are validated individually by the existing refresh loop.
+    pub(crate) fn revoke_mcp_ema_startups(&self) {
+        let mut current = self
+            .mcp_ema_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.startup.cancel();
+        current.startup = CancellationToken::new();
+    }
+
+    fn capture_mcp_ema_cancellation(&self) -> dex_config::McpEmaCancellation {
+        let current = self
+            .mcp_ema_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        dex_config::McpEmaCancellation::pending(current.startup.clone(), current.lifetime.clone())
+    }
+
+    pub(crate) fn with_embedded_network_policy(
+        mut self,
+        policy: crate::in_process::EmbeddedNetworkPolicy,
+    ) -> Self {
+        self.network_policy = policy.effective;
+        self.local_network_policy = policy.local;
+        self
     }
 
     pub(crate) fn user_config_path(&self) -> std::io::Result<AbsolutePathBuf> {
@@ -75,7 +170,7 @@ impl ConfigManager {
             .unwrap_or_default()
     }
 
-    pub(crate) fn current_cloud_config_bundle(&self) -> CloudConfigBundleLoader {
+    pub(crate) fn current_managed_config_loader(&self) -> CloudConfigBundleLoader {
         self.cloud_config_bundle
             .read()
             .map(|guard| guard.clone())
@@ -92,31 +187,49 @@ impl ConfigManager {
         Ok(())
     }
 
-    pub(crate) fn replace_cloud_config_bundle_loader(
+    pub(crate) fn update_managed_config_loader(
         &self,
         auth_manager: Arc<AuthManager>,
-        chatgpt_base_url: String,
-        http_client_factory: dex_http_client::HttpClientFactory,
+        config: &Config,
     ) {
-        let loader = cloud_config_bundle_loader(
+        // Keep config-server settings and their refresh worker when only
+        // ChatGPT/API-key credentials change.
+        if self
+            .current_managed_config_loader()
+            .config_server()
+            .is_some()
+        {
+            self.revoke_mcp_ema();
+            return;
+        }
+        let loader = managed_config_bundle_loader(
             auth_manager,
-            chatgpt_base_url,
+            config.chatgpt_base_url.clone(),
             self.dex_home.clone(),
-            http_client_factory,
+            config
+                .http_client_factory()
+                .with_network_policy(self.local_network_policy.policy()),
+            config.config_layer_stack.requirements_toml(),
         );
         if let Ok(mut guard) = self.cloud_config_bundle.write() {
+            guard.retire_ema_policy();
             *guard = loader;
         } else {
             warn!("failed to update cloud config bundle loader");
         }
+        self.revoke_mcp_ema();
     }
 
-    pub(crate) fn clear_cloud_config_bundle_loader(&self) {
+    pub(crate) fn clear_chatgpt_config_loader(&self) {
         if let Ok(mut guard) = self.cloud_config_bundle.write() {
-            *guard = CloudConfigBundleLoader::default();
+            if guard.config_server().is_none() {
+                guard.retire_ema_policy();
+                *guard = CloudConfigBundleLoader::default();
+            }
         } else {
             warn!("failed to clear cloud config bundle loader");
         }
+        self.revoke_mcp_ema();
     }
 
     pub(crate) async fn sync_default_client_residency_requirement(&self) {
@@ -135,33 +248,243 @@ impl ConfigManager {
         &self,
         fallback_cwd: Option<PathBuf>,
     ) -> std::io::Result<Config> {
+        let Some(fallback_cwd) = fallback_cwd else {
+            return self.load_non_project_config().await;
+        };
         self.load_with_cli_overrides(
             &self.current_cli_overrides(),
             /*request_overrides*/ None,
             ConfigOverrides::default(),
-            fallback_cwd,
+            Some(fallback_cwd),
         )
         .await
     }
 
-    pub(crate) async fn load_latest_config_for_thread(
-        &self,
-        thread_config: &Config,
-    ) -> std::io::Result<Config> {
-        let refreshed_config = self
-            .load_latest_config(Some(thread_config.cwd.to_path_buf()))
+    /// Loads system, user, and runtime settings without discovering a project
+    /// from the app-server process's working directory.
+    pub(crate) async fn load_non_project_config(&self) -> std::io::Result<Config> {
+        let mcp_ema_cancellation = self.capture_mcp_ema_cancellation();
+        let policy_load = self.refresh_application_network_policy().await?;
+        let mut config = ConfigBuilder::default()
+            .dex_home(self.dex_home.clone())
+            .cli_overrides(self.current_cli_overrides())
+            .loader_overrides(self.loader_overrides.clone())
+            .strict_config(self.strict_config)
+            .fallback_cwd(Some(self.dex_home.clone()))
+            .cloud_config_bundle(policy_load.cloud_config.clone())
+            .thread_config_loader(Arc::clone(&self.thread_config_loader))
+            .without_project_context()
+            .build()
             .await?;
-        let mut config = thread_config
-            .rebuild_preserving_session_layers(&refreshed_config)
-            .await?;
+        self.check_application_policy_load(&policy_load)?;
+        self.apply_network_policy(&mut config);
         self.apply_runtime_feature_enablement(&mut config);
         self.apply_arg0_paths(&mut config);
+        config.config_layer_stack = config
+            .config_layer_stack
+            .with_mcp_ema_cancellation(mcp_ema_cancellation);
         Ok(config)
     }
 
+    pub(crate) async fn load_latest_config_with_session_layers(
+        &self,
+        session_layers: &ConfigLayerStack,
+        cwd: &Path,
+    ) -> std::io::Result<Config> {
+        let mcp_ema_cancellation = self.capture_mcp_ema_cancellation();
+        let dex_home = AbsolutePathBuf::from_absolute_path(&self.dex_home)?;
+        let layers = self
+            .load_config_layers_for_cwd(AbsolutePathBuf::from_absolute_path(cwd)?)
+            .await?;
+        let mut config = Config::rebuild_with_session_layers(
+            session_layers,
+            cwd.to_path_buf(),
+            &layers,
+            dex_home,
+        )
+        .await?;
+        self.apply_network_policy(&mut config);
+        self.apply_runtime_feature_enablement(&mut config);
+        self.apply_arg0_paths(&mut config);
+        config.config_layer_stack = config
+            .config_layer_stack
+            .with_mcp_ema_cancellation(mcp_ema_cancellation);
+        Ok(config)
+    }
+
+    /// Refreshes global settings and managed requirements using already fetched session layers.
+    pub(crate) async fn load_retained_session_config(
+        &self,
+        session_layers: &ConfigLayerStack,
+        cwd: &Path,
+    ) -> std::io::Result<Config> {
+        let mcp_ema_cancellation = self.capture_mcp_ema_cancellation();
+        let mut manager = self.clone();
+        manager.thread_config_loader = Arc::new(dex_config::NoopThreadConfigLoader);
+        let refreshed_layers = manager
+            .load_config_layers_for_cwd(AbsolutePathBuf::from_absolute_path(cwd)?)
+            .await?;
+        // Merge the retained provider definitions before resolving managed provider selection.
+        let mut config = Config::rebuild_with_session_layers(
+            session_layers,
+            cwd.to_path_buf(),
+            &refreshed_layers,
+            AbsolutePathBuf::from_absolute_path(&self.dex_home)?,
+        )
+        .await?;
+        self.apply_network_policy(&mut config);
+        self.apply_runtime_feature_enablement(&mut config);
+        self.apply_arg0_paths(&mut config);
+        config.config_layer_stack = config
+            .config_layer_stack
+            .with_mcp_ema_cancellation(mcp_ema_cancellation);
+        Ok(config)
+    }
+
+    /// Checks the retained session route against current managed provider requirements.
+    pub(crate) async fn check_thread_model_provider(
+        &self,
+        current: &Config,
+    ) -> std::io::Result<()> {
+        let policy_load = self.refresh_application_network_policy().await?;
+        // Existing threads retain their session route; only managed
+        // requirements can invalidate it.
+        let requirements = load_managed_requirements_state(
+            LOCAL_FS.as_ref(),
+            &self.dex_home,
+            dex_config::ConfigLoadOptions {
+                loader_overrides: self.loader_overrides.clone(),
+                strict_config: self.strict_config,
+                cloud_config_bundle: policy_load.cloud_config.clone(),
+            },
+        )
+        .await?;
+        self.check_application_policy_load(&policy_load)?;
+        let selection_changed = requirements
+            .model_provider
+            .as_ref()
+            .is_some_and(|provider_id| provider_id != &current.model_provider_id);
+        let required_provider = requirements
+            .model_providers
+            .as_ref()
+            .and_then(|providers| providers.get(&current.model_provider_id))
+            .cloned();
+        let required_provider = match required_provider {
+            Some(provider)
+                if matches!(
+                    current.model_provider_id.as_str(),
+                    AMAZON_BEDROCK_PROVIDER_ID
+                        | AMAZON_BEDROCK_RUNTIME_PROVIDER_ID
+                        | GCP_PROVIDER_ID
+                        | OPENAI_PROVIDER_ID
+                ) =>
+            {
+                // Managed overrides must receive the same built-in defaults as startup config.
+                // OpenAI's inference URL belongs to the retained session, not the catalog override.
+                let mut provider = merge_configured_model_providers(
+                    built_in_model_providers(current.model_provider.base_url.clone()),
+                    HashMap::from([(current.model_provider_id.clone(), provider)]),
+                )
+                .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?
+                .remove(&current.model_provider_id);
+                if current.model_provider_id == GCP_PROVIDER_ID
+                    && let Some(provider) = provider.as_mut()
+                {
+                    apply_default_gcp_auth(provider, &current.cwd);
+                }
+                provider
+            }
+            Some(provider) => Some(provider),
+            None => None,
+        };
+        let definition_changed = required_provider
+            .as_ref()
+            .is_some_and(|provider| provider != &current.model_provider);
+        if selection_changed || definition_changed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                ModelProviderError::ModelProviderPolicyConflict {
+                    model_provider: current.model_provider_id.clone(),
+                    required_model_provider: requirements
+                        .model_provider
+                        .unwrap_or_else(|| current.model_provider_id.clone()),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Load local policy before auth, then fetch the account's cloud configuration.
+    /// Callers choose their error/recovery policy before initializing any runtimes.
+    pub(crate) async fn load_managed_startup_config(
+        &self,
+        cwd: Option<PathBuf>,
+    ) -> std::io::Result<CloudStartupConfig> {
+        let bootstrap = self.load_startup_config(cwd.clone()).await?.config;
+        let auth =
+            AuthManager::shared_from_config(&bootstrap, /*enable_dex_api_key_env*/ false)
+                .await
+                .map_err(std::io::Error::other)?;
+        self.update_managed_config_loader(auth, &bootstrap);
+        let config = self.load_latest_config(cwd).await;
+        Ok(CloudStartupConfig { bootstrap, config })
+    }
+
+    /// Admits resumed threads and input only on the currently selected provider.
+    pub(crate) async fn check_thread_model_provider_for_input(
+        &self,
+        current: &Config,
+    ) -> std::io::Result<()> {
+        self.check_thread_model_provider(current).await?;
+        let configured = self
+            .load_latest_config(Some(current.cwd.to_path_buf()))
+            .await?;
+        if current.model_provider_id != configured.model_provider_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                ModelProviderError::ModelProviderMismatch {
+                    model_provider: current.model_provider_id.clone(),
+                    current_model_provider: configured.model_provider_id,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Installs local policy before cloud access; failed policy loads block traffic while
+    /// non-strict startup remains available for configuration repair.
+    pub(crate) async fn load_startup_config(
+        &self,
+        fallback_cwd: Option<PathBuf>,
+    ) -> std::io::Result<StartupConfig> {
+        match self.load_latest_config(fallback_cwd).await {
+            Ok(config) => Ok(StartupConfig {
+                config,
+                used_defaults: false,
+            }),
+            Err(error)
+                if self.strict_config
+                    || crate::is_unsupported_untrusted_approval_policy_error(&error) =>
+            {
+                Err(error)
+            }
+            Err(error) => {
+                warn!(%error, "configuration is unavailable; using default settings");
+                Ok(StartupConfig {
+                    config: self.load_default_config().await?,
+                    used_defaults: true,
+                })
+            }
+        }
+    }
+
     pub(crate) async fn load_default_config(&self) -> std::io::Result<Config> {
+        let mcp_ema_cancellation = self.capture_mcp_ema_cancellation();
         let mut loader_overrides = self.loader_overrides.clone();
         loader_overrides.ignore_user_config = true;
+        loader_overrides.ignore_project_config = true;
+        loader_overrides.ignore_managed_requirements |=
+            self.refresh_local_network_policy().await.is_err();
         let mut config = ConfigBuilder::default()
             .dex_home(self.dex_home.clone())
             .cli_overrides(self.current_cli_overrides())
@@ -170,8 +493,12 @@ impl ConfigManager {
             .cloud_config_bundle(CloudConfigBundleLoader::default())
             .build()
             .await?;
+        self.apply_network_policy(&mut config);
         self.apply_runtime_feature_enablement(&mut config);
         self.apply_arg0_paths(&mut config);
+        config.config_layer_stack = config
+            .config_layer_stack
+            .with_mcp_ema_cancellation(mcp_ema_cancellation);
         Ok(config)
     }
 
@@ -202,6 +529,135 @@ impl ConfigManager {
             cwd,
         )
         .await
+        .and_then(|config| {
+            config.validate_windows_mxc_requirement()?;
+            Ok(config)
+        })
+    }
+
+    /// Validates saved and requested providers before resume overrides or policy can replace them.
+    pub(crate) async fn load_for_resume(
+        &self,
+        saved_provider: Option<&str>,
+        request_overrides: Option<HashMap<String, serde_json::Value>>,
+        typesafe_overrides: ConfigOverrides,
+        cwd: Option<PathBuf>,
+    ) -> std::io::Result<Config> {
+        let requested_provider = typesafe_overrides.model_provider.clone().or_else(|| {
+            request_overrides
+                .as_ref()
+                .and_then(|values| values.get("model_provider"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+        // Resolve the selection before the saved provider is applied as a resume override.
+        let current_provider = self
+            .load_latest_config(typesafe_overrides.cwd.clone().or_else(|| cwd.clone()))
+            .await
+            .map(|config| config.model_provider_id);
+        self.load_with_validation(
+            &self.current_cli_overrides(),
+            request_overrides,
+            typesafe_overrides,
+            cwd,
+            |config, _overrides, layers| {
+                let requested_provider = requested_provider
+                    .as_deref()
+                    .or(config.model_provider.as_deref())
+                    .unwrap_or("openai");
+                // Validate the saved route even when a client sends a provider override.
+                for provider in [
+                    saved_provider.unwrap_or(requested_provider),
+                    requested_provider,
+                ] {
+                    if let Some(required) = layers.required_model_provider()
+                        && required != provider
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            ModelProviderError::ModelProviderPolicyConflict {
+                                model_provider: provider.to_owned(),
+                                required_model_provider: required.to_owned(),
+                            },
+                        ));
+                    }
+                    if !config.model_providers.contains_key(provider)
+                        && !built_in_model_providers(config.openai_base_url.clone())
+                            .contains_key(provider)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            ModelProviderError::ModelProviderNotConfigured {
+                                model_provider: provider.to_owned(),
+                            },
+                        ));
+                    }
+                }
+                let current_provider = current_provider?;
+                for provider in [
+                    saved_provider.unwrap_or(requested_provider),
+                    requested_provider,
+                ] {
+                    if provider != current_provider {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            ModelProviderError::ModelProviderMismatch {
+                                model_provider: provider.to_owned(),
+                                current_model_provider: current_provider,
+                            },
+                        ));
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await
+        .and_then(|config| {
+            config.validate_windows_mxc_requirement()?;
+            Ok(config)
+        })
+    }
+
+    /// Reload sources using the task's session flags before materializing config.
+    pub(crate) async fn load_permission_config_for_thread(
+        &self,
+        thread_config: &Config,
+        cwd: AbsolutePathBuf,
+        permission_profile: String,
+    ) -> std::io::Result<Config> {
+        let mut session_flags = TomlValue::Table(Default::default());
+        for layer in thread_config.config_layer_stack.layers_low_to_high() {
+            if matches!(layer.name, dex_config::ConfigLayerSource::SessionFlags) {
+                dex_config::merge_toml_values(&mut session_flags, &layer.config);
+            }
+        }
+        let overrides = session_flags
+            .as_table()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "session flags must be a table",
+                )
+            })?
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        self.load_with_cli_overrides(
+            &overrides,
+            /*request_overrides*/ None,
+            ConfigOverrides {
+                cwd: Some(cwd.to_path_buf()),
+                default_permissions: Some(permission_profile),
+                dex_linux_sandbox_exe: self.arg0_paths.dex_linux_sandbox_exe.clone(),
+                ..Default::default()
+            },
+            Some(cwd.to_path_buf()),
+        )
+        .await
+        .and_then(|config| {
+            config.validate_windows_mxc_requirement()?;
+            Ok(config)
+        })
     }
 
     #[instrument(level = "trace", skip_all)]
@@ -209,9 +665,33 @@ impl ConfigManager {
         &self,
         cli_overrides: &[(String, TomlValue)],
         request_overrides: Option<HashMap<String, serde_json::Value>>,
-        mut typesafe_overrides: ConfigOverrides,
+        typesafe_overrides: ConfigOverrides,
         fallback_cwd: Option<PathBuf>,
     ) -> std::io::Result<Config> {
+        self.load_with_validation(
+            cli_overrides,
+            request_overrides,
+            typesafe_overrides,
+            fallback_cwd,
+            |_, _, _| Ok(()),
+        )
+        .await
+    }
+
+    async fn load_with_validation(
+        &self,
+        cli_overrides: &[(String, TomlValue)],
+        request_overrides: Option<HashMap<String, serde_json::Value>>,
+        mut typesafe_overrides: ConfigOverrides,
+        fallback_cwd: Option<PathBuf>,
+        validate: impl FnOnce(
+            &dex_config::config_toml::ConfigToml,
+            &ConfigOverrides,
+            &ConfigLayerStack,
+        ) -> std::io::Result<()>,
+    ) -> std::io::Result<Config> {
+        let mcp_ema_cancellation = self.capture_mcp_ema_cancellation();
+        let policy_load = self.refresh_application_network_policy().await?;
         let mut request_overrides = request_overrides.unwrap_or_default();
         if let Some(value) = request_overrides.remove("bypass_hook_trust") {
             typesafe_overrides.bypass_hook_trust = Some(value.as_bool().ok_or_else(|| {
@@ -230,19 +710,25 @@ impl ConfigManager {
                     .map(|(key, value)| (key, json_to_toml(value))),
             )
             .collect::<Vec<_>>();
-        let mut config = dex_core::config::ConfigBuilder::default()
+        let result = dex_core::config::ConfigBuilder::default()
             .dex_home(self.dex_home.clone())
             .cli_overrides(merged_cli_overrides)
             .loader_overrides(self.loader_overrides.clone())
             .strict_config(self.strict_config)
             .harness_overrides(typesafe_overrides)
             .fallback_cwd(fallback_cwd)
-            .cloud_config_bundle(self.current_cloud_config_bundle())
+            .cloud_config_bundle(policy_load.cloud_config.clone())
             .thread_config_loader(Arc::clone(&self.thread_config_loader))
-            .build()
-            .await?;
+            .build_with_validation(validate)
+            .await;
+        let mut config = result?;
+        self.check_application_policy_load(&policy_load)?;
+        self.apply_network_policy(&mut config);
         self.apply_runtime_feature_enablement(&mut config);
         self.apply_arg0_paths(&mut config);
+        config.config_layer_stack = config
+            .config_layer_stack
+            .with_mcp_ema_cancellation(mcp_ema_cancellation);
         Ok(config)
     }
 
@@ -257,7 +743,8 @@ impl ConfigManager {
         &self,
         cwd: Option<AbsolutePathBuf>,
     ) -> std::io::Result<ConfigLayerStack> {
-        load_config_layers_state(
+        let policy_load = self.refresh_application_network_policy().await?;
+        let result = load_config_layers_state(
             LOCAL_FS.as_ref(),
             &self.dex_home,
             cwd,
@@ -265,11 +752,14 @@ impl ConfigManager {
             dex_config::ConfigLoadOptions {
                 loader_overrides: self.loader_overrides.clone(),
                 strict_config: self.strict_config,
-                cloud_config_bundle: self.current_cloud_config_bundle(),
+                cloud_config_bundle: policy_load.cloud_config.clone(),
             },
             self.thread_config_loader.as_ref(),
         )
-        .await
+        .await;
+        let layers = result?;
+        self.check_application_policy_load(&policy_load)?;
+        Ok(layers)
     }
 
     fn apply_runtime_feature_enablement(&self, config: &mut Config) {
@@ -283,10 +773,25 @@ impl ConfigManager {
             .unwrap_or_default()
     }
 
+    fn apply_network_policy(&self, config: &mut Config) {
+        config.application_network_policy = self.network_policy.policy();
+        config.application_auth_route_config = Some(
+            dex_login::AuthRouteConfig::from_http_client_factory(
+                config
+                    .http_client_factory()
+                    .with_network_policy(self.network_policy.policy()),
+            )
+            .with_local_bootstrap_factory(
+                config
+                    .http_client_factory()
+                    .with_network_policy(self.local_network_policy.policy()),
+            ),
+        );
+    }
+
     fn apply_arg0_paths(&self, config: &mut Config) {
         config.dex_self_exe = self.arg0_paths.dex_self_exe.clone();
         config.dex_linux_sandbox_exe = self.arg0_paths.dex_linux_sandbox_exe.clone();
-        config.main_execve_wrapper_exe = self.arg0_paths.main_execve_wrapper_exe.clone();
     }
 
     #[cfg(test)]
@@ -318,6 +823,14 @@ impl ConfigManager {
     }
 }
 
+#[cfg(test)]
+#[path = "application_network_tests.rs"]
+mod application_network_tests;
+
+#[cfg(test)]
+#[path = "config_manager_provider_tests.rs"]
+mod provider_tests;
+
 pub(crate) fn protected_feature_keys(config_layer_stack: &ConfigLayerStack) -> BTreeSet<String> {
     let mut protected_features = config_layer_stack
         .effective_config()
@@ -341,6 +854,10 @@ pub(crate) fn apply_runtime_feature_enablement(
     config: &mut Config,
     runtime_feature_enablement: &BTreeMap<String, bool>,
 ) {
+    config.runtime_feature_defaults = runtime_feature_enablement
+        .iter()
+        .filter_map(|(name, enabled)| feature_for_key(name).map(|feature| (feature, *enabled)))
+        .collect();
     let protected_features = protected_feature_keys(&config.config_layer_stack);
     for (name, enabled) in runtime_feature_enablement {
         if protected_features.contains(name) {

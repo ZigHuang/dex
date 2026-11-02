@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 dex-app-server = { workspace = true }
 dex-app-server-protocol = { workspace = true }
+dex-app-server-transport = { workspace = true }
 dex-arg0 = { workspace = true }
 dex-config = { workspace = true }
 dex-core = { workspace = true }

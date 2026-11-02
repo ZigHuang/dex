@@ -4,4 +4,5 @@ dex_rust_crate(
     name = "http-client",
     compile_data = glob(["tests/fixtures/**"]),
     crate_name = "dex_http_client",
+    integration_compile_data_extra = glob(["tests/fixtures/*.pem"]),
 )

@@ -1,4 +1,5 @@
 pub(crate) const MEMORY_STARTUP: &str = "dex.memory.startup";
+pub(crate) const MEMORY_STORAGE_BYTES: &str = "dex.memory.storage_bytes";
 
 pub(crate) const MEMORY_PHASE_ONE_JOBS: &str = "dex.memory.phase1";
 pub(crate) const MEMORY_PHASE_ONE_E2E_MS: &str = "dex.memory.phase1.e2e_ms";

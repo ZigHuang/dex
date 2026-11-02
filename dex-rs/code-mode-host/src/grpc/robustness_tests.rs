@@ -139,6 +139,7 @@ async fn dropping_execution_before_admission_releases_its_reservation() {
             execution_id,
             "cell".to_string(),
             host.state.cell_permit().expect("reserve cell permit"),
+            /*traceparent*/ None,
         )
         .expect_err("abandoned execution must not admit a runtime cell");
     assert_eq!(error.code(), Code::Cancelled);
@@ -254,6 +255,7 @@ async fn session_closure_cancels_pending_termination() {
     let termination = host.terminate(Request::new(proto::TerminateRequest {
         session_id,
         cell_id,
+        max_output_tokens: None,
     }));
     tokio::pin!(termination);
     assert!(termination.as_mut().now_or_never().is_none());

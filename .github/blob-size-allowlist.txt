@@ -5,6 +5,7 @@
 MODULE.bazel.lock
 dex-rs/app-server-protocol/schema/json/dex_app_server_protocol.schemas.json
 dex-rs/app-server-protocol/schema/json/dex_app_server_protocol.v2.schemas.json
+dex-rs/models-manager/models.json
 dex-rs/tui/tests/fixtures/oss-story.jsonl
 dex-rs/tui_app_server/tests/fixtures/oss-story.jsonl
 dex-rs/tui/src/app.rs

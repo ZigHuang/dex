@@ -1,0 +1,16 @@
+---
+source: tui/src/onboarding/gcp_tests.rs
+expression: terminal.backend().to_string()
+---
+  Configure API access
+
+> 1. Use an API key
+     Connect using your provider API key
+
+  2. Use Amazon Bedrock
+     Connect using your AWS credentials
+
+  3. Use Google Cloud Vertex AI
+     Connect using your Google Cloud credentials
+
+  Press enter to continue

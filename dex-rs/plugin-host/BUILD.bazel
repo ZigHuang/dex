@@ -1,0 +1,7 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "plugin-host",
+    crate_name = "dex_plugin_host",
+    test_only_binaries = ["dex-plugin-test-helper"],
+)

@@ -131,7 +131,7 @@ pub(crate) fn build_pet_picker_params(
         stacked_side_content: Some(Box::new(())),
         preserve_side_content_bg: true,
         on_selection_changed,
-        ..Default::default()
+        ..SelectionViewParams::picker()
     }
 }
 
@@ -251,8 +251,8 @@ mod tests {
                 "Disable terminal pets",
                 "BSOD",
                 "Chefito",
-                "Dex",
                 "Dewey",
+                "Dex",
                 "Fireball",
                 "Null Signal",
                 "Rocky",
@@ -276,9 +276,9 @@ mod tests {
             PetPickerPreviewState::default(),
         );
 
-        assert_eq!(params.initial_selected_idx, Some(2));
-        assert_eq!(params.items[2].name, "Dex");
-        assert!(!params.items[2].is_current);
+        assert_eq!(params.initial_selected_idx, Some(3));
+        assert_eq!(params.items[3].name, "Dex");
+        assert!(!params.items[3].is_current);
     }
 
     #[test]

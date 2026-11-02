@@ -157,6 +157,8 @@ async fn exec_server_http_request_rejects_protected_environment_headers() -> any
         "DEX_EXEC_SERVER_NOISE_AUTH_TOKEN",
         "dex_exec_server_noise_auth_token",
         "OPENAI_API_KEY",
+        "DEX_GUARDIAN_DECISIONS_API_KEY",
+        "dex_guardian_decisions_api_key",
         "DEX_ACCESS_TOKEN",
         "DEX_CONNECTORS_TOKEN",
         "AWS_SECRET_ACCESS_KEY",

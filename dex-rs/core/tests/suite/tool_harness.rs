@@ -1,6 +1,6 @@
 #![cfg(not(target_os = "windows"))]
 
-use core_test_support::test_dex::local_selections;
+use core_test_support::test_dex::local_requests;
 use dex_core::TurnInputRequest;
 use std::fs;
 
@@ -105,7 +105,7 @@ async fn exec_command_tool_executes_command_and_streams_output() -> anyhow::Resu
             text_elements: Vec::new(),
         }])
         .with_thread_settings(ThreadSettingsOverrides {
-            environments: Some(local_selections(cwd_path)),
+            environments: Some(local_requests(cwd_path)),
             approval_policy: Some(AskForApproval::Never),
             sandbox_policy: Some(sandbox_policy),
             permission_profile,
@@ -140,7 +140,7 @@ async fn update_plan_tool_emits_plan_update_event() -> anyhow::Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_dex();
+    let mut builder = test_dex().with_config(|config| config.update_plan_enabled = true);
     let TestDex {
         dex,
         cwd,
@@ -182,7 +182,7 @@ async fn update_plan_tool_emits_plan_update_event() -> anyhow::Result<()> {
             text_elements: Vec::new(),
         }])
         .with_thread_settings(ThreadSettingsOverrides {
-            environments: Some(local_selections(cwd_path)),
+            environments: Some(local_requests(cwd_path)),
             approval_policy: Some(AskForApproval::Never),
             sandbox_policy: Some(sandbox_policy),
             permission_profile,
@@ -231,7 +231,7 @@ async fn update_plan_tool_rejects_malformed_payload() -> anyhow::Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_dex();
+    let mut builder = test_dex().with_config(|config| config.update_plan_enabled = true);
     let TestDex {
         dex,
         cwd,
@@ -269,7 +269,7 @@ async fn update_plan_tool_rejects_malformed_payload() -> anyhow::Result<()> {
             text_elements: Vec::new(),
         }])
         .with_thread_settings(ThreadSettingsOverrides {
-            environments: Some(local_selections(cwd_path)),
+            environments: Some(local_requests(cwd_path)),
             approval_policy: Some(AskForApproval::Never),
             sandbox_policy: Some(sandbox_policy),
             permission_profile,
@@ -366,7 +366,7 @@ async fn apply_patch_tool_executes_and_emits_patch_events() -> anyhow::Result<()
             text_elements: Vec::new(),
         }])
         .with_thread_settings(ThreadSettingsOverrides {
-            environments: Some(local_selections(cwd_path)),
+            environments: Some(local_requests(cwd_path)),
             approval_policy: Some(AskForApproval::Never),
             sandbox_policy: Some(sandbox_policy),
             permission_profile,
@@ -500,7 +500,7 @@ async fn apply_patch_reports_parse_diagnostics() -> anyhow::Result<()> {
             text_elements: Vec::new(),
         }])
         .with_thread_settings(ThreadSettingsOverrides {
-            environments: Some(local_selections(cwd_path)),
+            environments: Some(local_requests(cwd_path)),
             approval_policy: Some(AskForApproval::Never),
             sandbox_policy: Some(sandbox_policy),
             permission_profile,

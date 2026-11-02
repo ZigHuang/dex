@@ -1,0 +1,36 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-multi-env-copy-file"
+version.workspace = true
+
+[lib]
+test = false
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+dex-extension-api = { workspace = true }
+dex-tools = { workspace = true }
+dex-utils-path-uri = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+dex-config = { workspace = true }
+dex-core = { workspace = true }
+dex-exec-server = { workspace = true }
+dex-features = { workspace = true }
+dex-models-manager = { workspace = true }
+dex-protocol = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+core_test_support = { workspace = true }
+insta = { workspace = true, features = ["json", "filters"] }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+test-case = "3.3.1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

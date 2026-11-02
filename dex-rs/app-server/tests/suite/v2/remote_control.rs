@@ -10,15 +10,16 @@ use app_test_support::ChatGptAuthFixture;
 use app_test_support::DEFAULT_CLIENT_NAME;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
+use app_test_support::create_fake_paginated_rollout;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use dex_app_server::AppServerRuntimeOptions;
 use dex_app_server::AppServerTransport;
-use dex_app_server::AppServerWebsocketAuthSettings;
 use dex_app_server::PluginStartupTasks;
 use dex_app_server::RemoteControlStartupMode;
 use dex_app_server::run_main_with_transport_options;
 use dex_app_server_protocol::ClientRequest;
+use dex_app_server_protocol::InitializeCapabilities;
 use dex_app_server_protocol::JSONRPCError;
 use dex_app_server_protocol::JSONRPCResponse;
 use dex_app_server_protocol::RemoteControlClient;
@@ -37,6 +38,8 @@ use dex_app_server_protocol::RemoteControlPairingStatusResponse;
 use dex_app_server_protocol::RemoteControlStatusChangedNotification;
 use dex_app_server_protocol::RemoteControlStatusReadResponse;
 use dex_app_server_protocol::RequestId;
+use dex_app_server_protocol::ThreadResumeParams;
+use dex_app_server_protocol::ThreadResumeResponse;
 use dex_arg0::Arg0DispatchPaths;
 use dex_config::LoaderOverrides;
 use dex_config::types::AuthCredentialsStoreMode;
@@ -44,6 +47,7 @@ use dex_protocol::protocol::SessionSource;
 use dex_state::RemoteControlEnrollmentRecord;
 use dex_state::StateRuntime;
 use dex_utils_cli::CliConfigOverrides;
+use dex_websocket_auth::WebsocketAuthSettings;
 use futures::SinkExt;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
@@ -62,6 +66,9 @@ use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[path = "remote_control_auth.rs"]
+mod auth_tests;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_CONTROL_DISABLED_BY_REQUIREMENTS_MESSAGE: &str =
     "remote control is disabled by managed requirements";
@@ -213,7 +220,10 @@ async fn explicit_remote_control_startup_fails_when_disabled_by_requirements() -
         "allow_remote_control = false\n",
     )?;
     let managed_config_path = dex_home.path().join("managed_config.toml");
-    let socket_path = dex_home.path().join("app-server.sock");
+    let socket_path = dex_home
+        .path()
+        .join("app-server-control")
+        .join("app-server.sock");
     let transport =
         AppServerTransport::from_listen_url(&format!("unix://{}", socket_path.display()))?;
     let _dex_home_guard = EnvVarGuard::set("DEX_HOME", dex_home.path().as_os_str());
@@ -232,7 +242,7 @@ async fn explicit_remote_control_startup_fails_when_disabled_by_requirements() -
             /*default_analytics_enabled*/ false,
             transport,
             SessionSource::VSCode,
-            AppServerWebsocketAuthSettings::default(),
+            WebsocketAuthSettings::default(),
             AppServerRuntimeOptions {
                 plugin_startup_tasks: PluginStartupTasks::Skip,
                 remote_control_startup_mode: RemoteControlStartupMode::EnabledEphemeral,
@@ -491,6 +501,116 @@ async fn stdio_eof_exits_with_remote_control_connection() -> Result<()> {
 }
 
 #[tokio::test]
+async fn stdio_eof_releases_thread_writer_with_pending_remote_control_enable() -> Result<()> {
+    let dex_home = TempDir::new()?;
+    let mut backend = BlockingRemoteControlBackend::start(dex_home.path()).await?;
+    let config_path = dex_home.path().join("config.toml");
+    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
+    // Keep thread initialization from using the enrollment-only backend for unrelated requests.
+    let features = config["features"]
+        .as_table_mut()
+        .context("fixture features should be a table")?;
+    features.insert("apps".to_string(), toml::Value::Boolean(false));
+    features.insert("remote_plugin".to_string(), toml::Value::Boolean(false));
+    std::fs::write(
+        config_path,
+        format!(
+            "{}\n[analytics]\nenabled = false\n",
+            toml::to_string(&config)?
+        ),
+    )?;
+    let thread_id = create_fake_paginated_rollout(
+        dex_home.path(),
+        "2025-01-01T00-00-00",
+        "2025-01-01T00:00:00Z",
+        "owned thread",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let mut owner = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let _: ThreadResumeResponse = owner
+        .request(|request_id| ClientRequest::ThreadResume {
+            request_id,
+            params: ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                exclude_turns: true,
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    let secondary_sqlite_home = TempDir::new()?;
+    let secondary_sqlite_home_path = secondary_sqlite_home.path().to_string_lossy();
+    let mut secondary = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("DEX_SQLITE_HOME", Some(secondary_sqlite_home_path.as_ref()))])
+        .build_initialized()
+        .await?;
+    let resume_id = secondary
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let error = timeout(
+        DEFAULT_TIMEOUT,
+        secondary.read_stream_until_error_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    assert_eq!(error.error.code, -32600);
+    assert_eq!(
+        error.error.message,
+        format!("thread {thread_id} already has an active writer")
+    );
+
+    owner.send_remote_control_enable_request().await?;
+    assert_eq!(
+        timeout(DEFAULT_TIMEOUT, backend.wait_for_enroll_request()).await??,
+        "POST /backend-api/wham/remote/control/server/enroll HTTP/1.1"
+    );
+    // Keep enrollment pending while EOF requests teardown of the owning process.
+    let status = timeout(DEFAULT_TIMEOUT, owner.shutdown_gracefully())
+        .await
+        .context("stdio EOF did not stop the thread writer while enrollment was pending")??;
+    assert!(status.success());
+
+    let state_db = StateRuntime::init(
+        dex_state::SqliteConfig::new_for_testing(dex_home.path().abs()),
+        "test-provider".to_string(),
+    )
+    .await?;
+    assert_eq!(
+        state_db
+            .get_remote_control_enrollment(
+                backend.websocket_url(),
+                "account_id",
+                Some(DEFAULT_CLIENT_NAME),
+            )
+            .await?,
+        None
+    );
+
+    let resumed: ThreadResumeResponse = secondary
+        .request(|request_id| ClientRequest::ThreadResume {
+            request_id,
+            params: ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                exclude_turns: true,
+                ..Default::default()
+            },
+        })
+        .await?;
+    assert_eq!(resumed.thread.id, thread_id);
+    Ok(())
+}
+
+#[tokio::test]
 async fn disable_waits_for_in_flight_durable_enable() -> Result<()> {
     let dex_home = TempDir::new()?;
     let mut backend = BlockingRemoteControlBackend::start(dex_home.path()).await?;
@@ -591,6 +711,84 @@ async fn rpc_updates_durable_preference_but_ephemeral_does_not() -> Result<()> {
         Some(false)
     );
 
+    assert!(
+        !dex_home
+            .path()
+            .join("app-server-daemon/settings.json")
+            .exists()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_rpc_persists_unless_daemon_lock_is_busy() -> Result<()> {
+    use super::daemon_update_recovery::connect_daemon_client;
+    use super::daemon_update_recovery::request;
+    use super::daemon_update_recovery::spawn_server;
+    use serde_json::json;
+
+    let home = TempDir::new()?;
+    let mut backend = BlockingRemoteControlBackend::start(home.path()).await?;
+    let socket = home.path().join("control/server.sock");
+    let settings_file = home.path().join("app-server-daemon/settings.json");
+    let _server = spawn_server(home.path(), &socket)?;
+    let mut client = connect_daemon_client(
+        &socket,
+        InitializeCapabilities {
+            experimental_api: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let enable = request(
+        &mut client,
+        /*id*/ 2,
+        "remoteControl/enable",
+        json!(null),
+    );
+    let enroll = async {
+        timeout(DEFAULT_TIMEOUT, backend.wait_for_enroll_request()).await??;
+        backend.complete_enrollment()
+    };
+    tokio::try_join!(enable, enroll)?;
+    let mut settings = tokio::fs::read(&settings_file).await?;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&settings)?,
+        json!({"remoteControlEnabled": true})
+    );
+    for (id, method, ephemeral) in [
+        (3, "remoteControl/disable", true),
+        (4, "remoteControl/disable", false),
+        (5, "remoteControl/enable", true),
+    ] {
+        request(&mut client, id, method, json!({"ephemeral": ephemeral})).await?;
+        let updated = tokio::fs::read(&settings_file).await?;
+        if ephemeral {
+            assert_eq!(updated, settings);
+        } else {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&updated)?,
+                json!({"remoteControlEnabled": false})
+            );
+        }
+        settings = updated;
+    }
+    // A lifecycle operation holding daemon.lock must not block the RPC or
+    // allow it to overwrite other settings being changed by the daemon.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(settings_file.with_file_name("daemon.lock"))?;
+    lock.lock()?;
+    request(
+        &mut client,
+        /*id*/ 6,
+        "remoteControl/enable",
+        json!(null),
+    )
+    .await?;
+    assert_eq!(tokio::fs::read(&settings_file).await?, settings);
     Ok(())
 }
 
@@ -834,6 +1032,7 @@ struct BlockingRemoteControlBackend {
 struct ConnectedRemoteControlBackend {
     initialized_rx: Option<oneshot::Receiver<std::result::Result<(), String>>>,
     server_task: JoinHandle<Result<()>>,
+    _models_server: wiremock::MockServer,
 }
 
 struct ClientManagementRemoteControlBackend {
@@ -844,6 +1043,20 @@ struct ClientManagementRemoteControlBackend {
 impl ConnectedRemoteControlBackend {
     async fn start(dex_home: &std::path::Path) -> Result<Self> {
         let listener = configured_remote_control_listener(dex_home).await?;
+        // Model refreshes can arrive after enrollment, when this listener expects a WebSocket.
+        let models_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/models"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(/*s*/ 200)
+                    .set_body_json(serde_json::json!({ "models": [] })),
+            )
+            .mount(&models_server)
+            .await;
+        let remote_control_url = format!("http://{}/backend-api/", listener.local_addr()?);
+        MockResponsesConfig::new(&models_server.uri())
+            .with_root_config(&format!("chatgpt_base_url = \"{remote_control_url}\""))
+            .write(dex_home)?;
         let (initialized_tx, initialized_rx) = oneshot::channel();
         let server_task = tokio::spawn(async move {
             let mut initialized_tx = Some(initialized_tx);
@@ -939,6 +1152,7 @@ impl ConnectedRemoteControlBackend {
         Ok(Self {
             initialized_rx: Some(initialized_rx),
             server_task,
+            _models_server: models_server,
         })
     }
 
@@ -1113,11 +1327,14 @@ impl PairingRemoteControlBackend {
                 )
                 .await?;
 
-                let request_after_enroll = read_http_request(&listener).await?;
-                let pair_http_request = if request_after_enroll.request_line.starts_with("GET ") {
-                    read_http_request(&listener).await?
-                } else {
-                    request_after_enroll
+                let mut websocket_connections = Vec::new();
+                let pair_http_request = loop {
+                    let request = read_http_request(&listener).await?;
+                    if request.request_line.starts_with("GET ") {
+                        websocket_connections.push(request);
+                    } else {
+                        break request;
+                    }
                 };
                 respond_with_json(
                     pair_http_request.reader.into_inner(),
@@ -1134,7 +1351,14 @@ impl PairingRemoteControlBackend {
                     serde_json::json!({ "pairing_code": "pairing-code" }),
                     serde_json::json!({ "manual_pairing_code": "ABCD-EFGH" }),
                 ] {
-                    let status_http_request = read_http_request(&listener).await?;
+                    let status_http_request = loop {
+                        let request = read_http_request(&listener).await?;
+                        if request.request_line.starts_with("GET ") {
+                            websocket_connections.push(request);
+                        } else {
+                            break request;
+                        }
+                    };
                     assert_eq!(
                         status_http_request.request_line,
                         "POST /backend-api/wham/remote/control/server/pair/status HTTP/1.1"
@@ -1209,8 +1433,18 @@ struct HttpRequest {
 async fn configured_remote_control_listener(dex_home: &std::path::Path) -> Result<TcpListener> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let remote_control_url = format!("http://{}/backend-api/", listener.local_addr()?);
+    let catalog_path = dex_home.join("models.json");
+    std::fs::write(
+        &catalog_path,
+        serde_json::to_vec(&dex_models_manager::bundled_models_response()?)?,
+    )?;
     MockResponsesConfig::new(&remote_control_url)
         .with_root_config(&format!("chatgpt_base_url = \"{remote_control_url}\""))
+        .with_root_config(&format!(
+            "model_catalog_json = {}",
+            serde_json::to_string(&catalog_path)?
+        ))
+        .disable_feature(dex_features::Feature::Plugins)
         .write(dex_home)?;
     write_chatgpt_auth(
         dex_home,

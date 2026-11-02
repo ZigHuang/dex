@@ -1,6 +1,11 @@
 use super::*;
+use crate::model_catalog::ModelCatalog;
+use dex_config::ConfigPathContext;
 use dex_core::config::permission_profile_catalog;
 use dex_hooks::HookListEntryHandler;
+use dex_utils_absolute_path::AbsolutePathBufGuard;
+use dex_utils_path_uri::PathConvention;
+use dex_utils_path_uri::PathUri;
 use futures::StreamExt;
 
 #[derive(Clone)]
@@ -10,13 +15,14 @@ pub(crate) struct CatalogRequestProcessor {
     pub(super) thread_manager: Arc<ThreadManager>,
     pub(super) config: Arc<Config>,
     pub(super) config_manager: ConfigManager,
+    model_catalog: Arc<ModelCatalog>,
 }
 
 const SKILLS_LIST_CWD_CONCURRENCY: usize = 5;
 
 fn skills_to_info(
     skills: &[dex_skills::SkillMetadata],
-    disabled_paths: &HashSet<AbsolutePathBuf>,
+    disabled_paths: &HashSet<PathUri>,
 ) -> Vec<dex_app_server_protocol::SkillMetadata> {
     skills
         .iter()
@@ -54,9 +60,10 @@ fn skills_to_info(
                             .collect(),
                     }
                 }),
-                path: skill.path_to_skills_md.clone(),
+                path: skill.path_to_skills_md.clone().into(),
                 scope: skill.scope.into(),
                 enabled,
+                plugin_id: skill.plugin_id.clone(),
             }
         })
         .collect()
@@ -65,6 +72,7 @@ fn skills_to_info(
 fn hooks_to_info(hooks: &[dex_hooks::HookListEntry]) -> Vec<HookMetadata> {
     hooks
         .iter()
+        .filter(|hook| !hook.builtin)
         .map(|hook| {
             let handler = match &hook.handler {
                 HookListEntryHandler::Command { command, r#async } => {
@@ -89,6 +97,7 @@ fn hooks_to_info(hooks: &[dex_hooks::HookListEntry]) -> Vec<HookMetadata> {
                 source_path: hook.source_path.clone(),
                 source: hook.source.into(),
                 plugin_id: hook.plugin_id.clone(),
+                environment_id: hook.environment_id.clone(),
                 display_order: hook.display_order,
                 enabled: hook.enabled,
                 is_managed: hook.is_managed,
@@ -118,6 +127,7 @@ impl CatalogRequestProcessor {
         thread_manager: Arc<ThreadManager>,
         config: Arc<Config>,
         config_manager: ConfigManager,
+        model_catalog: Arc<ModelCatalog>,
     ) -> Self {
         Self {
             outgoing,
@@ -125,6 +135,7 @@ impl CatalogRequestProcessor {
             thread_manager,
             config,
             config_manager,
+            model_catalog,
         }
     }
 
@@ -168,13 +179,47 @@ impl CatalogRequestProcessor {
         &self,
         params: ModelListParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        Self::list_models(
-            self.thread_manager.clone(),
-            self.config.http_client_factory(),
-            params,
+        let (config, models_manager) = self
+            .model_catalog
+            .current()
+            .await
+            .map_err(|err| config_load_error(&err))?;
+        // Gate the same provider used by the catalog, including when its model cache is warm.
+        // Resolving credentials may refresh them, but explicit host policy prevents browser login.
+        if let Some(gateway) = dex_model_provider::create_model_provider(
+            config.model_provider.clone(),
+            Some(self.thread_manager.auth_manager()),
         )
-        .await
-        .map(|response| Some(response.into()))
+        .gateway_auth_manager()
+        .map_err(|error| internal_error(error.to_string()))?
+        {
+            // Refreshing credentials can contact the gateway before the catalog's own check.
+            self.config_manager
+                .check_thread_model_provider(&config)
+                .await
+                .map_err(|err| config_load_error(&err))?;
+            if gateway.resolve_access_token().await.is_err() {
+                let current = self
+                    .config_manager
+                    .load_latest_config(/*fallback_cwd*/ None)
+                    .await
+                    .map_err(|err| config_load_error(&err))?;
+                // Configuration edits without an account transition still require a restart to refresh the model catalog.
+                if current.model_provider_id != config.model_provider_id
+                    || current.model_provider != config.model_provider
+                {
+                    return Err(invalid_request(
+                        "Model provider settings changed. Restart Dex to apply them, then retry fetching the model list",
+                    ));
+                }
+                return Err(invalid_request(
+                    "Gateway sign-in required or unavailable. Complete gateway sign-in and retry fetching the model list",
+                ));
+            }
+        }
+        self.list_models(params, config, models_manager)
+            .await
+            .map(|response| Some(response.into()))
     }
 
     pub(crate) async fn experimental_feature_list(
@@ -239,21 +284,26 @@ impl CatalogRequestProcessor {
     }
 
     async fn list_models(
-        thread_manager: Arc<ThreadManager>,
-        http_client_factory: dex_http_client::HttpClientFactory,
+        &self,
         params: ModelListParams,
+        config: Arc<Config>,
+        models_manager: dex_models_manager::manager::SharedModelsManager,
     ) -> Result<ModelListResponse, JSONRPCErrorError> {
         let ModelListParams {
             limit,
             cursor,
             include_hidden,
         } = params;
-        let models = supported_models(
-            thread_manager,
-            include_hidden.unwrap_or(false),
-            http_client_factory,
-        )
-        .await;
+        let presets = self
+            .model_catalog
+            .list_models_from_snapshot(
+                config,
+                models_manager,
+                dex_models_manager::manager::RefreshStrategy::OnlineIfUncached,
+            )
+            .await
+            .map_err(|err| config_load_error(&err))?;
+        let models = supported_models(presets, include_hidden.unwrap_or(false));
         let total = models.len();
 
         if total == 0 {
@@ -325,7 +375,10 @@ impl CatalogRequestProcessor {
                     .map_err(|_| invalid_request(format!("thread not found: {thread_id}")))?;
                 let thread_config = thread.config().await;
                 self.config_manager
-                    .load_latest_config_for_thread(thread_config.as_ref())
+                    .load_latest_config_with_session_layers(
+                        &thread_config.config_layer_stack,
+                        &thread_config.cwd,
+                    )
                     .await
                     .map_err(|err| internal_error(format!("failed to reload config: {err}")))?
             }
@@ -411,22 +464,26 @@ impl CatalogRequestProcessor {
         params: PermissionProfileListParams,
     ) -> Result<PermissionProfileListResponse, JSONRPCErrorError> {
         let PermissionProfileListParams { cursor, limit, cwd } = params;
-        let config_layer_stack = match cwd {
-            Some(cwd) => {
-                let cwd = PathBuf::from(cwd);
-                let (_, config_layer_stack) = self
-                    .resolve_cwd_config(&cwd)
-                    .await
-                    .map_err(|err| internal_error(format!("failed to reload config: {err}")))?;
-                config_layer_stack
-            }
-            None => self
-                .config_manager
-                .load_config_layers(/*cwd*/ None)
+        let (cwd, config_layer_stack) = match cwd {
+            Some(cwd) => self
+                .resolve_cwd_config(&PathBuf::from(cwd))
                 .await
                 .map_err(|err| internal_error(format!("failed to reload config: {err}")))?,
+            None => (
+                self.config.cwd.clone(),
+                self.config_manager
+                    .load_config_layers(/*cwd*/ None)
+                    .await
+                    .map_err(|err| internal_error(format!("failed to reload config: {err}")))?,
+            ),
         };
-        let profiles = permission_profile_catalog(&config_layer_stack)
+        let context = ConfigPathContext::new(
+            PathConvention::native(),
+            Some(PathUri::from_abs_path(&cwd)),
+            AbsolutePathBufGuard::home_directory()
+                .and_then(|home| PathUri::from_host_native_path(home).ok()),
+        );
+        let profiles = permission_profile_catalog(&config_layer_stack, &context)
             .map_err(|err| internal_error(format!("failed to resolve permission profiles: {err}")))?
             .into_iter()
             .map(|profile| PermissionProfileSummary {
@@ -478,19 +535,12 @@ impl CatalogRequestProcessor {
             cwds
         };
 
-        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
         let skills_service = self.thread_manager.skills_service();
         let plugins_manager = self.thread_manager.plugins_manager();
-        if force_reload && config.features.enabled(Feature::Plugins) {
+        if force_reload {
             plugins_manager.clear_cache();
             skills_service.clear_cache();
         }
-        // Plugin configuration is user-scoped; workspace skill rules are applied below.
-        let plugins_input = config.plugins_config_input();
-        let plugins = plugins_manager.plugins_for_config(&plugins_input).await;
-        let effective_skill_roots = plugins.effective_plugin_skill_roots();
-        let plugin_skill_snapshots =
-            plugins_manager.plugin_skill_snapshots_for_config(&plugins_input);
         let fs = self
             .thread_manager
             .environment_manager()
@@ -501,12 +551,11 @@ impl CatalogRequestProcessor {
             .map(|(index, cwd)| {
                 let fs = fs.clone();
                 let skills_request = &skills_request;
-                let effective_skill_roots = effective_skill_roots.clone();
-                let plugin_skill_snapshots = plugin_skill_snapshots.clone();
+                let plugins_manager = Arc::clone(&plugins_manager);
                 async move {
-                    let (cwd_abs, config_layer_stack) = match self.resolve_cwd_config(&cwd).await {
+                    let config = match self.load_latest_config(Some(cwd.clone())).await {
                         Ok(resolved) => resolved,
-                        Err(message) => {
+                        Err(error) => {
                             let error_path = cwd.clone();
                             return (
                                 index,
@@ -515,16 +564,20 @@ impl CatalogRequestProcessor {
                                     skills: Vec::new(),
                                     errors: vec![dex_app_server_protocol::SkillErrorInfo {
                                         path: error_path,
-                                        message,
+                                        message: error.message,
                                     }],
                                 },
                             );
                         }
                     };
+                    let plugins_input = config.plugins_config_input();
+                    let plugins = plugins_manager.plugins_for_config(&plugins_input).await;
+                    let plugin_skill_snapshots =
+                        plugins_manager.plugin_skill_snapshots_for_config(&plugins_input);
                     let skills_input = dex_skills_extension::HostSkillsLoadInput::new(
-                        cwd_abs.clone(),
-                        effective_skill_roots,
-                        config_layer_stack,
+                        config.cwd.clone(),
+                        plugins.effective_plugin_skill_roots(),
+                        config.config_layer_stack,
                     )
                     .with_plugin_skill_snapshots(plugin_skill_snapshots);
                     let snapshot = skills_request
@@ -569,12 +622,35 @@ impl CatalogRequestProcessor {
         Ok(SkillsExtraRootsSetResponse {})
     }
 
-    /// Handle `hooks/list` by resolving hooks for each requested cwd.
+    /// Resolve a loaded thread's hook inventory, or inspect configuration for each requested cwd.
     async fn hooks_list_response(
         &self,
         params: HooksListParams,
     ) -> Result<HooksListResponse, JSONRPCErrorError> {
-        let HooksListParams { cwds } = params;
+        let HooksListParams { cwds, thread_id } = params;
+        if let Some(thread_id) = thread_id {
+            if !cwds.is_empty() {
+                return Err(invalid_request("specify either threadId or cwds"));
+            }
+            let thread_id = ThreadId::from_string(&thread_id)
+                .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+            let thread = self
+                .thread_manager
+                .get_thread(thread_id)
+                .await
+                .map_err(|_| invalid_request(format!("thread not found: {thread_id}")))?;
+            let cwd = thread.config_snapshot().await.cwd().to_path_buf();
+            let hooks = thread.list_hooks();
+            return Ok(HooksListResponse {
+                data: vec![dex_app_server_protocol::HooksListEntry {
+                    cwd,
+                    hooks: hooks_to_info(&hooks.hooks),
+                    warnings: hooks.warnings,
+                    errors: Vec::new(),
+                }],
+            });
+        }
+
         let cwds = if cwds.is_empty() {
             vec![self.config.cwd.to_path_buf()]
         } else {
@@ -619,14 +695,17 @@ impl CatalogRequestProcessor {
             } else {
                 dex_core_plugins::PluginHookLoadOutcome::default()
             };
-            let hooks = dex_hooks::list_hooks(dex_hooks::HooksConfig {
+            let hooks_config = dex_hooks::HooksConfig {
                 feature_enabled: hooks_enabled,
                 bypass_hook_trust: config.bypass_hook_trust,
                 config_layer_stack: Some(config.config_layer_stack),
                 plugin_hook_sources: plugin_hooks.hook_sources,
                 plugin_hook_load_warnings: plugin_hooks.hook_load_warnings,
                 ..Default::default()
-            });
+            };
+            let hooks = tokio::task::spawn_blocking(move || dex_hooks::list_hooks(hooks_config))
+                .await
+                .map_err(|err| internal_error(format!("hook discovery task failed: {err}")))?;
             data.push(dex_app_server_protocol::HooksListEntry {
                 cwd,
                 hooks: hooks_to_info(&hooks.hooks),

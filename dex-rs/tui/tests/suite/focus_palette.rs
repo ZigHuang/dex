@@ -14,6 +14,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
+use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
 // Full startup continues after the composer first appears and can be slower under Rosetta in CI.
@@ -21,13 +22,20 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
 const FOCUS_INPUT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 5);
 const FOCUS_PROBE_INPUT: &str = "focus-palette-24527";
 
+#[path = "external_editor_tests.rs"]
+mod external_editor;
+#[path = "gov_cloud_guidance_tests.rs"]
+mod gov_cloud_guidance;
+#[path = "tui_mode_picker_tests.rs"]
+mod tui_mode_picker;
+
 #[test]
 fn focus_gained_with_unanswered_palette_queries_preserves_immediate_input() -> Result<()> {
     let repo_root = dex_utils_cargo_bin::repo_root()?;
     let dex_home = tempfile::tempdir()?;
     write_test_config(dex_home.path(), &repo_root)?;
 
-    let mut terminal = PtyDex::start(&repo_root, dex_home)?;
+    let mut terminal = PtyDex::start(&repo_root, dex_home, &["--no-alt-screen"])?;
     terminal.wait_for_startup()?;
 
     let startup_output_len = terminal.output.len();
@@ -45,8 +53,249 @@ fn focus_gained_with_unanswered_palette_queries_preserves_immediate_input() -> R
     Ok(())
 }
 
-struct PtyDex {
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_startup_honors_dex_home_symlink_opt_out() -> Result<()> {
+    use core_test_support::responses;
+    use wiremock::matchers::body_string_contains;
+
+    core_test_support::skip_if_sandbox!(Ok(()));
+    let workspace = tempfile::tempdir()?;
+    let workspace_path = workspace.path().canonicalize()?;
+    let dex_home = tempfile::tempdir()?;
+    let target = tempfile::tempdir()?;
+    let visualizations = dex_home.path().join("visualizations");
+    std::os::unix::fs::symlink(target.path(), &visualizations)?;
+    write_test_config(dex_home.path(), &workspace_path)?;
+
+    let server = responses::start_mock_server().await;
+    // Automatic thread-title requests must not consume the tool responses.
+    let _title_mock = responses::mount_sse_once_match(
+        &server,
+        body_string_contains(r#"\"thread_source\":\"system\""#),
+        responses::sse(vec![
+            responses::ev_assistant_message("title", r#"{"title":"Symlink probe"}"#),
+            responses::ev_completed("title"),
+        ]),
+    )
+    .await;
+    let _write_mock = responses::mount_sse_once_match(
+        &server,
+        body_string_contains(r#"\"thread_source\":\"user\""#),
+        responses::sse(vec![
+            responses::ev_exec_command_call_with_args(
+                "write",
+                &serde_json::json!({
+                    "cmd": "printf ready > ready.txt",
+                    "workdir": visualizations,
+                    "shell": "/bin/sh",
+                    "login": false,
+                }),
+            ),
+            responses::ev_completed("startup"),
+        ]),
+    )
+    .await;
+    let completion_mock = responses::mount_sse_once_match(
+        &server,
+        body_string_contains(r#"\"thread_source\":\"user\""#),
+        responses::sse(vec![
+            responses::ev_assistant_message("ready", "symlink-opt-out-ready"),
+            responses::ev_completed("complete"),
+        ]),
+    )
+    .await;
+    let base_url = server.uri();
+    let visualizations = toml::Value::String(visualizations.display().to_string());
+    let config_path = dex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        config_path,
+        format!(
+            "allow_symlinked_dex_home = true\n\
+             sandbox_mode = \"workspace-write\"\n\
+             approval_policy = \"never\"\n\
+             {config}\n\
+             [sandbox_workspace_write]\nwritable_roots = [{visualizations}]\n\
+             [model_providers.test]\nname = \"Mock\"\n\
+             base_url = \"{base_url}/v1\"\nwire_api = \"responses\"\n\
+             requires_openai_auth = false\nsupports_websockets = false\n"
+        ),
+    )?;
+
+    // A fresh home has no daemon. Writing through the link exercises the embedded server's
+    // local executor and its sandbox policy.
+    let mut terminal = PtyDex::start(
+        &workspace_path,
+        dex_home,
+        &[
+            "--no-alt-screen",
+            "-c",
+            "model_provider=\"test\"",
+            "Write ready.txt",
+        ],
+    )?;
+    terminal.wait_for_startup()?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while Instant::now() < deadline {
+        terminal.read_output(Duration::from_millis(/*millis*/ 50))?;
+        if terminal.screen_contains("symlink-opt-out-ready") {
+            let tool_output = completion_mock
+                .function_call_output_text("write")
+                .context("missing symlink write tool output")?;
+            ensure!(
+                tool_output.contains("Process exited with code 0"),
+                "{tool_output}"
+            );
+            assert_eq!(std::fs::read(target.path().join("ready.txt"))?, b"ready");
+            return Ok(());
+        }
+        if terminal.child.try_wait()?.is_some() {
+            break;
+        }
+    }
+    bail!(
+        "interactive startup did not honor the symlink opt-out; screen:\n{}",
+        terminal.screen_contents(),
+    );
+}
+
+#[test]
+fn default_owned_screen_entry_paints_before_sync_ends_and_exit_clears_inline_draft() -> Result<()> {
+    let repo_root = dex_utils_cargo_bin::repo_root()?;
+    let dex_home = tempfile::tempdir()?;
+    write_test_config(dex_home.path(), &repo_root)?;
+    let mut terminal = PtyDex::start(&repo_root, dex_home, &[])?;
+    terminal.wait_for_startup()?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while !terminal.parser.screen().alternate_screen() && Instant::now() < deadline {
+        terminal.read_output(Duration::from_millis(/*millis*/ 50))?;
+        terminal.answer_startup_queries()?;
+        terminal.ensure_running()?;
+    }
+    ensure!(
+        terminal.parser.screen().alternate_screen(),
+        "owned screen did not open"
+    );
+    terminal.wait_for_screen("GPT-5.6-Terra")?;
+    ensure!(
+        terminal.parser.screen().alternate_screen(),
+        "fullscreen did not survive application startup"
+    );
+    let enter_alt = b"\x1b[?1049h";
+    let begin_sync = b"\x1b[?2026h";
+    let end_sync = b"\x1b[?2026l";
+    let entry = terminal
+        .output
+        .windows(enter_alt.len())
+        .position(|bytes| bytes == enter_alt)
+        .context("missing owned-screen entry")?;
+    let begin = terminal.output[..entry]
+        .windows(begin_sync.len())
+        .rposition(|bytes| bytes == begin_sync)
+        .context("missing synchronized update before owned-screen entry")?;
+    ensure!(
+        !terminal.output[begin..entry]
+            .windows(end_sync.len())
+            .any(|bytes| bytes == end_sync),
+        "owned-screen entry happened outside a synchronized update"
+    );
+    let end = entry
+        + terminal.output[entry..]
+            .windows(end_sync.len())
+            .position(|bytes| bytes == end_sync)
+            .context("missing synchronized update end after owned-screen entry")?;
+    let (rows, cols) = terminal.parser.screen().size();
+    let mut first_frame = vt100::Parser::new(rows, cols, /*scrollback_len*/ 0);
+    first_frame.process(&terminal.output[..end]);
+    let first_contents = first_frame.screen().contents();
+    ensure!(
+        first_contents.contains("Dex") && first_contents.contains("Ask Dex to do anything"),
+        "owned-screen synchronization ended before its first complete loading frame:\n{first_contents}"
+    );
+    let composer_row = first_contents
+        .lines()
+        .position(|line| line.contains("Ask Dex to do anything"))
+        .context("missing composer in first owned-screen frame")?;
+    assert_eq!(
+        (
+            first_contents.matches("Ask Dex to do anything").count(),
+            first_frame.screen().cursor_position(),
+            first_frame.screen().hide_cursor(),
+        ),
+        (1, (u16::try_from(composer_row)?, 2), false),
+        "first owned-screen frame must contain one composer with its visible cursor"
+    );
+    let exit_start = terminal.output.len();
+    terminal.write_input(b"\x1b[99;5u")?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while !contains_bytes(&terminal.output[exit_start..], b"\x1b[c") {
+        terminal.ensure_running()?;
+        ensure!(Instant::now() < deadline, "missing exit DA1 query");
+        terminal.read_output(Duration::from_millis(/*millis*/ 50))?;
+    }
+    assert_eq!(
+        terminal.parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    // The DA1 reply straddles the first 1 KiB of in-flight mouse reports.
+    let mut reports = b"\x1b[<51;23;56M".repeat(85);
+    reports.extend_from_slice(b"\x1b[?1;2c");
+    terminal.write_input(&reports)?;
+    loop {
+        terminal.read_output(Duration::from_millis(/*millis*/ 50))?;
+        if let Some(status) = terminal.child.try_wait()? {
+            ensure!(status.success(), "owned screen exited with {status}");
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "owned screen did not exit; screen:\n{}",
+            terminal.screen_contents()
+        );
+    }
+    terminal.write_input(b"shell\n")?;
+    let mut shell_input = [0; 6];
+    terminal.slave.read_exact(&mut shell_input)?;
+    assert_eq!(&shell_input, b"shell\n");
+    ensure!(
+        !terminal.parser.screen().alternate_screen(),
+        "alternate screen was not restored"
+    );
+    ensure!(
+        !terminal
+            .screen_contents()
+            .contains("Ask Dex to do anything"),
+        "owned-screen exit left the inline composer visible"
+    );
+    Ok(())
+}
+
+#[test]
+fn fullscreen_transcript_can_opt_out_to_terminal_scrollback() -> Result<()> {
+    let repo_root = dex_utils_cargo_bin::repo_root()?;
+    let dex_home = tempfile::tempdir()?;
+    write_test_config(dex_home.path(), &repo_root)?;
+    let mut terminal = PtyDex::start(
+        &repo_root,
+        dex_home,
+        &["-c", "tui.fullscreen_transcript=false"],
+    )?;
+    terminal.wait_for_startup()?;
+    terminal.wait_for_screen("GPT-5.6-Terra")?;
+    ensure!(
+        !terminal
+            .output
+            .windows(b"\x1b[?1049h".len())
+            .any(|bytes| bytes == b"\x1b[?1049h"),
+        "fullscreen opt-out entered the alternate screen"
+    );
+    Ok(())
+}
+
+pub(super) struct PtyDex {
     master: File,
+    slave: File,
     child: Child,
     parser: vt100::Parser,
     output: Vec<u8>,
@@ -57,7 +306,30 @@ struct PtyDex {
 }
 
 impl PtyDex {
-    fn start(repo_root: &Path, dex_home: TempDir) -> Result<Self> {
+    pub(super) fn start(repo_root: &Path, dex_home: TempDir, extra_args: &[&str]) -> Result<Self> {
+        let dex = dex_utils_cargo_bin::cargo_bin("dex-tui")
+            .or_else(|_| dex_utils_cargo_bin::cargo_bin("dex"))?;
+        Self::start_binary(&dex, repo_root, dex_home, extra_args, /*editor*/ None)
+    }
+
+    /// Include the CLI dispatch futures when testing production stack headroom.
+    pub(super) fn start_cli(
+        repo_root: &Path,
+        dex_home: TempDir,
+        extra_args: &[&str],
+    ) -> Result<Self> {
+        let dex = dex_utils_cargo_bin::cargo_bin("dex")
+            .context("build dex-cli and set CARGO_BIN_EXE_dex to its executable")?;
+        Self::start_binary(&dex, repo_root, dex_home, extra_args, /*editor*/ None)
+    }
+
+    fn start_binary(
+        dex: &Path,
+        repo_root: &Path,
+        dex_home: TempDir,
+        extra_args: &[&str],
+        editor: Option<&Path>,
+    ) -> Result<Self> {
         let mut master_fd = -1;
         let mut slave_fd = -1;
         let mut window_size = libc::winsize {
@@ -89,25 +361,32 @@ impl PtyDex {
         let stdin = slave.try_clone().context("clone pseudo-terminal stdin")?;
         let stdout = slave.try_clone().context("clone pseudo-terminal stdout")?;
 
-        let dex = dex_utils_cargo_bin::cargo_bin("dex")
-            .or_else(|_| dex_utils_cargo_bin::cargo_bin("dex-tui"))?;
-        let child = Command::new(dex)
-            .arg("--no-alt-screen")
+        let mut command = Command::new(dex);
+        if let Some(editor) = editor {
+            command.env("VISUAL", editor);
+        }
+        let child = command
+            .args(extra_args)
             .arg("-C")
             .arg(repo_root)
-            .arg("-c")
-            .arg("analytics.enabled=false")
             .env("TERM", "xterm-256color")
+            // This PTY answers its own capability probes; it is not inside the caller's mux.
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .env_remove("STY")
+            .env("TERM_PROGRAM", "kitty")
+            .env_remove("TERM_PROGRAM_VERSION")
             .env("OPENAI_API_KEY", "focus-palette-test")
             .env("DEX_HOME", dex_home.path())
             .stdin(stdin)
             .stdout(stdout)
-            .stderr(slave)
+            .stderr(slave.try_clone()?)
             .spawn()
             .context("start Dex in focus-test pseudo-terminal")?;
 
         Ok(Self {
             master,
+            slave,
             child,
             parser: vt100::Parser::new(
                 /*rows*/ 32, /*cols*/ 120, /*scrollback_len*/ 0,
@@ -120,7 +399,7 @@ impl PtyDex {
         })
     }
 
-    fn wait_for_startup(&mut self) -> Result<()> {
+    pub(super) fn wait_for_startup(&mut self) -> Result<()> {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         while Instant::now() < deadline {
             self.read_output(Duration::from_millis(/*millis*/ 50))?;
@@ -178,8 +457,11 @@ impl PtyDex {
             self.cursor_answered = true;
         }
 
-        if !self.keyboard_answered && contains_bytes(&self.output, b"\x1b[?u") {
-            self.write_input(b"\x1b[?0u\x1b[?1;2c")?;
+        if !self.keyboard_answered && contains_bytes(&self.output, b"\x1b[c") {
+            if contains_bytes(&self.output, b"\x1b[?u") {
+                self.write_input(b"\x1b[?7u")?;
+            }
+            self.write_input(b"\x1b[?1;2c")?;
             self.keyboard_answered = true;
         }
 
@@ -194,7 +476,7 @@ impl PtyDex {
         Ok(())
     }
 
-    fn read_output(&mut self, timeout: Duration) -> Result<()> {
+    pub(super) fn read_output(&mut self, timeout: Duration) -> Result<()> {
         let timeout_ms = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
         let mut descriptor = libc::pollfd {
             fd: self.master.as_raw_fd(),
@@ -224,18 +506,42 @@ impl PtyDex {
         Ok(())
     }
 
-    fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
+    pub(super) fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
         self.master.write_all(bytes)?;
         self.master.flush()?;
         Ok(())
     }
 
-    fn screen_contains(&self, text: &str) -> bool {
+    pub(super) fn screen_contains(&self, text: &str) -> bool {
         self.parser.screen().contents().contains(text)
     }
 
-    fn screen_contents(&self) -> String {
+    pub(super) fn screen_contents(&self) -> String {
         self.parser.screen().contents()
+    }
+
+    pub(super) fn wait_for_screen(&mut self, text: &str) -> Result<()> {
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        while Instant::now() < deadline {
+            self.read_output(Duration::from_millis(/*millis*/ 50))?;
+            self.answer_startup_queries()?;
+            if self.screen_contains(text) {
+                return Ok(());
+            }
+            if let Some(status) = self.child.try_wait()? {
+                bail!("Dex exited while waiting for {text:?} ({status})");
+            }
+        }
+        bail!("missing {text:?}; screen:\n{}", self.screen_contents())
+    }
+
+    pub(super) fn ensure_running(&mut self) -> Result<()> {
+        ensure!(
+            self.child.try_wait()?.is_none(),
+            "Dex exited unexpectedly; screen:\n{}",
+            self.screen_contents()
+        );
+        Ok(())
     }
 }
 
@@ -250,11 +556,13 @@ fn contains_bytes(buffer: &[u8], needle: &[u8]) -> bool {
     buffer.windows(needle.len()).any(|window| window == needle)
 }
 
-fn write_test_config(dex_home: &Path, repo_root: &Path) -> Result<()> {
+pub(super) fn write_test_config(dex_home: &Path, repo_root: &Path) -> Result<()> {
     let repo_root = repo_root.display();
     let config = format!(
         "model = \"gpt-5.6-terra\"\nmodel_provider = \"openai\"\n\
-         suppress_unstable_features_warning = true\n\n\
+         suppress_unstable_features_warning = true\nanalytics.enabled = false\n\
+         features.daemon_auto_start = false\n\
+         notice.model_migrations.\"gpt-5.6-terra\" = \"gpt-6-sol\"\n\n\
          [projects.\"{repo_root}\"]\ntrust_level = \"trusted\"\n"
     );
     std::fs::write(dex_home.join("config.toml"), config)
@@ -264,4 +572,101 @@ fn write_test_config(dex_home: &Path, repo_root: &Path) -> Result<()> {
         r#"{"OPENAI_API_KEY":"focus-palette-test","tokens":null,"last_refresh":null}"#,
     )
     .context("write focus-test API-key authentication")
+}
+
+#[test]
+fn no_daemon_skips_startup_and_discovery() -> Result<()> {
+    for running in [false, true] {
+        let workspace = tempfile::tempdir()?;
+        let home = tempfile::tempdir()?;
+        write_test_config(home.path(), workspace.path())?;
+        let config = home.path().join("config.toml");
+        let contents = std::fs::read_to_string(&config)?;
+        std::fs::write(
+            config,
+            contents.replace("features.daemon_auto_start = false\n", ""),
+        )?;
+        let socket_path = dex_app_server_client::app_server_control_socket_path(home.path())?;
+        std::fs::create_dir_all(socket_path.as_path().parent().unwrap())?;
+        let listener = if running {
+            let listener = std::os::unix::net::UnixListener::bind(socket_path.as_path())?;
+            listener.set_nonblocking(true)?;
+            Some(listener)
+        } else {
+            None
+        };
+        let mut terminal = PtyDex::start(workspace.path(), home, &["--no-daemon"])?;
+        terminal.wait_for_startup()?;
+        terminal.write_input(b"/status")?;
+        terminal.wait_for_screen("show current session configuration")?;
+        terminal.read_output(Duration::from_millis(/*millis*/ 200))?;
+        terminal.write_input(b"\r")?;
+        terminal.wait_for_screen("Model:")?;
+        ensure!(!terminal._dex_home.path().join("app-server-daemon").exists());
+        if let Some(listener) = listener {
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+        ensure!(
+            !String::from_utf8_lossy(&terminal.output)
+                .contains("Running without the shared background server")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn auto_daemon_start_failure_exits_with_manual_fallback_hint() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let home = tempfile::tempdir()?;
+    write_test_config(home.path(), workspace.path())?;
+    let config = home.path().join("config.toml");
+    let contents = std::fs::read_to_string(&config)?;
+    std::fs::write(
+        config,
+        contents.replace("features.daemon_auto_start = false\n", ""),
+    )?;
+    // An incomplete selected package must fail without installing a replacement.
+    std::fs::create_dir_all(home.path().join("packages/app-server-daemon/current"))?;
+    let mut terminal = PtyDex::start(
+        workspace.path(),
+        home,
+        &[
+            "-c",
+            "features.api_key_model_discovery=true",
+            "-c",
+            "suppress_unstable_features_warning=true",
+        ],
+    )?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while Instant::now() < deadline {
+        terminal.read_output(Duration::from_millis(/*millis*/ 50))?;
+        terminal.answer_startup_queries()?;
+        if let Some(status) = terminal.child.try_wait()? {
+            ensure!(!status.success());
+            let output = String::from_utf8_lossy(&terminal.output);
+            let failure = &output[output.find("Error:").context("missing fatal error")?..];
+            let failure = dex_ansi_escape::ansi_escape(failure)
+                .to_string()
+                .replace(
+                    terminal
+                        ._dex_home
+                        .path()
+                        .canonicalize()?
+                        .to_string_lossy()
+                        .as_ref(),
+                    "[DEX_HOME]",
+                )
+                .replace(
+                    terminal._dex_home.path().to_string_lossy().as_ref(),
+                    "[DEX_HOME]",
+                )
+                .replace('\r', "");
+            insta::assert_snapshot!("daemon_auto_start_failure", failure.trim());
+            return Ok(());
+        }
+    }
+    bail!("auto-start did not fail: {}", terminal.screen_contents())
 }

@@ -1,0 +1,10 @@
+---
+source: tui/src/onboarding/gcp_tests.rs
+expression: terminal.backend().to_string()
+---
+  Configure API access
+
+> 1. Use an API key
+     Connect using your provider API key
+
+  Press enter to continue

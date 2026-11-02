@@ -135,7 +135,10 @@ async fn import_home_migrates_supported_config_fields_skills_and_agents_md() {
             .join("skill-a")
             .join("SKILL.md"),
         format!(
-            "Use {SOURCE_EXTERNAL_AGENT_PRODUCT_NAME} and {SOURCE_EXTERNAL_AGENT_UPPER_NAME} utilities."
+            "Use {SOURCE_EXTERNAL_AGENT_PRODUCT_NAME} and {SOURCE_EXTERNAL_AGENT_UPPER_NAME} utilities.\n\
+             Open [{SOURCE_EXTERNAL_AGENT_DISPLAY_NAME} settings](https://{SOURCE_EXTERNAL_AGENT_NAME}.ai/settings)\n\
+             or <HTTPS://{SOURCE_EXTERNAL_AGENT_UPPER_NAME}.ai/{EXTERNAL_AGENT_CONFIG_MD}>.\n\
+             Read [{EXTERNAL_AGENT_CONFIG_MD}](./{EXTERNAL_AGENT_CONFIG_MD})."
         ),
     )
     .expect("write skill");
@@ -195,7 +198,12 @@ MY_TEAM = "dex"
     assert_eq!(
         fs::read_to_string(agents_skills.join("skill-a").join("SKILL.md"))
             .expect("read copied skill"),
-        "Use Dex and Dex utilities."
+        format!(
+            "Use Dex and Dex utilities.\n\
+             Open [Dex settings](https://{SOURCE_EXTERNAL_AGENT_NAME}.ai/settings)\n\
+             or <HTTPS://{SOURCE_EXTERNAL_AGENT_UPPER_NAME}.ai/{EXTERNAL_AGENT_CONFIG_MD}>.\n\
+             Read [AGENTS.md](./AGENTS.md)."
+        )
     );
 }
 

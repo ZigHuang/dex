@@ -2,6 +2,9 @@ use super::*;
 use crate::config::ConfigBuilder;
 use crate::plugins::plugins_manager_for_config;
 use crate::skills_load_input_from_config;
+use dex_config::CloudConfigBundleBindingStatus;
+use dex_config::CloudConfigBundlePolicy;
+use dex_config::CloudConfigBundleSnapshot;
 use dex_config::test_support::CloudConfigBundleFixture;
 use dex_login::test_support::auth_manager_from_optional_auth;
 use dex_protocol::config_types::ServiceTier;
@@ -186,7 +189,6 @@ async fn apply_role_preserves_unspecified_keys() {
     )])
     .await;
     config.dex_linux_sandbox_exe = Some(PathBuf::from("/tmp/dex-linux-sandbox"));
-    config.main_execve_wrapper_exe = Some(PathBuf::from("/tmp/dex-execve-wrapper"));
     let role_path = write_role_config(
         &home,
         "instructions-only.toml",
@@ -223,35 +225,72 @@ async fn apply_role_preserves_unspecified_keys() {
         config.dex_linux_sandbox_exe,
         Some(PathBuf::from("/tmp/dex-linux-sandbox"))
     );
-    assert_eq!(
-        config.main_execve_wrapper_exe,
-        Some(PathBuf::from("/tmp/dex-execve-wrapper"))
-    );
     assert_eq!(config.base_instructions, base_instructions);
     assert_eq!(config.base_instructions_provenance, provenance);
 }
 
 #[tokio::test]
-async fn apply_role_regenerates_model_instructions_when_personality_changes() {
-    for (role_contents, provenance) in [
+async fn apply_role_refreshes_model_instructions_only_when_personality_opt_out_changes() {
+    for (parent_personality, role_contents, provenance, should_refresh) in [
         (
+            "friendly",
             "personality = \"none\"",
             BaseInstructionsProvenance::Model {
                 model: "parent-model".to_string(),
             },
+            true,
         ),
         (
+            "friendly",
             "[features]\npersonality = false",
             BaseInstructionsProvenance::Model {
                 model: "parent-model".to_string(),
             },
+            false,
         ),
-        ("personality = \"none\"", BaseInstructionsProvenance::Custom),
+        (
+            "none",
+            "[features]\npersonality = false",
+            BaseInstructionsProvenance::Model {
+                model: "parent-model".to_string(),
+            },
+            false,
+        ),
+        (
+            "friendly",
+            "personality = \"none\"\n[features]\npersonality = false",
+            BaseInstructionsProvenance::Model {
+                model: "parent-model".to_string(),
+            },
+            true,
+        ),
+        (
+            "friendly",
+            "personality = \"pragmatic\"",
+            BaseInstructionsProvenance::Model {
+                model: "parent-model".to_string(),
+            },
+            false,
+        ),
+        (
+            "none",
+            "personality = \"friendly\"",
+            BaseInstructionsProvenance::Model {
+                model: "parent-model".to_string(),
+            },
+            true,
+        ),
+        (
+            "friendly",
+            "personality = \"none\"",
+            BaseInstructionsProvenance::Custom,
+            false,
+        ),
     ] {
         let (home, mut config) = test_config_with_cli_overrides(vec![
             (
                 "personality".to_string(),
-                TomlValue::String("friendly".to_string()),
+                TomlValue::String(parent_personality.to_string()),
             ),
             ("features.personality".to_string(), TomlValue::Boolean(true)),
         ])
@@ -272,12 +311,10 @@ async fn apply_role_regenerates_model_instructions_when_personality_changes() {
             .await
             .expect("custom role should apply");
 
-        let expected = match provenance {
-            BaseInstructionsProvenance::Model { .. } => (None, None),
-            BaseInstructionsProvenance::Custom => (
-                Some("inherited instructions".to_string()),
-                Some(BaseInstructionsProvenance::Custom),
-            ),
+        let expected = if should_refresh {
+            (None, None)
+        } else {
+            (Some("inherited instructions".to_string()), Some(provenance))
         };
         assert_eq!(
             (
@@ -393,6 +430,31 @@ writable_roots = ["./sandbox-root"]
 #[tokio::test]
 async fn apply_role_cannot_expand_parent_authority() {
     let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let policy = CloudConfigBundlePolicy::default();
+    let mut snapshot = CloudConfigBundleSnapshot {
+        config_server: None,
+        bundle: Ok(None),
+        binding: None,
+    };
+    policy.publish_snapshot(&mut snapshot);
+    let config_server = dex_config::ConfigServer {
+        base_url: "https://policy.example/settings".into(),
+        oauth: None,
+    };
+    let mut requirements = config.config_layer_stack.requirements_toml().clone();
+    requirements.config_server = Some(config_server.clone());
+    config.config_layer_stack = dex_config::ConfigLayerStack::new(
+        config
+            .config_layer_stack
+            .all_layers_low_to_high()
+            .cloned()
+            .collect(),
+        config.config_layer_stack.requirements().clone(),
+        requirements,
+    )
+    .expect("parent managed config")
+    .with_cloud_config_binding(snapshot.binding)
+    .with_applied_config_server(Some(config_server));
     config.notify = Some(vec!["parent-notifier".to_string()]);
     for feature in [Feature::MemoryTool, Feature::RequestPermissionsTool] {
         config
@@ -441,6 +503,23 @@ command = "attacker-command"
         .await
         .expect("custom role should apply");
 
+    assert_eq!(
+        config.config_layer_stack.applied_config_server(),
+        parent.config_layer_stack.applied_config_server()
+    );
+
+    policy.observe_remote_bundle(
+        &CloudConfigBundleFixture::enterprise_config("model = 'managed'").into_bundle(),
+    );
+    assert_eq!(
+        config
+            .config_layer_stack
+            .cloud_config_binding()
+            .expect("role should preserve managed policy binding")
+            .read()
+            .status,
+        CloudConfigBundleBindingStatus::Suspended
+    );
     assert_eq!(
         config.developer_instructions.as_deref(),
         Some("Stay focused")
@@ -708,7 +787,7 @@ fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
 }
 
 #[test]
-fn spawn_tool_spec_marks_role_locked_service_tier() {
+fn spawn_tool_spec_omits_role_service_tier() {
     let tempdir = TempDir::new().expect("create temp dir");
     let role_path = tempdir.path().join("tiered.toml");
     fs::write(
@@ -727,9 +806,7 @@ fn spawn_tool_spec_marks_role_locked_service_tier() {
 
     let spec = spawn_tool_spec::build(&user_defined_roles);
 
-    assert!(spec.contains(
-        "Stay fast.\n- This role's service tier is set to `priority`. If it is supported by the resolved model, it takes precedence over a valid spawn request service tier."
-    ));
+    assert!(spec.contains("tiered: {\nStay fast.\n}"));
 }
 
 #[test]

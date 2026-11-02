@@ -40,7 +40,7 @@ use rmcp::model::Resource;
 use rmcp::model::ResourceContents;
 use rmcp::model::ResourceTemplate;
 use rmcp::model::ServerCapabilities;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::model::Tool;
 use rmcp::model::ToolAnnotations;
 use rmcp::transport::StreamableHttpServerConfig;
@@ -118,7 +118,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if std::env::var_os("MCP_TEST_AMBIENT_SECRET").is_some() {
                 return Err("helper inherited ambient secret".into());
             }
-            println!(r#"{{"Proxy-Authorization":"Bearer gateway-token"}}"#);
+            if let Some(invocations) = args.next() {
+                let count = fs::read_to_string(&invocations).unwrap_or_default().len() + 1;
+                fs::write(invocations, "x".repeat(count))?;
+                let header =
+                    if args.next().as_deref() == Some(std::ffi::OsStr::new("--authorization")) {
+                        "Authorization"
+                    } else {
+                        "Proxy-Authorization"
+                    };
+                println!(
+                    r#"{{"{header}":"Bearer gateway-token","X-Helper-Generation":"{count}"}}"#
+                );
+            } else {
+                println!(r#"{{"Proxy-Authorization":"Bearer gateway-token"}}"#);
+            }
             return Ok(());
         }
         _ => {}
@@ -150,6 +164,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::write(bound_addr_file, actual_bind_addr.to_string())?;
     }
     eprintln!("starting rmcp streamable http test server on http://{actual_bind_addr}/mcp");
+
+    let mut transport_config = StreamableHttpServerConfig::default();
+    if !actual_bind_addr.ip().is_loopback() {
+        transport_config
+            .allowed_hosts
+            .push(actual_bind_addr.to_string());
+        transport_config =
+            transport_config.with_allowed_origins([format!("http://{actual_bind_addr}")]);
+    }
 
     let router = Router::new()
         .route(
@@ -206,7 +229,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             StreamableHttpService::new(
                 || Ok(TestToolServer::new()),
                 Arc::new(LocalSessionManager::default()),
-                StreamableHttpServerConfig::default(),
+                transport_config,
             ),
         )
         .layer(middleware::from_fn_with_state(
@@ -237,8 +260,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 impl ServerHandler for TestToolServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()

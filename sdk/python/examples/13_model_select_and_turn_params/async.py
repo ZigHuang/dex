@@ -16,7 +16,6 @@ from openai_dex import (
     Sandbox,
 )
 from openai_dex.types import (
-    Personality,
     ReasoningEffort,
     ReasoningSummary,
 )
@@ -100,7 +99,6 @@ async def main() -> None:
             effort=selected_effort,
             model=selected_model.model,
             output_schema=OUTPUT_SCHEMA,
-            personality=Personality.pragmatic,
             sandbox=Sandbox.read_only,
             summary=ReasoningSummary.model_validate("concise"),
         )

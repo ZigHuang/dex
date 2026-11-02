@@ -2,6 +2,7 @@ mod archive_thread;
 mod create_thread;
 mod delete_thread;
 mod helpers;
+mod history_revision;
 mod list_threads;
 mod live_writer;
 mod model_context;
@@ -16,24 +17,38 @@ mod rollout_migration;
 #[allow(dead_code)]
 mod rollout_lineage;
 mod search_threads;
+mod thread_attachments;
 mod thread_history;
 mod thread_history_materialization;
 mod thread_rollout_resolver;
 mod thread_sections;
 mod unarchive_thread;
 mod update_thread_metadata;
-mod writer_lock;
 
+#[cfg(test)]
+#[path = "compression_writer_tests.rs"]
+mod compression_writer_tests;
+#[cfg(test)]
+#[path = "daybreak_metadata_tests.rs"]
+mod daybreak_metadata_tests;
 #[cfg(test)]
 #[path = "pending_thread_metadata_tests.rs"]
 mod pending_thread_metadata_tests;
 #[cfg(test)]
+#[path = "read_thread_tests.rs"]
+mod read_thread_tests;
+#[cfg(test)]
 mod test_support;
+#[cfg(test)]
+#[path = "timestamp_metadata_tests.rs"]
+mod timestamp_metadata_tests;
 
 use dex_protocol::ThreadId;
 use dex_protocol::protocol::ThreadHistoryMode;
+use dex_rollout::RolloutItem;
 use dex_rollout::RolloutRecorder;
 use dex_rollout::StateDbHandle;
+use dex_rollout::WriterLockCoordinator;
 use dex_state::SqliteConfig;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -46,6 +61,8 @@ use tokio::sync::OwnedRwLockReadGuard;
 use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::sync::RwLock;
 
+use crate::AddThreadAttachmentOutcome;
+use crate::AddThreadAttachmentParams;
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::ArchiveThreadsParams;
@@ -60,8 +77,11 @@ use crate::DeletedProject;
 use crate::ItemPage;
 use crate::ListItemsParams;
 use crate::ListProjectsParams;
+use crate::ListThreadAttachmentThreadsParams;
+use crate::ListThreadAttachmentsParams;
 use crate::ListThreadSectionsParams;
 use crate::ListThreadsParams;
+use crate::ListTimelineParams;
 use crate::ListTurnsParams;
 use crate::LoadThreadHistoryParams;
 use crate::MoveProjectParams;
@@ -72,6 +92,8 @@ use crate::PreparedFork;
 use crate::ProjectMoveOutcome;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
+use crate::RemoveThreadAttachmentOutcome;
+use crate::RemoveThreadAttachmentParams;
 use crate::RenameThreadSectionParams;
 use crate::ResumeThreadParams;
 use crate::RevertThreadParams;
@@ -84,6 +106,8 @@ use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::StoredThreadSection;
 use crate::StoredThreadSectionsPage;
+use crate::ThreadAttachmentOwnerPage;
+use crate::ThreadAttachmentPage;
 use crate::ThreadMetadataPatch;
 use crate::ThreadOccurrenceSearchPage;
 use crate::ThreadPage;
@@ -92,12 +116,11 @@ use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
+use crate::TimelinePage;
 use crate::TurnPage;
 use crate::UpdateProjectParams;
 use crate::UpdateThreadMetadataParams;
 use crate::UpdatedProject;
-use crate::local::writer_lock::WriterLockCoordinator;
-use crate::local::writer_lock::WriterLockGuard;
 
 pub use rollout_migration::RolloutMigrationFailureReason;
 pub use rollout_migration::RolloutMigrationMode;
@@ -129,7 +152,14 @@ pub struct LocalThreadStore {
     writer_lock_coordinator: Arc<WriterLockCoordinator>,
     state_db: Option<StateDbHandle>,
     thread_history_db: Arc<OnceCell<sqlx::SqlitePool>>,
+    thread_data_cleanup: Option<Arc<ThreadDataCleanup>>,
+    #[cfg(test)]
+    startup_migration_retry_gate: Option<Arc<StartupMigrationRetryGate>>,
 }
+
+type ThreadDataCleanup = dyn Fn(Vec<ThreadId>) -> ThreadStoreFuture<'static, ()> + Send + Sync;
+
+type WriterLockGuard = Arc<dex_rollout::WriterLockGuard>;
 
 struct LiveRecorderEntry {
     recorder: RolloutRecorder,
@@ -199,6 +229,14 @@ impl LiveWriterLocks {
     }
 }
 
+// Per-store synchronization for exercising startup contention through the public entry point.
+#[cfg(test)]
+#[derive(Default)]
+struct StartupMigrationRetryGate {
+    retry_started: tokio::sync::Notify,
+    retry_allowed: tokio::sync::Notify,
+}
+
 /// Process-scoped configuration for local thread storage.
 ///
 /// This describes where local storage lives. New-thread rollout metadata such
@@ -242,7 +280,21 @@ impl LocalThreadStore {
             writer_lock_coordinator,
             state_db,
             thread_history_db: Arc::new(OnceCell::new()),
+            thread_data_cleanup: None,
+            #[cfg(test)]
+            startup_migration_retry_gate: None,
         }
+    }
+
+    /// Adds cleanup for host-owned durable data when threads are permanently deleted.
+    /// Runs after reference and writer checks, under the lifecycle locks, before deleting rollouts.
+    /// Cleanup must be idempotent: later deletion steps can fail and the caller may retry.
+    pub fn with_thread_data_cleanup(
+        mut self,
+        cleanup: impl Fn(Vec<ThreadId>) -> ThreadStoreFuture<'static, ()> + Send + Sync + 'static,
+    ) -> Self {
+        self.thread_data_cleanup = Some(Arc::new(cleanup));
+        self
     }
 
     /// Return the state DB handle used by local rollout writers.
@@ -287,6 +339,26 @@ impl LocalThreadStore {
         live_writer::rollout_path(self, thread_id).await
     }
 
+    /// Select only materialized rollout inputs without creating a file for untouched threads.
+    pub(crate) async fn feedback_rollout_path(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<Option<PathBuf>> {
+        let (recorder, _, _) = live_writer::live_writer_parts(self, thread_id).await?;
+        if recorder
+            .unpersisted_session_meta()
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: error.to_string(),
+            })?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        // Keep the path even if a materialized file was deleted: collection must report that error.
+        Ok(Some(recorder.rollout_path().to_path_buf()))
+    }
+
     pub(super) async fn ensure_live_recorder_absent(
         &self,
         thread_id: ThreadId,
@@ -299,6 +371,23 @@ impl LocalThreadStore {
         Ok(())
     }
 
+    fn acquire_writer_lock(&self, thread_id: ThreadId) -> ThreadStoreResult<WriterLockGuard> {
+        self.writer_lock_coordinator
+            .acquire(thread_id)
+            .map(Arc::new)
+            .map_err(|err| {
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    ThreadStoreError::Conflict {
+                        message: err.to_string(),
+                    }
+                } else {
+                    ThreadStoreError::Internal {
+                        message: err.to_string(),
+                    }
+                }
+            })
+    }
+
     async fn acquire_writer_locks(
         &self,
         thread_ids: &[ThreadId],
@@ -308,7 +397,7 @@ impl LocalThreadStore {
             if self.live_recorders.lock().await.contains_key(&thread_id) {
                 continue;
             }
-            writer_locks.push(self.writer_lock_coordinator.acquire(thread_id)?);
+            writer_locks.push(self.acquire_writer_lock(thread_id)?);
         }
         Ok(writer_locks)
     }
@@ -403,6 +492,14 @@ impl LocalThreadStore {
         thread_history::list_items(self, params).await
     }
 
+    /// Lists bounded ordinary and realtime items from the rollout projection.
+    pub async fn list_timeline(
+        &self,
+        params: ListTimelineParams,
+    ) -> ThreadStoreResult<TimelinePage> {
+        thread_history::list_timeline(self, params).await
+    }
+
     /// Searches projection-backed visible messages within one paginated thread.
     pub async fn search_thread_occurrences(
         &self,
@@ -413,6 +510,10 @@ impl LocalThreadStore {
 }
 
 impl ThreadStore for LocalThreadStore {
+    fn default_history_mode(&self) -> ThreadHistoryMode {
+        ThreadHistoryMode::Paginated
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -441,6 +542,19 @@ impl ThreadStore for LocalThreadStore {
         })
     }
 
+    fn read_pending_thread_metadata(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, Option<ThreadMetadataPatch>> {
+        Box::pin(async move {
+            Ok(self
+                .pending_thread_metadata
+                .lock(thread_id)
+                .await
+                .and_then(|metadata| metadata.clone()))
+        })
+    }
+
     fn remove_pending_thread_metadata(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
             self.pending_thread_metadata.remove(thread_id).await;
@@ -448,7 +562,10 @@ impl ThreadStore for LocalThreadStore {
         })
     }
 
-    fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()> {
+    fn resume_thread(
+        &self,
+        params: ResumeThreadParams,
+    ) -> ThreadStoreFuture<'_, Arc<Vec<RolloutItem>>> {
         Box::pin(async move { live_writer::resume_thread(self, params).await })
     }
 
@@ -459,9 +576,18 @@ impl ThreadStore for LocalThreadStore {
     fn persist_thread(
         &self,
         thread_id: ThreadId,
-        _context: PersistContext,
+        context: PersistContext,
     ) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move { live_writer::persist_thread(self, thread_id).await })
+        if context == PersistContext::SubagentSpawn {
+            return Box::pin(async { Ok(()) });
+        }
+        Box::pin(async move {
+            if context == PersistContext::ThreadPreparation {
+                live_writer::flush_thread(self, thread_id).await
+            } else {
+                live_writer::persist_thread(self, thread_id).await
+            }
+        })
     }
 
     fn flush_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
@@ -488,6 +614,25 @@ impl ThreadStore for LocalThreadStore {
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
         Box::pin(async move { model_context::load_latest_model_context(self, params).await })
+    }
+
+    fn is_model_context_current(
+        &self,
+        params: LoadThreadHistoryParams,
+        revision: String,
+    ) -> ThreadStoreFuture<'_, bool> {
+        Box::pin(async move {
+            let resolved = if params.include_archived {
+                thread_rollout_resolver::resolve_current_including_archived(self, params.thread_id)
+                    .await?
+            } else {
+                thread_rollout_resolver::resolve_current(self, params.thread_id).await?
+            };
+            let Some(resolved) = resolved else {
+                return Ok(false);
+            };
+            Ok(history_revision::read(&resolved.path).await.as_ref() == Some(&revision))
+        })
     }
 
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
@@ -547,6 +692,55 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move { thread_sections::delete_thread_section(self, params).await })
     }
 
+    fn supports_thread_attachments(&self) -> bool {
+        self.state_db.is_some()
+    }
+
+    fn copy_thread_attachments(
+        &self,
+        source_thread_id: ThreadId,
+        destination_thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            thread_attachments::copy_thread_attachments(
+                self,
+                source_thread_id,
+                destination_thread_id,
+            )
+            .await
+        })
+    }
+
+    fn add_thread_attachment(
+        &self,
+        params: AddThreadAttachmentParams,
+    ) -> ThreadStoreFuture<'_, AddThreadAttachmentOutcome> {
+        Box::pin(async move { thread_attachments::add_thread_attachment(self, params).await })
+    }
+
+    fn list_thread_attachments(
+        &self,
+        params: ListThreadAttachmentsParams,
+    ) -> ThreadStoreFuture<'_, ThreadAttachmentPage> {
+        Box::pin(async move { thread_attachments::list_thread_attachments(self, params).await })
+    }
+
+    fn list_thread_attachment_threads(
+        &self,
+        params: ListThreadAttachmentThreadsParams,
+    ) -> ThreadStoreFuture<'_, ThreadAttachmentOwnerPage> {
+        Box::pin(
+            async move { thread_attachments::list_thread_attachment_threads(self, params).await },
+        )
+    }
+
+    fn remove_thread_attachment(
+        &self,
+        params: RemoveThreadAttachmentParams,
+    ) -> ThreadStoreFuture<'_, RemoveThreadAttachmentOutcome> {
+        Box::pin(async move { thread_attachments::remove_thread_attachment(self, params).await })
+    }
+
     fn supports_projects(&self) -> bool {
         self.state_db.is_some()
     }
@@ -594,6 +788,10 @@ impl ThreadStore for LocalThreadStore {
 
     fn list_items(&self, params: ListItemsParams) -> ThreadStoreFuture<'_, ItemPage> {
         Box::pin(LocalThreadStore::list_items(self, params))
+    }
+
+    fn list_timeline(&self, params: ListTimelineParams) -> ThreadStoreFuture<'_, TimelinePage> {
+        Box::pin(LocalThreadStore::list_timeline(self, params))
     }
 
     fn search_threads(
@@ -650,7 +848,21 @@ impl ThreadStore for LocalThreadStore {
     }
 
     fn unarchive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
-        Box::pin(async move { unarchive_thread::unarchive_thread(self, params).await })
+        Box::pin(async move {
+            unarchive_thread::unarchive_threads(self, params, Vec::new())
+                .await
+                .map(|(thread, _)| thread)
+        })
+    }
+
+    fn unarchive_threads(
+        &self,
+        params: ArchiveThreadParams,
+        descendant_thread_ids: Vec<ThreadId>,
+    ) -> ThreadStoreFuture<'_, (StoredThread, Vec<ThreadId>)> {
+        Box::pin(async move {
+            unarchive_thread::unarchive_threads(self, params, descendant_thread_ids).await
+        })
     }
 
     fn delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()> {
@@ -664,6 +876,10 @@ impl ThreadStore for LocalThreadStore {
 
 #[cfg(test)]
 mod tests {
+    #[path = "acquisition_tests.rs"]
+    mod acquisition_tests;
+    #[path = "delegated_preview_tests.rs"]
+    mod delegated_preview_tests;
     use std::sync::Arc;
 
     use dex_protocol::ThreadId;
@@ -671,6 +887,7 @@ mod tests {
     use dex_protocol::items::TurnItem;
     use dex_protocol::items::UserMessageItem;
     use dex_protocol::models::BaseInstructions;
+    use dex_protocol::models::ContentItem;
     use dex_protocol::models::FunctionCallOutputPayload;
     use dex_protocol::models::MessagePhase;
     use dex_protocol::models::ResponseItem;
@@ -859,13 +1076,15 @@ mod tests {
             .await
             .expect("update stale sqlite rollout path");
 
-        let resumed = LiveThread::resume(
+        let history = Arc::new(vec![user_message_item("bounded suffix")]);
+        let (resumed, supplied_history) = LiveThread::resume(
             store,
             ThreadHistoryMode::Paginated,
             ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(rollout_path.clone()),
-                history: Some(Arc::new(vec![user_message_item("bounded suffix")])),
+                history: Some(Arc::clone(&history)),
                 include_archived: false,
                 metadata: ThreadPersistenceMetadata {
                     cwd: Some(home.path().to_path_buf()),
@@ -873,12 +1092,14 @@ mod tests {
                     memory_mode: ThreadMemoryMode::Enabled,
                 },
             },
+            /*resume_preparation*/ None,
         )
         .await
         .expect("resume paginated thread from its requested rollout");
+        assert!(Arc::ptr_eq(&supplied_history, &history));
         assert_eq!(
             resumed.local_rollout_path().await.expect("live rollout"),
-            Some(rollout_path)
+            Some(std::fs::canonicalize(rollout_path).expect("canonical rollout path"))
         );
         resumed.shutdown().await.expect("shutdown resumed writer");
 
@@ -919,36 +1140,36 @@ mod tests {
         let turn_context = |model: &str, approval_policy| {
             RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("turn-1".to_string()),
+                root_turn_id: None,
+                disabled_plugin_ids: None,
                 cwd: serde_json::from_value(serde_json::json!(cwd)).expect("absolute cwd"),
-                workspace_roots: None,
-                current_date: None,
-                timezone: None,
                 approval_policy,
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
                 permission_profile: None,
                 active_permission_profile: None,
-                network: None,
                 file_system_sandbox_policy: None,
                 model: model.to_string(),
                 comp_hash: None,
-                personality: None,
                 collaboration_mode: None,
                 multi_agent_version: None,
-                multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: None,
-                summary: ReasoningSummary::Auto,
+                summary: Some(ReasoningSummary::Auto),
             })
         };
 
+        let mut guard = crate::LiveThreadInitGuard::default();
         let live_thread = LiveThread::create_with_inherited_model_context(
             store,
             params,
             &[turn_context("parent-model", AskForApproval::Never)],
+            &mut guard,
         )
         .await
         .expect("create live thread with inherited context");
+        guard.commit();
         live_thread
             .persist(PersistContext::Standard)
             .await
@@ -1003,7 +1224,9 @@ mod tests {
         live_thread
             .append_items(&[RolloutItem::EventMsg(EventMsg::TurnStarted(
                 TurnStartedEvent {
+                    turn_attribution: None,
                     turn_id: "turn-1".to_string(),
+                    root_turn_id: None,
                     trace_id: None,
                     started_at: None,
                     model_context_window: None,
@@ -1027,6 +1250,7 @@ mod tests {
                     phase: Some(MessagePhase::Commentary),
                     memory_citation: None,
                     delivery: None,
+                    questions: None,
                 })),
                 RolloutItem::ResponseItem(
                     ResponseItem::FunctionCallOutput {
@@ -1046,6 +1270,7 @@ mod tests {
                     },
                 )),
                 RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                    root_turn_id: None,
                     turn_id: "turn-1".to_string(),
                     started_at: None,
                     last_agent_message: None,
@@ -1203,10 +1428,11 @@ mod tests {
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
         let rollout_path =
             write_session_file(home.path(), "2025-01-03T17-00-00", uuid).expect("session file");
-        let live_thread = LiveThread::resume(
+        let (live_thread, _history) = LiveThread::resume(
             store,
             ThreadHistoryMode::Legacy,
             ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(rollout_path),
                 history: None,
@@ -1217,6 +1443,7 @@ mod tests {
                     memory_mode: ThreadMemoryMode::Enabled,
                 },
             },
+            /*resume_preparation*/ None,
         )
         .await
         .expect("resume live thread");
@@ -1258,10 +1485,11 @@ mod tests {
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
         let rollout_path = write_session_file(external_home.path(), "2025-01-03T17-30-00", uuid)
             .expect("external session file");
-        let live_thread = LiveThread::resume(
+        let (live_thread, _history) = LiveThread::resume(
             store,
             ThreadHistoryMode::Legacy,
             ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(rollout_path),
                 history: None,
@@ -1272,6 +1500,7 @@ mod tests {
                     memory_mode: ThreadMemoryMode::Enabled,
                 },
             },
+            /*resume_preparation*/ None,
         )
         .await
         .expect("resume external live thread");
@@ -1346,6 +1575,20 @@ mod tests {
                 .live_rollout_path(thread_id)
                 .await
                 .expect("load rollout path");
+            {
+                let recorder = store
+                    .live_recorders
+                    .lock()
+                    .await
+                    .get(&thread_id)
+                    .expect("live recorder")
+                    .recorder
+                    .clone();
+                recorder
+                    .record_canonical_items(&[user_message_item("deferred item to discard")])
+                    .await
+                    .expect("queue deferred item without materializing it");
+            }
             assert!(!rollout_path.exists());
 
             let lock_path = home
@@ -1374,12 +1617,132 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_thread_reopens_live_writer_and_appends() {
+    async fn attached_creation_and_deletion_coordinate_across_stores() {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
+        let runtime = dex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("initialize state db");
+        let first = LocalThreadStore::new(config.clone(), Some(runtime.clone()));
+        let second = LocalThreadStore::new(config, Some(runtime.clone()));
+        let parent_uuid = uuid::Uuid::new_v4();
+        let parent = ThreadId::from_u128(parent_uuid.as_u128());
+        let parent_path = write_session_file(home.path(), "2025-01-03T00-00-00", parent_uuid)
+            .expect("write parent");
+        let child = ThreadId::new();
+        let mut params = create_thread_params(child);
+        params.attached_thread = true;
+        assert!(matches!(
+            second.create_thread(params.clone()).await,
+            Err(ThreadStoreError::InvalidRequest { .. })
+        ));
+        params.forked_from_id = Some(parent);
+        let parent_guard = first.acquire_writer_lock(parent).expect("lock parent");
+        assert!(matches!(
+            second.create_thread(params.clone()).await,
+            Err(ThreadStoreError::Conflict { .. })
+        ));
+        drop(parent_guard);
+        let pool = runtime
+            .sqlite()
+            .open_read_write_pool(&runtime.sqlite().state_db_path())
+            .await
+            .expect("open state db");
+        sqlx::query(
+            "CREATE TRIGGER fail_attached_index BEFORE UPDATE OF memory_mode ON threads WHEN NEW.attached_thread_parent_id IS NOT NULL BEGIN SELECT RAISE(ABORT, 'index failed'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("inject index failure");
+        let mut failing_params = params.clone();
+        failing_params.metadata.memory_mode = ThreadMemoryMode::Disabled;
+        second
+            .create_thread(failing_params)
+            .await
+            .expect_err("indexing must fail");
+        first
+            .ensure_no_attached_threads(&[parent])
+            .await
+            .expect("failed creation must not leave an attached rollout");
+        assert!(
+            runtime
+                .get_thread(child)
+                .await
+                .expect("read index")
+                .is_none()
+        );
+        sqlx::query("DROP TRIGGER fail_attached_index")
+            .execute(&pool)
+            .await
+            .expect("remove index failure");
+        second
+            .create_thread(params.clone())
+            .await
+            .expect("create child");
+        assert_eq!(
+            runtime
+                .delete_thread(child)
+                .await
+                .expect("remove index row"),
+            1
+        );
+        assert!(matches!(
+            first
+                .delete_threads(DeleteThreadsParams {
+                    thread_ids: vec![parent]
+                })
+                .await,
+            Err(ThreadStoreError::InvalidRequest { .. })
+        ));
+        assert!(
+            parent_path.exists(),
+            "refused deletion must preserve parent"
+        );
+        second
+            .discard_thread(child)
+            .await
+            .expect("release child writer");
+        assert!(matches!(
+            first
+                .delete_threads(DeleteThreadsParams {
+                    thread_ids: vec![parent]
+                })
+                .await,
+            Err(ThreadStoreError::InvalidRequest { .. })
+        ));
+        first
+            .delete_thread(DeleteThreadParams { thread_id: child })
+            .await
+            .expect("delete child");
+        first
+            .delete_threads(DeleteThreadsParams {
+                thread_ids: vec![parent],
+            })
+            .await
+            .expect("parent can be deleted after its child");
+        assert!(!parent_path.exists());
+        assert!(matches!(
+            second.create_thread(params).await,
+            Err(ThreadStoreError::ThreadNotFound { thread_id }) if thread_id == parent
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_thread_reopens_live_writer_and_appends_with_stale_sqlite_path() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let runtime = dex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
         let thread_id = ThreadId::default();
 
-        let first_store = LocalThreadStore::new(config.clone(), /*state_db*/ None);
+        let first_store = LocalThreadStore::new(config.clone(), Some(runtime.clone()));
         first_store
             .create_thread(create_thread_params(thread_id))
             .await
@@ -1408,9 +1771,24 @@ mod tests {
             .await
             .expect("shutdown initial writer");
 
-        let resumed_store = LocalThreadStore::new(config, /*state_db*/ None);
+        let mut builder = dex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            home.path().join("missing-rollout.jsonl"),
+            chrono::Utc::now(),
+            SessionSource::Exec,
+        );
+        builder.history_mode = ThreadHistoryMode::Legacy;
+        builder.cwd = home.path().to_path_buf();
+        let metadata = builder.build("test-provider");
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("store stale sqlite path");
+
+        let resumed_store = LocalThreadStore::new(config, Some(runtime));
         resumed_store
             .resume_thread(ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: None,
                 history: None,
@@ -1459,10 +1837,19 @@ mod tests {
                 .live_rollout_path(thread_id)
                 .await
                 .expect("load rollout path");
+            let snapshot = primary
+                .load_latest_model_context(LoadThreadHistoryParams {
+                    thread_id,
+                    include_archived: true,
+                })
+                .await
+                .expect("load initial snapshot");
+            let mut expected = snapshot.items;
             let resume_params = ResumeThreadParams {
+                history_revision: snapshot.revision,
                 thread_id,
                 rollout_path: Some(rollout_path),
-                history: None,
+                history: Some(Arc::new(expected.clone())),
                 include_archived: true,
                 metadata: thread_metadata(),
             };
@@ -1482,11 +1869,47 @@ mod tests {
             primary
                 .shutdown_thread(thread_id)
                 .await
-                .expect("shutdown should release writer ownership");
+                .expect("release writer");
+            let unchanged = secondary
+                .resume_thread(resume_params.clone())
+                .await
+                .expect("resume unchanged snapshot");
+            assert!(Arc::ptr_eq(
+                &unchanged,
+                resume_params.history.as_ref().unwrap()
+            ));
+
+            let late_edit = RolloutItem::ResponseItem(
+                ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "edit after the initial snapshot".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
+            );
             secondary
+                .append_items(AppendThreadItemsParams {
+                    thread_id,
+                    items: vec![late_edit.clone()],
+                })
+                .await
+                .expect("append before handing off writer ownership");
+            expected.push(late_edit);
+            secondary
+                .shutdown_thread(thread_id)
+                .await
+                .expect("shutdown should release writer ownership");
+            let resumed = primary
                 .resume_thread(resume_params)
                 .await
                 .expect("resume after shutdown should acquire writer ownership");
+            assert_eq!(serde_json::json!(*resumed), serde_json::json!(expected));
         }
     }
 
@@ -1526,6 +1949,7 @@ mod tests {
             .expect("live rollout path");
         let err = store
             .resume_thread(ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(rollout_path),
                 history: None,
@@ -1555,6 +1979,7 @@ mod tests {
         .expect("session file");
         let err = store
             .resume_thread(ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(rollout_path.clone()),
                 history: None,
@@ -1573,6 +1998,7 @@ mod tests {
 
         competing_store
             .resume_thread(ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(rollout_path),
                 history: None,
@@ -1595,6 +2021,7 @@ mod tests {
 
         store
             .resume_thread(ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(rollout_path),
                 history: None,
@@ -1643,6 +2070,7 @@ mod tests {
 
         store
             .resume_thread(ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(rollout_path.clone()),
                 history: None,
@@ -1661,7 +2089,10 @@ mod tests {
             .await
             .expect("read external live thread");
 
-        assert_eq!(thread.rollout_path, Some(rollout_path));
+        assert_eq!(
+            thread.rollout_path,
+            Some(std::fs::canonicalize(rollout_path).expect("canonical rollout path"))
+        );
         assert!(thread.history.expect("history").items.iter().any(|item| {
             matches!(
                 item,
@@ -1687,15 +2118,30 @@ mod tests {
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
         let rollout_path = write_archived_session_file(home.path(), "2025-01-04T10-30-00", uuid)
             .expect("archived session file");
+        #[cfg(unix)]
+        let rollout_path = {
+            let alias = home.path().join("active-alias.jsonl");
+            std::os::unix::fs::symlink(&rollout_path, &alias).expect("symlink archived rollout");
+            alias
+        };
 
+        let mut resume_params = ResumeThreadParams {
+            history_revision: None,
+            thread_id,
+            rollout_path: Some(rollout_path),
+            history: None,
+            include_archived: false,
+            metadata: thread_metadata(),
+        };
+        let err = store
+            .resume_thread(resume_params.clone())
+            .await
+            .expect_err("active-only resume should reject archived rollout targets");
+        assert!(matches!(err, ThreadStoreError::InvalidRequest { .. }));
+        assert!(err.to_string().contains("archived"));
+        resume_params.include_archived = true;
         store
-            .resume_thread(ResumeThreadParams {
-                thread_id,
-                rollout_path: Some(rollout_path),
-                history: None,
-                include_archived: true,
-                metadata: thread_metadata(),
-            })
+            .resume_thread(resume_params)
             .await
             .expect("resume live archived thread");
         store
@@ -1860,6 +2306,7 @@ mod tests {
         );
         store
             .resume_thread(ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(rollout_path),
                 history: None,
@@ -1927,6 +2374,9 @@ mod tests {
 
     fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
         CreateThreadParams {
+            attached_thread: false,
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,
@@ -1943,6 +2393,7 @@ mod tests {
             history_base: None,
             subagent_history_start_ordinal: None,
             initial_window_id: uuid::Uuid::now_v7().to_string(),
+            runtime_workspace_roots: None,
             metadata: thread_metadata(),
         }
     }

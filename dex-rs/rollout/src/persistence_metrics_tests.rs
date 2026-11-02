@@ -1,12 +1,18 @@
+use std::time::Duration;
+
 use dex_protocol::ThreadId;
+use dex_protocol::items::CommandExecutionItem;
+use dex_protocol::items::CommandExecutionStatus;
 use dex_protocol::items::EnteredReviewModeItem;
 use dex_protocol::items::ExitedReviewModeItem;
 use dex_protocol::items::TurnItem;
 use dex_protocol::items::UserMessageItem;
 use dex_protocol::models::ContentItem;
 use dex_protocol::models::ResponseItem;
+use dex_protocol::parse_command::ParsedCommand;
 use dex_protocol::protocol::EnteredReviewModeEvent;
 use dex_protocol::protocol::EventMsg;
+use dex_protocol::protocol::ExecCommandSource;
 use dex_protocol::protocol::ExitedReviewModeEvent;
 use dex_protocol::protocol::ItemCompletedEvent;
 use dex_protocol::protocol::ReviewTarget;
@@ -15,6 +21,7 @@ use dex_protocol::protocol::TurnAbortReason;
 use dex_protocol::protocol::TurnAbortedEvent;
 use dex_protocol::protocol::TurnCompleteEvent;
 use dex_protocol::protocol::TurnStartedEvent;
+use dex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 
 use super::CompletedTurnMeasurement;
@@ -26,9 +33,12 @@ use super::measure_and_filter_rollout_items;
 use super::update_turn_measurements;
 use crate::ResponseItemEnvelope;
 use crate::RolloutItem;
+use crate::policy::PERSISTED_COMMAND_OUTPUT_MAX_BYTES;
 
 fn retained_message(text: &str) -> RolloutItem {
     RolloutItem::ResponseItem(ResponseItemEnvelope::new(ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -41,7 +51,9 @@ fn retained_message(text: &str) -> RolloutItem {
 
 fn turn_started(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+        turn_attribution: None,
         turn_id: turn_id.to_string(),
+        root_turn_id: None,
         trace_id: None,
         started_at: None,
         model_context_window: None,
@@ -51,6 +63,7 @@ fn turn_started(turn_id: &str) -> RolloutItem {
 
 fn turn_complete(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        root_turn_id: None,
         turn_id: turn_id.to_string(),
         started_at: None,
         last_agent_message: None,
@@ -63,9 +76,11 @@ fn turn_complete(turn_id: &str) -> RolloutItem {
 
 fn turn_aborted(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
+        root_turn_id: None,
         turn_id: Some(turn_id.to_string()),
         started_at: None,
         reason: TurnAbortReason::Interrupted,
+        error: None,
         completed_at: None,
         duration_ms: None,
     }))
@@ -285,6 +300,63 @@ fn item_completion_persistence_depends_on_history_mode() {
     assert_eq!(
         paginated_measurement.items[0].decision,
         super::PersistenceDecision::Kept
+    );
+}
+
+#[test]
+fn projected_items_report_post_projection_bytes() {
+    let original_output = "x".repeat(PERSISTED_COMMAND_OUTPUT_MAX_BYTES * 2);
+    let item = RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+        thread_id: ThreadId::default(),
+        turn_id: "turn".to_string(),
+        item: TurnItem::CommandExecution(CommandExecutionItem {
+            sandbox_type: None,
+            model_context: None,
+            id: "exec".to_string(),
+            plugin_id: None,
+            script_path: None,
+            process_id: None,
+            command: vec!["echo".to_string()],
+            cwd: std::env::temp_dir().abs().into(),
+            parsed_cmd: vec![ParsedCommand::Unknown {
+                cmd: "echo".to_string(),
+            }],
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
+            status: CommandExecutionStatus::Completed,
+            aggregated_output: Some(original_output),
+            exit_code: Some(0),
+            duration: Some(Duration::ZERO),
+        }),
+        started_at_ms: Some(0),
+        completed_at_ms: 0,
+    }));
+    let original_bytes = serde_json::to_vec(&item)
+        .expect("serialize original command")
+        .len() as u64;
+
+    let (persisted, measurement) =
+        measure_and_filter_rollout_items(std::slice::from_ref(&item), ThreadHistoryMode::Paginated);
+    let persisted_bytes = serde_json::to_vec(&persisted[0])
+        .expect("serialize persisted command")
+        .len() as u64;
+    assert_eq!(
+        measurement.pre_filter,
+        super::RolloutSizeTotals {
+            items: 1,
+            payload_bytes: original_bytes,
+        }
+    );
+    assert_eq!(
+        measurement.post_filter,
+        super::RolloutSizeTotals {
+            items: 1,
+            payload_bytes: persisted_bytes,
+        }
+    );
+    assert!(
+        persisted_bytes < original_bytes,
+        "projection should reduce serialized bytes"
     );
 }
 

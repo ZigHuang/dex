@@ -1,21 +1,25 @@
 use crate::function_tool::FunctionCallError;
+use crate::tools::context::ToolEnvironments;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolPayload;
 use crate::tools::handlers::mcp_resource_spec::create_list_mcp_resources_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use dex_protocol::openai_models::ToolMessage;
 use dex_protocol::protocol::McpInvocation;
 use dex_tools::ToolName;
 use dex_tools::ToolSpec;
 
 use super::ListResourceArgs;
 use super::ListResourcesPayload;
+use super::ResourceOperation;
 use super::model_can_access_mcp_server;
-use super::parse_args_with_default;
-use super::parse_arguments;
+use super::resource_arguments;
+use super::resource_environments;
 use super::run_resource_operation;
 
-pub struct ListMcpResourcesHandler;
+pub struct ListMcpResourcesHandler {
+    spec: ToolSpec,
+}
 
 impl ToolExecutor<ToolInvocation> for ListMcpResourcesHandler {
     fn tool_name(&self) -> ToolName {
@@ -23,19 +27,28 @@ impl ToolExecutor<ToolInvocation> for ListMcpResourcesHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_list_mcp_resources_tool()
+        self.spec.clone()
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
         true
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> dex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> dex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
 
 impl ListMcpResourcesHandler {
+    pub fn new(messages: Option<&ToolMessage>) -> Self {
+        Self {
+            spec: create_list_mcp_resources_tool(messages),
+        }
+    }
+
     async fn handle_call(
         &self,
         invocation: ToolInvocation,
@@ -50,18 +63,8 @@ impl ListMcpResourcesHandler {
         let turn = std::sync::Arc::clone(&step_context.turn);
         let mcp = &step_context.mcp;
 
-        let arguments = match payload {
-            ToolPayload::Function { arguments } => arguments,
-            _ => {
-                return Err(FunctionCallError::RespondToModel(
-                    "list_mcp_resources handler received unsupported payload".to_string(),
-                ));
-            }
-        };
-
-        let arguments = parse_arguments(arguments.as_str())?;
-        let args: ListResourceArgs = parse_args_with_default(arguments.clone())?;
-        let args = args.normalized();
+        let arguments = resource_arguments(&payload)?;
+        let args = ListResourceArgs::parse(arguments.clone())?;
 
         let invocation = McpInvocation {
             server: args.server.clone().unwrap_or_else(|| "dex".to_string()),
@@ -69,7 +72,7 @@ impl ListMcpResourcesHandler {
             arguments: arguments.clone(),
         };
 
-        run_resource_operation(&session, turn.as_ref(), &call_id, invocation, async {
+        run_resource_operation(&session, &step_context, &call_id, invocation, async {
             if let Some((server_name, params)) = args.target(turn.as_ref())? {
                 let result = mcp
                     .list_resources(&server_name, params)
@@ -94,4 +97,11 @@ impl ListMcpResourcesHandler {
     }
 }
 
-impl CoreToolRuntime for ListMcpResourcesHandler {}
+impl CoreToolRuntime for ListMcpResourcesHandler {
+    fn environments_for_input(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> Result<ToolEnvironments, FunctionCallError> {
+        resource_environments(invocation, ResourceOperation::List)
+    }
+}

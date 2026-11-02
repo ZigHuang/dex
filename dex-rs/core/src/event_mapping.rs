@@ -5,6 +5,7 @@ use dex_protocol::items::TurnItem;
 use dex_protocol::items::UserMessageItem;
 use dex_protocol::items::WebSearchItem;
 use dex_protocol::models::ContentItem;
+use dex_protocol::models::ContentItemKind;
 use dex_protocol::models::MessagePhase;
 use dex_protocol::models::ReasoningItemContent;
 use dex_protocol::models::ReasoningItemReasoningSummary;
@@ -42,6 +43,7 @@ const CONTEXTUAL_DEVELOPER_PREFIXES: &[&str] = &[
     APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX,
     "<model_switch>",
     "<managed_developer_instructions>",
+    "<persistent_mode>",
     APPS_INSTRUCTIONS_OPEN_TAG,
     COLLABORATION_MODE_OPEN_TAG,
     "<multi_agent_role>",
@@ -64,21 +66,18 @@ pub(crate) fn is_contextual_user_message_content(message: &[ContentItem]) -> boo
     message.iter().any(is_contextual_user_fragment)
 }
 
-/// Returns true when a developer message contains any rollback-trimmable contextual fragment.
-///
-/// `build_initial_context` can bundle these fragments together with persistent developer text in a
-/// single developer message, so callers that care about invalidating a stored reference baseline
-/// should pair this with `has_non_contextual_dev_message_content`.
-pub(crate) fn is_contextual_dev_message_content(message: &[ContentItem]) -> bool {
-    message.iter().any(is_contextual_dev_fragment)
-}
-
-/// Returns true when a developer message contains any fragment that is not part of the
-/// rollback-trimmable contextual prefix set.
-pub(crate) fn has_non_contextual_dev_message_content(message: &[ContentItem]) -> bool {
-    message
-        .iter()
-        .any(|content_item| !is_contextual_dev_fragment(content_item))
+/// Classifies each fragment for rollback. A catalog heading can change while its
+/// harness-owned kind stays stable. Older messages only carry the literal text.
+pub(crate) fn contextual_dev_fragments<'a>(
+    message: &'a [ContentItem],
+    kinds: &'a [ContentItemKind],
+) -> impl Iterator<Item = bool> + 'a {
+    message.iter().enumerate().map(|(index, item)| {
+        kinds
+            .get(index)
+            .is_some_and(|kind| kind.0 == crate::context::SAVED_PREFIX_KIND)
+            || is_contextual_dev_fragment(item)
+    })
 }
 
 fn is_contextual_dev_fragment(content_item: &ContentItem) -> bool {
@@ -94,6 +93,36 @@ fn is_contextual_dev_fragment(content_item: &ContentItem) -> bool {
     })
 }
 
+/// User-input parts with their original indices. Media wrapper labels are not
+/// user text; retain the indices so history edits can carry the right annotations.
+pub(crate) fn user_input_parts(
+    message: &[ContentItem],
+) -> impl Iterator<Item = (usize, &ContentItem)> {
+    message
+        .iter()
+        .enumerate()
+        .filter(|(idx, content_item)| match content_item {
+            ContentItem::InputText { text } => {
+                let is_image_label = ((is_local_image_open_tag_text(text)
+                    || is_image_open_tag_text(text))
+                    && matches!(message.get(idx + 1), Some(ContentItem::InputImage { .. })))
+                    || (*idx > 0
+                        && (is_local_image_close_tag_text(text) || is_image_close_tag_text(text))
+                        && matches!(message.get(idx - 1), Some(ContentItem::InputImage { .. })));
+                let is_audio_label = ((is_local_audio_open_tag_text(text)
+                    || is_audio_open_tag_text(text))
+                    && matches!(message.get(idx + 1), Some(ContentItem::InputAudio { .. })))
+                    || (*idx > 0
+                        && (is_local_audio_close_tag_text(text) || is_audio_close_tag_text(text))
+                        && matches!(message.get(idx - 1), Some(ContentItem::InputAudio { .. })));
+                !is_image_label && !is_audio_label
+            }
+            ContentItem::InputImage { .. }
+            | ContentItem::InputAudio { .. }
+            | ContentItem::OutputText { .. } => true,
+        })
+}
+
 fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
     if is_contextual_user_message_content(message) {
         return None;
@@ -101,42 +130,27 @@ fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
 
     let mut content: Vec<UserInput> = Vec::new();
 
-    for (idx, content_item) in message.iter().enumerate() {
+    for (_, content_item) in user_input_parts(message) {
         match content_item {
             ContentItem::InputText { text } => {
-                let is_image_label = ((is_local_image_open_tag_text(text)
-                    || is_image_open_tag_text(text))
-                    && matches!(message.get(idx + 1), Some(ContentItem::InputImage { .. })))
-                    || (idx > 0
-                        && (is_local_image_close_tag_text(text) || is_image_close_tag_text(text))
-                        && matches!(message.get(idx - 1), Some(ContentItem::InputImage { .. })));
-                let is_audio_label = ((is_local_audio_open_tag_text(text)
-                    || is_audio_open_tag_text(text))
-                    && matches!(message.get(idx + 1), Some(ContentItem::InputAudio { .. })))
-                    || (idx > 0
-                        && (is_local_audio_close_tag_text(text) || is_audio_close_tag_text(text))
-                        && matches!(message.get(idx - 1), Some(ContentItem::InputAudio { .. })));
-                if is_image_label || is_audio_label {
-                    continue;
-                }
                 content.push(UserInput::Text {
                     text: text.clone(),
                     // Model input content does not carry UI element ranges.
                     text_elements: Vec::new(),
                 });
             }
-            ContentItem::InputImage { image_url, detail } => {
+            ContentItem::InputImage { image, detail } => {
                 content.push(UserInput::Image {
-                    image_url: image_url.clone(),
+                    image: image.clone(),
                     detail: *detail,
                 });
             }
-            ContentItem::InputAudio { audio_url } => {
+            ContentItem::InputAudio { audio } => {
                 content.push(UserInput::Audio {
-                    audio_url: audio_url.clone(),
+                    audio: audio.clone(),
                 });
             }
-            ContentItem::OutputText { text } => {
+            ContentItem::OutputText { text, .. } => {
                 warn!("Output text in user message: {}", text);
             }
         }
@@ -153,7 +167,7 @@ fn parse_agent_message(
     let mut content: Vec<AgentMessageContent> = Vec::new();
     for content_item in message.iter() {
         match content_item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
                 content.push(AgentMessageContent::Text { text: text.clone() });
             }
             _ => {
@@ -173,6 +187,7 @@ fn parse_agent_message(
         phase,
         memory_citation: None,
         delivery: None,
+        questions: None,
     }
 }
 

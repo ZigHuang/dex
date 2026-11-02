@@ -1,0 +1,23 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-agent-roles"
+version.workspace = true
+
+[lib]
+doctest = false
+name = "dex_agent_roles"
+path = "src/lib.rs"
+test = false
+
+[lints]
+workspace = true
+
+[dependencies]
+dex-config = { workspace = true }
+dex-file-system = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+dex-utils-path-uri = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+toml = { workspace = true, features = ["preserve_order"] }
+tracing = { workspace = true }

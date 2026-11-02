@@ -19,6 +19,7 @@ use dex_config::record_user_marketplace;
 use dex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::time::timeout;
 
 #[cfg(windows)]
@@ -152,17 +153,17 @@ async fn marketplace_upgrade_all_configured_git_marketplaces() -> Result<()> {
         debug_source.path(),
         Some(&debug_new_revision),
     )?;
-    record_git_marketplace(
-        dex_home.path(),
-        "tools",
-        tools_source.path(),
-        Some(&tools_new_revision),
-    )?;
+    let tools_override = format!(
+        "marketplaces.tools={{ source_type = \"git\", source = {}, ref = {} }}",
+        serde_json::to_string(&tools_source.path().to_string_lossy())?,
+        serde_json::to_string(&tools_new_revision)?,
+    );
     disable_plugin_startup_tasks(dex_home.path())?;
     let config_before = std::fs::read_to_string(dex_home.path().join("config.toml"))?;
 
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
+        .with_args(&["--config", &tools_override])
         .without_auto_env()
         .build_initialized()
         .await?;
@@ -204,9 +205,12 @@ async fn marketplace_upgrade_all_configured_git_marketplaces() -> Result<()> {
     Ok(())
 }
 
+#[test_case(false; "user config")]
+#[test_case(true; "invalid user config fallback")]
 #[tokio::test]
-async fn automatic_upgrade_isolates_git_while_explicit_install_preserves_configuration()
--> Result<()> {
+async fn automatic_upgrade_isolates_git_while_explicit_install_preserves_configuration(
+    invalid_user_config: bool,
+) -> Result<()> {
     let dex_home = TempDir::new()?;
     let source = TempDir::new()?;
     let plugin_source = TempDir::new()?;
@@ -266,14 +270,36 @@ async fn automatic_upgrade_isolates_git_while_explicit_install_preserves_configu
 
     let manual_plugin_alias = "https://manual.example/plugin.git";
     let manual_plugin_rewrite = format!("url.{}.insteadOf", plugin_source.path().display());
-    let mut server = TestAppServer::builder()
+    let config_before = std::fs::read_to_string(&config_path)?;
+    let abandoned = marketplace_install_root(dex_home.path())
+        .join(".staging")
+        .join(format!("marketplace-{}-abandoned", std::env::consts::OS));
+    std::fs::create_dir_all(abandoned.join("checkout"))?;
+    std::fs::write(abandoned.join(".lock"), "")?;
+    std::fs::write(abandoned.join("checkout/payload"), "abandoned upgrade")?;
+    let mut builder = TestAppServer::builder()
         .with_dex_home(dex_home.path())
         .with_plugin_startup_tasks()
         .with_env_overrides(&[
             ("GIT_CONFIG_COUNT", Some("1")),
             ("GIT_CONFIG_KEY_0", Some(&manual_plugin_rewrite)),
             ("GIT_CONFIG_VALUE_0", Some(manual_plugin_alias)),
-        ])
+        ]);
+    if invalid_user_config {
+        // Runtime definitions remain available when startup ignores malformed user config.
+        std::fs::write(&config_path, "invalid = [")?;
+        let marketplace_override = format!(
+            "marketplaces.trusted={{ source_type = 'git', source = {} }}",
+            serde_json::to_string(&source_path)?,
+        );
+        builder = builder.with_args(&[
+            "--config",
+            &marketplace_override,
+            "--config",
+            "plugins={\"toolkit@trusted\"={enabled=true}}",
+        ]);
+    }
+    let mut server = builder
         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
     let plugin_root = dex_home
@@ -285,7 +311,12 @@ async fn automatic_upgrade_isolates_git_while_explicit_install_preserves_configu
         }
     })
     .await?;
+    assert!(!abandoned.exists());
 
+    if invalid_user_config {
+        // Subsequent explicit operations must pick up a repaired user config normally.
+        std::fs::write(&config_path, config_before)?;
+    }
     let marketplace_path =
         marketplace_install_root(dex_home.path()).join("trusted/.agents/plugins/marketplace.json");
     std::fs::write(

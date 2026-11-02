@@ -94,7 +94,7 @@ fn hook_trusted_hash_edit(hook_key: &str, current_hash: &str) -> ConfigEdit {
     }
 }
 
-async fn trust_materialized_plugin_hooks(
+pub(crate) async fn trust_materialized_plugin_hooks(
     materializations: Vec<RemotePluginMaterialization>,
     auth_manager: &AuthManager,
     thread_manager: &ThreadManager,
@@ -119,14 +119,17 @@ async fn trust_materialized_plugin_hooks(
         .plugins_manager()
         .plugins_for_config(&config.plugins_config_input())
         .await;
-    let hooks = dex_hooks::list_hooks(dex_hooks::HooksConfig {
+    let hooks_config = dex_hooks::HooksConfig {
         feature_enabled: true,
         bypass_hook_trust: config.bypass_hook_trust,
         config_layer_stack: Some(config.config_layer_stack),
         plugin_hook_sources: plugin_outcome.effective_plugin_hook_sources(),
         plugin_hook_load_warnings: plugin_outcome.effective_plugin_hook_warnings(),
         ..Default::default()
-    });
+    };
+    let hooks = tokio::task::spawn_blocking(move || dex_hooks::list_hooks(hooks_config))
+        .await
+        .map_err(|err| format!("hook discovery task failed: {err}"))?;
     if !hooks.warnings.is_empty() {
         warn!(
             warnings = ?hooks.warnings,

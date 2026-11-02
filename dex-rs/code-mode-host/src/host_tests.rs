@@ -7,13 +7,15 @@ use std::sync::atomic::AtomicBool;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
+use std::time::Instant;
 
-use dex_code_mode_protocol::CodeModeSessionCellExecutionLimits;
+use dex_code_mode_protocol::CodeModeSessionOptions;
+use dex_code_mode_protocol::TerminateRequest;
+use dex_code_mode_protocol::host::BOUNDED_OUTPUT_CAPABILITY;
 use dex_code_mode_protocol::host::Capability;
 use dex_code_mode_protocol::host::CapabilitySet;
 use dex_code_mode_protocol::host::ClientHello;
 use dex_code_mode_protocol::host::ClientToHost;
-use dex_code_mode_protocol::host::DUAL_WEBSOCKET_CAPABILITY;
 use dex_code_mode_protocol::host::EncodedFrame;
 use dex_code_mode_protocol::host::FramedReader;
 use dex_code_mode_protocol::host::FramedWriter;
@@ -27,16 +29,21 @@ use dex_code_mode_protocol::host::RequestId;
 use dex_code_mode_protocol::host::SESSION_RESOURCE_LIMITS_CAPABILITY;
 use dex_code_mode_protocol::host::SessionId;
 use dex_code_mode_protocol::host::SupportedProtocolVersions;
+use dex_code_mode_protocol::host::WireContentItem;
 use dex_code_mode_protocol::host::WireExecuteRequest;
+use dex_code_mode_protocol::host::WireOutputTruncation;
 use dex_code_mode_protocol::host::WireResult;
+use dex_code_mode_protocol::host::WireRuntimeResponse;
+use dex_code_mode_protocol::host::WireWaitOutcome;
+use dex_code_mode_protocol::host::WireWaitRequest;
 use pretty_assertions::assert_eq;
+use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use uuid::Uuid;
 
 use super::HostLimits;
 use super::HostState;
@@ -45,12 +52,8 @@ use super::MAX_RECENT_REQUEST_IDS;
 use super::RequestKind;
 use super::RequestRegistry;
 use super::SeenSessionIds;
-use super::negotiate;
 use super::peer::HostPeer;
 use super::run;
-use super::transport::BulkConnectionRegistry;
-use super::transport::ConnectionReader;
-use super::transport::ConnectionWriter;
 
 fn client_hello(
     versions: impl IntoIterator<Item = ProtocolVersion>,
@@ -101,6 +104,20 @@ fn execute_request(source: &str) -> WireExecuteRequest {
     }
 }
 
+async fn next_response(reader: &mut FramedReader<impl AsyncRead + Unpin>) -> HostToClient {
+    loop {
+        match reader
+            .read()
+            .await
+            .expect("host response")
+            .expect("host connected")
+        {
+            HostToClient::CellClosed { .. } => {}
+            message => return message,
+        }
+    }
+}
+
 #[tokio::test]
 async fn handshake_and_multiple_session_lifecycles_are_ordered() {
     let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 4096);
@@ -132,6 +149,7 @@ async fn handshake_and_multiple_session_lifecycles_are_ordered() {
                 request: HostRequest::OpenSession {
                     session_id: session_id(id),
                     cell_execution_limits: None,
+                    output_truncation: None,
                 },
             })
             .await
@@ -203,6 +221,7 @@ async fn disconnect_cancels_a_backpressured_host_writer() {
             request: HostRequest::OpenSession {
                 session_id: session_id("backpressured-session"),
                 cell_execution_limits: None,
+                output_truncation: None,
             },
         })
         .await
@@ -261,91 +280,66 @@ impl AsyncWrite for BlockingWriter {
 }
 
 #[tokio::test]
-async fn failed_host_hello_removes_the_bulk_pairing_reservation() {
-    let (host_reader, client_writer) = tokio::io::duplex(/*max_buf_size*/ 4096);
-    let capability = Capability::new(DUAL_WEBSOCKET_CAPABILITY).expect("dual websocket capability");
-    let hello = ClientToHost::ClientHello(
-        ClientHello::new(
-            SupportedProtocolVersions::try_new([ProtocolVersion::V1]).expect("supported versions"),
-            CapabilitySet::empty(),
-            CapabilitySet::try_new([capability]).expect("optional capabilities"),
-        )
-        .expect("client hello"),
-    );
-    FramedWriter::new(client_writer)
-        .write(&hello)
-        .await
-        .expect("write client hello");
+async fn supported_capabilities_are_negotiated_when_optional_or_required() {
+    for capability in [
+        SESSION_RESOURCE_LIMITS_CAPABILITY,
+        BOUNDED_OUTPUT_CAPABILITY,
+    ] {
+        let capability = Capability::new(capability).expect("supported capability");
+        let host_capabilities =
+            CapabilitySet::try_new([capability.clone()]).expect("host capabilities");
 
-    let bytes = Arc::new(Mutex::new(Vec::new()));
-    let registry = BulkConnectionRegistry::default();
-    let mut reader = ConnectionReader::from_reader(host_reader);
-    let mut writer = ConnectionWriter::from_writer(FailingHandshakeWriter {
-        bytes: Arc::clone(&bytes),
-    });
-    let result = negotiate(&mut reader, &mut writer, Some(&registry)).await;
-    assert!(result.is_err());
+        for (required, optional) in [
+            (
+                CapabilitySet::empty(),
+                CapabilitySet::try_new([capability]).expect("optional capabilities"),
+            ),
+            (host_capabilities.clone(), CapabilitySet::empty()),
+        ] {
+            let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 1024);
+            let (host_reader, host_writer) = tokio::io::split(host_stream);
+            let (client_reader, client_writer) = tokio::io::split(client_stream);
+            let host = tokio::spawn(run(host_reader, host_writer));
+            let mut reader = FramedReader::new(client_reader);
+            let mut writer = FramedWriter::new(client_writer);
 
-    let message = EncodedFrame::decode_framed::<HostToClient>(
-        &bytes.lock().unwrap_or_else(PoisonError::into_inner),
-    )
-    .expect("decode failed host hello");
-    let HostToClient::HostHello(hello) = message else {
-        panic!("expected a host hello");
-    };
-    let token = hello
-        .bulk_connection_token()
-        .expect("dual websocket pairing token");
-    let token = Uuid::parse_str(token).expect("UUID pairing token");
-    assert!(registry.remove(token).is_none());
-}
+            writer
+                .write(&ClientToHost::ClientHello(
+                    ClientHello::new(
+                        SupportedProtocolVersions::try_new([ProtocolVersion::V1])
+                            .expect("supported versions"),
+                        required,
+                        optional,
+                    )
+                    .expect("client hello"),
+                ))
+                .await
+                .expect("write hello");
+            assert_eq!(
+                reader.read::<HostToClient>().await.expect("host hello"),
+                Some(HostToClient::HostHello(HostHello::new(
+                    ProtocolVersion::V1,
+                    host_capabilities.clone(),
+                )))
+            );
 
-struct FailingHandshakeWriter {
-    bytes: Arc<Mutex<Vec<u8>>>,
-}
-
-impl AsyncWrite for FailingHandshakeWriter {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        bytes: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        self.bytes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(bytes);
-        Poll::Ready(Ok(bytes.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Err(std::io::Error::other("host hello write failed")))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+            drop(writer);
+            drop(reader);
+            host.await.expect("host task").expect("host connection");
+        }
     }
 }
 
 #[tokio::test]
-async fn optional_dual_websocket_capability_falls_back_to_a_single_connection() {
-    let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 1024);
+async fn output_selection_is_per_session() {
+    let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 4096);
     let (host_reader, host_writer) = tokio::io::split(host_stream);
     let (client_reader, client_writer) = tokio::io::split(client_stream);
     let host = tokio::spawn(run(host_reader, host_writer));
     let mut reader = FramedReader::new(client_reader);
     let mut writer = FramedWriter::new(client_writer);
-    let capability = Capability::new(DUAL_WEBSOCKET_CAPABILITY).expect("dual websocket capability");
-
     writer
-        .write(&ClientToHost::ClientHello(
-            ClientHello::new(
-                SupportedProtocolVersions::try_new([ProtocolVersion::V1])
-                    .expect("supported versions"),
-                CapabilitySet::empty(),
-                CapabilitySet::try_new([capability]).expect("optional capabilities"),
-            )
-            .expect("client hello"),
-        ))
+        .write(&client_hello([ProtocolVersion::V1], CapabilitySet::empty()))
         .await
         .expect("write hello");
     assert_eq!(
@@ -355,60 +349,138 @@ async fn optional_dual_websocket_capability_falls_back_to_a_single_connection() 
             CapabilitySet::empty(),
         )))
     );
+    for (id, name, output_truncation) in [
+        (1, "client", None),
+        (2, "server", Some(WireOutputTruncation::Server)),
+    ] {
+        writer
+            .write(&ClientToHost::Request {
+                id: request_id(id),
+                request: HostRequest::OpenSession {
+                    session_id: session_id(name),
+                    cell_execution_limits: None,
+                    output_truncation,
+                },
+            })
+            .await
+            .expect("open session");
+        assert_eq!(
+            reader.read::<HostToClient>().await.expect("session ready"),
+            Some(HostToClient::Response {
+                id: request_id(id),
+                result: WireResult::Ok {
+                    value: HostResponse::SessionReady {
+                        session_id: session_id(name),
+                    },
+                },
+            })
+        );
+    }
 
+    for (id, name, expected_text, expected_wait) in [
+        (
+            3,
+            "client",
+            "0123456789012345678901234567890123456789",
+            "01234567890123456789012345678901234567890123456789012345678901234567890123456789",
+        ),
+        (
+            4,
+            "server",
+            "Warning: truncated output (original token count: 10)\nTotal output lines: 1\n\n0123456789…5 tokens truncated…0123456789",
+            "Warning: truncated output (original token count: 20)\nTotal output lines: 1\n\n01234567890123…13 tokens truncated…67890123456789",
+        ),
+    ] {
+        let mut request = execute_request(
+            "text('0123456789'.repeat(4)); yield_control(); text('0123456789'.repeat(8));",
+        );
+        request.max_output_tokens = Some(5);
+        writer
+            .write(&ClientToHost::Request {
+                id: request_id(id),
+                request: HostRequest::Execute {
+                    session_id: session_id(name),
+                    request,
+                },
+            })
+            .await
+            .expect("execute");
+        // Admission is sent before start_cell can send its initial result.
+        assert!(matches!(
+            next_response(&mut reader).await,
+            HostToClient::Response {
+                id: actual_id,
+                result: WireResult::Ok { value: HostResponse::ExecutionStarted { .. } },
+            } if actual_id == request_id(id)
+        ));
+        let HostToClient::InitialResponse {
+            id: actual_id,
+            result:
+                WireResult::Ok {
+                    value:
+                        WireRuntimeResponse::Yielded {
+                            cell_id,
+                            content_items,
+                            ..
+                        },
+                },
+        } = next_response(&mut reader).await
+        else {
+            panic!("expected initial yield");
+        };
+        assert_eq!(actual_id, request_id(id));
+        assert_eq!(
+            content_items,
+            vec![WireContentItem::InputText {
+                text: expected_text.to_string()
+            }]
+        );
+        writer
+            .write(&ClientToHost::Request {
+                id: request_id(id + 2),
+                request: HostRequest::Wait {
+                    session_id: session_id(name),
+                    request: WireWaitRequest {
+                        cell_id,
+                        yield_time_ms: 60_000,
+                    },
+                    // A supplied budget only affects Server mode and belongs
+                    // to this observation, not the preceding exec.
+                    max_output_tokens: Some(7),
+                },
+            })
+            .await
+            .expect("wait");
+        let HostToClient::Response {
+            id: actual_id,
+            result:
+                WireResult::Ok {
+                    value:
+                        HostResponse::WaitCompleted {
+                            outcome:
+                                WireWaitOutcome::LiveCell(WireRuntimeResponse::Result {
+                                    content_items,
+                                    error_text,
+                                    ..
+                                }),
+                        },
+                },
+        } = next_response(&mut reader).await
+        else {
+            panic!("expected final wait");
+        };
+        assert_eq!(actual_id, request_id(id + 2));
+        assert_eq!(error_text, None);
+        assert_eq!(
+            content_items,
+            vec![WireContentItem::InputText {
+                text: expected_wait.to_string()
+            }]
+        );
+    }
     drop(writer);
     drop(reader);
     host.await.expect("host task").expect("host connection");
-}
-
-#[tokio::test]
-async fn session_resource_limits_are_negotiated_when_optional_or_required() {
-    let dual_capability =
-        Capability::new(DUAL_WEBSOCKET_CAPABILITY).expect("dual websocket capability");
-    let resource_limits_capability =
-        Capability::new(SESSION_RESOURCE_LIMITS_CAPABILITY).expect("resource limits capability");
-    let resource_limits =
-        CapabilitySet::try_new([resource_limits_capability.clone()]).expect("host capabilities");
-
-    for (required, optional) in [
-        (
-            CapabilitySet::empty(),
-            CapabilitySet::try_new([dual_capability, resource_limits_capability])
-                .expect("optional capabilities"),
-        ),
-        (resource_limits.clone(), CapabilitySet::empty()),
-    ] {
-        let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 1024);
-        let (host_reader, host_writer) = tokio::io::split(host_stream);
-        let (client_reader, client_writer) = tokio::io::split(client_stream);
-        let host = tokio::spawn(run(host_reader, host_writer));
-        let mut reader = FramedReader::new(client_reader);
-        let mut writer = FramedWriter::new(client_writer);
-
-        writer
-            .write(&ClientToHost::ClientHello(
-                ClientHello::new(
-                    SupportedProtocolVersions::try_new([ProtocolVersion::V1])
-                        .expect("supported versions"),
-                    required,
-                    optional,
-                )
-                .expect("client hello"),
-            ))
-            .await
-            .expect("write hello");
-        assert_eq!(
-            reader.read::<HostToClient>().await.expect("host hello"),
-            Some(HostToClient::HostHello(HostHello::new(
-                ProtocolVersion::V1,
-                resource_limits.clone(),
-            )))
-        );
-
-        drop(writer);
-        drop(reader);
-        host.await.expect("host task").expect("host connection");
-    }
 }
 
 #[tokio::test]
@@ -448,6 +520,7 @@ async fn incompatible_or_invalid_handshake_is_rejected() {
             request: HostRequest::OpenSession {
                 session_id: session_id("session-1"),
                 cell_execution_limits: None,
+                output_truncation: None,
             },
         })
         .await
@@ -514,6 +587,7 @@ async fn session_id_cannot_be_reused_after_shutdown() {
             HostRequest::OpenSession {
                 session_id: id.clone(),
                 cell_execution_limits: None,
+                output_truncation: None,
             },
         ),
         (
@@ -542,6 +616,7 @@ async fn session_id_cannot_be_reused_after_shutdown() {
             request: HostRequest::OpenSession {
                 session_id: id,
                 cell_execution_limits: None,
+                output_truncation: None,
             },
         })
         .await
@@ -625,10 +700,7 @@ async fn execute_request_id_remains_active_until_initial_response() {
     });
     let session_id = session_id("session-1");
     state
-        .open_session(
-            session_id.clone(),
-            CodeModeSessionCellExecutionLimits::default(),
-        )
+        .open_session(session_id.clone(), CodeModeSessionOptions::default())
         .expect("open session");
     let request_id = request_id(/*value*/ 1);
 
@@ -665,7 +737,10 @@ async fn execute_request_id_remains_active_until_initial_response() {
     state
         .session(&session_id)
         .expect("session")
-        .terminate(cell_id.into())
+        .terminate(TerminateRequest {
+            cell_id: cell_id.into(),
+            max_output_tokens: None,
+        })
         .await
         .expect("terminate cell");
     state.disconnect().await;
@@ -689,10 +764,7 @@ async fn active_cell_limit_rejects_execute_without_disconnecting() {
     };
     let session_id = session_id("session-1");
     state
-        .open_session(
-            session_id.clone(),
-            CodeModeSessionCellExecutionLimits::default(),
-        )
+        .open_session(session_id.clone(), CodeModeSessionOptions::default())
         .expect("open session");
     let request_id = request_id(/*value*/ 1);
 
@@ -704,6 +776,8 @@ async fn active_cell_limit_rejects_execute_without_disconnecting() {
                 request: execute_request("text(\"hello\");"),
             },
             CancellationToken::new(),
+            CancellationToken::new(),
+            Instant::now(),
         )
         .await;
 

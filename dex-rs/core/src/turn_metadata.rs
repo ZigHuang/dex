@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::path::Path;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -11,47 +10,97 @@ use std::sync::atomic::Ordering;
 
 use serde_json::Value;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::responses_metadata::AGENT_NAME_KEY;
 use crate::responses_metadata::DexResponsesMetadata;
 use crate::responses_metadata::DexResponsesRequestKind;
+use crate::responses_metadata::MAX_EXTRA_METADATA_VALUE_BYTES;
 use crate::responses_metadata::PARENT_TURN_ID_KEY;
 use crate::responses_metadata::ROOT_TURN_ID_KEY;
 use crate::responses_metadata::TurnMetadataWorkspace;
-use crate::responses_metadata::TurnToolNamespacesInfo;
 use crate::responses_metadata::filter_extra_metadata;
 use crate::responses_metadata::subagent_header_value;
 use crate::responses_metadata::subagent_metadata_kind;
-use crate::sandbox_tags::permission_profile_policy_tag;
-use crate::sandbox_tags::permission_profile_sandbox_tag;
+use crate::sandbox_tags::SandboxTags;
+use crate::sandbox_tags::record_policy_metadata;
+use crate::session::step_settings::ResolvedStepSettings;
+use dex_file_system::WindowsSandboxSelection;
+use dex_git_utils::SanitizedGitUrl;
 use dex_git_utils::get_git_remote_urls_assume_git_repo;
-use dex_git_utils::get_git_repo_root;
 use dex_git_utils::get_has_changes_in_repo;
 use dex_git_utils::get_head_commit_hash;
 use dex_protocol::AgentPath;
 use dex_protocol::ThreadId;
-use dex_protocol::config_types::WindowsSandboxLevel;
 use dex_protocol::models::PermissionProfile;
 use dex_protocol::openai_models::ModelInfo;
 use dex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use dex_protocol::protocol::SessionSource;
 use dex_protocol::protocol::ThreadSource;
+use dex_protocol::turn_input::ResponsesApiClientMetadataUpdate;
 use dex_utils_absolute_path::AbsolutePathBuf;
+use dex_utils_git_discovery::GitRootDiscovery;
+
+// Memory requests await this optional metadata before sending their model request.
+const MEMORY_GIT_METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 const MODEL_KEY: &str = "model";
+const DEX_VERSION_KEY: &str = "dex_version";
 const REASONING_EFFORT_KEY: &str = "reasoning_effort";
 const USER_INPUT_REQUESTED_DURING_TURN_KEY: &str = "user_input_requested_during_turn";
 const WORKSPACE_KIND_KEY: &str = "workspace_kind";
 
-pub(crate) struct McpTurnMetadataContext<'a> {
+fn is_targeted_continuation(value: &str) -> bool {
+    serde_json::from_str::<Value>(value).is_ok_and(|value| value.get("review_target").is_some())
+}
+
+/// Captured execution settings shared by Responses and MCP metadata.
+pub(crate) struct ExecutionMetadata<'a> {
     pub(crate) model: &'a str,
     pub(crate) reasoning_effort: Option<ReasoningEffortConfig>,
+    pub(crate) node_repl_disabled: bool,
+    pub(crate) auto_review_enabled: bool,
+    pub(crate) node_repl_auto_review_required: bool,
+}
+
+impl<'a> ExecutionMetadata<'a> {
+    pub(crate) fn from_settings(settings: &'a ResolvedStepSettings) -> Self {
+        Self {
+            model: settings.model_info.slug.as_str(),
+            reasoning_effort: settings.effective_reasoning_effort(),
+            node_repl_disabled: settings.model_info.node_repl_disabled,
+            auto_review_enabled: crate::guardian::routes_approval_policy_to_guardian(
+                settings.approval_policy(),
+                settings.approvals_reviewer(),
+            ),
+            node_repl_auto_review_required: settings.model_info.computer_use_review_required(),
+        }
+    }
+
+    pub(crate) fn apply_to(&self, metadata: &mut DexResponsesMetadata) {
+        metadata.auto_review_enabled = Some(self.auto_review_enabled);
+        metadata.node_repl_auto_review_required = Some(self.node_repl_auto_review_required);
+        metadata.node_repl_disabled = Some(self.node_repl_disabled);
+        metadata
+            .extra
+            .insert(MODEL_KEY.to_string(), self.model.to_string());
+        match &self.reasoning_effort {
+            Some(reasoning_effort) => {
+                metadata.extra.insert(
+                    REASONING_EFFORT_KEY.to_string(),
+                    reasoning_effort.to_string(),
+                );
+            }
+            None => {
+                metadata.extra.remove(REASONING_EFFORT_KEY);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 struct WorkspaceGitMetadata {
-    associated_remote_urls: Option<BTreeMap<String, String>>,
+    associated_remote_urls: Option<BTreeMap<String, SanitizedGitUrl>>,
     latest_git_commit_hash: Option<String>,
     has_changes: Option<bool>,
 }
@@ -76,6 +125,7 @@ impl From<WorkspaceGitMetadata> for TurnMetadataWorkspace {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn detached_memory_responses_metadata(
+    thread_manager: &crate::ThreadManager,
     installation_id: String,
     session_id: String,
     thread_id: String,
@@ -85,47 +135,85 @@ pub async fn detached_memory_responses_metadata(
     permission_profile: &PermissionProfile,
     sandbox: Option<&str>,
 ) -> DexResponsesMetadata {
-    DexResponsesMetadata {
+    let turn_id = uuid::Uuid::now_v7().to_string();
+    let mut metadata = DexResponsesMetadata {
+        turn_id: Some(turn_id.clone()),
+        root_turn_id: Some(turn_id),
         request_kind: Some(DexResponsesRequestKind::Memory),
+        thread_source: Some(ThreadSource::MemoryConsolidation),
+        turn_trigger: Some("memory_consolidation".to_owned()),
         subagent_header: subagent_header_value(session_source),
         sandbox: sandbox.map(ToString::to_string),
-        sandbox_mode: Some(
-            permission_profile_policy_tag(permission_profile, cwd.as_path()).to_string(),
-        ),
-        workspaces: memory_workspaces(cwd).await,
+        workspaces: memory_workspaces(
+            cwd,
+            thread_manager.git_root_discovery().discover(cwd.clone()),
+        )
+        .await,
         ..DexResponsesMetadata::new(installation_id, session_id, thread_id, window_id)
-    }
+    };
+    record_policy_metadata(permission_profile, cwd.as_path(), &mut metadata);
+    metadata
 }
 
 #[derive(Debug)]
 pub(crate) struct TurnMetadataState {
     cwd: AbsolutePathBuf,
-    repo_root: Option<PathBuf>,
     session_id: String,
     thread_id: String,
     agent_name: String,
     forked_from_thread_id: Option<ThreadId>,
     parent_thread_id: Option<ThreadId>,
     parent_turn_id: OnceLock<String>,
+    initiating_agent_path: OnceLock<AgentPath>,
     root_turn_id: OnceLock<String>,
     subagent_header: Option<String>,
     subagent_kind: Option<String>,
     thread_source: Option<ThreadSource>,
+    turn_trigger: OnceLock<String>,
     turn_id: String,
-    sandbox: Option<String>,
-    sandbox_mode: Option<String>,
+    // TODO(anp): Derive this cached tag from TurnEnvironment::sandbox_context
+    // so metadata reflects the selected environment's backend.
+    pub(crate) sandbox_tags: SandboxTags,
     auto_review_enabled: bool,
     node_repl_auto_review_required: bool,
     node_repl_disabled: bool,
     enriched_workspaces: RwLock<Option<BTreeMap<String, TurnMetadataWorkspace>>>,
-    tool_namespaces_info: RwLock<Option<TurnToolNamespacesInfo>>,
     turn_started_at_unix_ms: RwLock<Option<i64>>,
     responses_api_metadata: RwLock<BTreeMap<String, String>>,
     responsesapi_client_metadata: RwLock<BTreeMap<String, String>>,
-    root_turn_ambiguous: AtomicBool,
     user_input_requested_during_turn: AtomicBool,
-    enrichment_task: Mutex<Option<JoinHandle<()>>>,
+    enrichment_task: Mutex<Option<AbortOnDropHandle<()>>>,
     git_enrichment_complete: watch::Sender<bool>,
+}
+
+impl dex_analytics::TurnAnalyticsMetadata for TurnMetadataState {
+    fn root_turn_id(&self) -> Option<String> {
+        TurnMetadataState::root_turn_id(self)
+    }
+
+    fn turn_trigger(&self) -> Option<String> {
+        self.turn_trigger
+            .get()
+            .filter(|trigger| trigger.len() <= MAX_EXTRA_METADATA_VALUE_BYTES)
+            .cloned()
+    }
+
+    fn dex_turn_source(&self) -> Option<String> {
+        // Match Responses metadata precedence without copying oversized client values to analytics.
+        let configured_metadata = self
+            .responses_api_metadata
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let client_metadata = self
+            .responsesapi_client_metadata
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        configured_metadata
+            .get("source")
+            .or_else(|| client_metadata.get("source"))
+            .filter(|source| source.len() <= MAX_EXTRA_METADATA_VALUE_BYTES)
+            .cloned()
+    }
 }
 
 impl TurnMetadataState {
@@ -140,51 +228,44 @@ impl TurnMetadataState {
         turn_id: String,
         cwd: AbsolutePathBuf,
         permission_profile: &PermissionProfile,
-        windows_sandbox_level: WindowsSandboxLevel,
+        windows_sandbox_selection: impl Into<WindowsSandboxSelection>,
         enforce_managed_network: bool,
         auto_review_enabled: bool,
         model_info: &ModelInfo,
     ) -> Self {
-        let repo_root = get_git_repo_root(&cwd);
-        let sandbox = Some(
-            permission_profile_sandbox_tag(
-                permission_profile,
-                windows_sandbox_level,
-                enforce_managed_network,
-            )
-            .to_string(),
+        let sandbox_tags = SandboxTags::new(
+            permission_profile,
+            cwd.as_path(),
+            windows_sandbox_selection.into(),
+            enforce_managed_network,
         );
-        let sandbox_mode =
-            Some(permission_profile_policy_tag(permission_profile, cwd.as_path()).to_string());
         let agent_name = session_source
             .get_agent_path()
             .unwrap_or_else(AgentPath::root)
             .to_string();
         Self {
             cwd,
-            repo_root,
             session_id,
             thread_id,
             agent_name,
             forked_from_thread_id,
             parent_thread_id,
             parent_turn_id: OnceLock::new(),
+            initiating_agent_path: OnceLock::new(),
             root_turn_id: OnceLock::new(),
             subagent_header: subagent_header_value(session_source),
             subagent_kind: subagent_metadata_kind(session_source),
             thread_source,
+            turn_trigger: OnceLock::new(),
             turn_id,
-            sandbox,
-            sandbox_mode,
+            sandbox_tags,
             auto_review_enabled,
-            node_repl_auto_review_required: model_info.node_repl_auto_review_required,
+            node_repl_auto_review_required: model_info.computer_use_review_required(),
             node_repl_disabled: model_info.node_repl_disabled,
             enriched_workspaces: RwLock::new(None),
-            tool_namespaces_info: RwLock::new(None),
             turn_started_at_unix_ms: RwLock::new(None),
             responses_api_metadata: RwLock::new(BTreeMap::new()),
             responsesapi_client_metadata: RwLock::new(BTreeMap::new()),
-            root_turn_ambiguous: AtomicBool::new(false),
             user_input_requested_during_turn: AtomicBool::new(false),
             enrichment_task: Mutex::new(None),
             git_enrichment_complete: watch::channel(/*init*/ true).0,
@@ -193,10 +274,35 @@ impl TurnMetadataState {
 
     pub(crate) fn current_meta_value_for_mcp_request(
         &self,
-        context: McpTurnMetadataContext<'_>,
+        execution: ExecutionMetadata<'_>,
     ) -> Option<serde_json::Value> {
-        let mut responses_metadata = self.mcp_metadata_template();
-        // Never serialize harness-owned tool inventory for external MCP servers.
+        self.current_meta_value_for_tool_request(self.mcp_metadata_template(), execution)
+    }
+
+    pub(crate) fn current_meta_value_for_extension_request(
+        &self,
+        execution: ExecutionMetadata<'_>,
+    ) -> Option<serde_json::Value> {
+        // Native extensions need configured Responses metadata for request attribution,
+        // which the MCP template omits for external servers.
+        self.current_meta_value_for_tool_request(self.responses_metadata_template(), execution)
+    }
+
+    fn current_meta_value_for_tool_request(
+        &self,
+        mut responses_metadata: DexResponsesMetadata,
+        execution: ExecutionMetadata<'_>,
+    ) -> Option<serde_json::Value> {
+        if responses_metadata
+            .extra
+            .get("misalignment_override")
+            .is_some_and(|value| is_targeted_continuation(value))
+        {
+            // A review target is for Responses admission, not external tools or hooks.
+            responses_metadata.extra.remove("misalignment_override");
+        }
+        execution.apply_to(&mut responses_metadata);
+        // Never serialize harness-owned tool inventory for tool requests.
         responses_metadata.tool_namespaces_info = None;
         let Value::Object(mut metadata) = responses_metadata.turn_metadata_value()? else {
             return None;
@@ -205,20 +311,9 @@ impl TurnMetadataState {
         metadata.remove(PARENT_TURN_ID_KEY);
         metadata.remove(ROOT_TURN_ID_KEY);
         metadata.insert(
-            MODEL_KEY.to_string(),
-            Value::String(context.model.to_string()),
+            DEX_VERSION_KEY.to_string(),
+            Value::String(env!("CARGO_PKG_VERSION").to_string()),
         );
-        match context.reasoning_effort {
-            Some(reasoning_effort) => {
-                metadata.insert(
-                    REASONING_EFFORT_KEY.to_string(),
-                    Value::String(reasoning_effort.to_string()),
-                );
-            }
-            None => {
-                metadata.remove(REASONING_EFFORT_KEY);
-            }
-        }
         if self
             .user_input_requested_during_turn
             .load(Ordering::Relaxed)
@@ -239,25 +334,28 @@ impl TurnMetadataState {
         window_id: String,
         request_kind: DexResponsesRequestKind,
     ) -> DexResponsesMetadata {
+        let mut metadata = self.responses_metadata_template();
+        if matches!(request_kind, DexResponsesRequestKind::Compaction(_))
+            && metadata
+                .extra
+                .get("misalignment_override")
+                .is_some_and(|value| is_targeted_continuation(value))
+        {
+            // Target-based intent belongs to the pending turn, not compaction. Preserve the
+            // legacy timestamp path until servers can admit pre-turn compaction separately.
+            metadata.extra.remove("misalignment_override");
+        }
         DexResponsesMetadata {
             installation_id,
             window_id,
             request_kind: Some(request_kind),
-            ..self.responses_metadata_template()
+            ..metadata
         }
     }
 
     pub(crate) fn mark_user_input_requested_during_turn(&self) {
         self.user_input_requested_during_turn
             .store(true, Ordering::Relaxed);
-    }
-
-    pub(crate) fn set_tool_namespaces_info(&self, tool_namespaces_info: TurnToolNamespacesInfo) {
-        *self
-            .tool_namespaces_info
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            (!tool_namespaces_info.is_empty()).then_some(tool_namespaces_info);
     }
 
     pub(crate) fn set_parent_turn_id(&self, parent_turn_id: String) {
@@ -267,6 +365,18 @@ impl TurnMetadataState {
         let _ = self.parent_turn_id.set(parent_turn_id);
     }
 
+    pub(crate) fn parent_turn_id(&self) -> Option<String> {
+        self.parent_turn_id.get().cloned()
+    }
+
+    pub(crate) fn set_initiating_agent_path(&self, initiating_agent_path: AgentPath) {
+        let _ = self.initiating_agent_path.set(initiating_agent_path);
+    }
+
+    pub(crate) fn initiating_agent_path(&self) -> Option<&AgentPath> {
+        self.initiating_agent_path.get()
+    }
+
     pub(crate) fn set_root_turn_id(&self, root_turn_id: String) {
         if root_turn_id.trim().is_empty() {
             return;
@@ -274,50 +384,59 @@ impl TurnMetadataState {
         let _ = self.root_turn_id.set(root_turn_id);
     }
 
+    pub(crate) fn set_turn_trigger(&self, turn_trigger: String) {
+        if turn_trigger.trim().is_empty() {
+            return;
+        }
+        let _ = self.turn_trigger.set(turn_trigger);
+    }
+
+    pub(crate) fn current_turn_trigger(&self) -> Option<String> {
+        self.turn_trigger.get().cloned()
+    }
+
     pub(crate) fn root_turn_id(&self) -> Option<String> {
-        self.root_turn_id
-            .get()
-            .filter(|_| !self.root_turn_ambiguous.load(Ordering::Relaxed))
-            .cloned()
+        self.root_turn_id.get().cloned()
     }
 
-    pub(crate) fn mark_root_turn_ambiguous(&self) {
-        self.root_turn_ambiguous.store(true, Ordering::Relaxed);
-    }
-
-    pub(crate) fn can_start_root_turn(&self, session_source: &SessionSource) -> bool {
-        if session_source.is_non_root_agent() {
-            return false;
-        }
-        match &self.thread_source {
-            // Desktop create/fork/send lacks trusted app-server provenance; fail closed.
-            Some(ThreadSource::Subagent | ThreadSource::MemoryConsolidation) => false,
-            Some(ThreadSource::Feature(feature)) => {
-                !matches!(feature.as_str(), "system" | "title") && !feature.starts_with("ambient")
-            }
-            Some(ThreadSource::User) | None => true,
-        }
-    }
-
-    pub(crate) fn set_responsesapi_client_metadata(
+    pub(crate) fn update_responsesapi_client_metadata(
         &self,
-        responsesapi_client_metadata: HashMap<String, String>,
+        update: ResponsesApiClientMetadataUpdate,
     ) {
-        *self
+        let replacement = update.replacement.map(filter_extra_metadata);
+        let patch = update.patch.map(filter_extra_metadata).unwrap_or_default();
+        if replacement.is_none() && patch.is_empty() {
+            return;
+        }
+        let mut current = self
             .responsesapi_client_metadata
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            filter_extra_metadata(responsesapi_client_metadata);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let continuation = current
+            .get("misalignment_override")
+            .filter(|value| is_targeted_continuation(value))
+            .cloned();
+        if let Some(replacement) = replacement {
+            *current = replacement;
+        }
+        current.extend(patch);
+        if let Some(continuation) = continuation {
+            // Steering may update other metadata, but cannot replace the reviewed block.
+            current.insert("misalignment_override".to_string(), continuation);
+        }
     }
 
     pub(crate) fn set_responses_api_metadata(
         &self,
         responses_api_metadata: BTreeMap<String, String>,
     ) {
+        let mut metadata = filter_extra_metadata(responses_api_metadata);
+        // Only explicit per-turn metadata can acknowledge a reviewed block.
+        metadata.remove("misalignment_override");
         *self
             .responses_api_metadata
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = responses_api_metadata;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = metadata;
     }
 
     pub(crate) fn workspace_kind(&self) -> Option<String> {
@@ -330,6 +449,9 @@ impl TurnMetadataState {
 
     fn responses_metadata_template(&self) -> DexResponsesMetadata {
         let mut metadata = self.mcp_metadata_template();
+        if metadata.parent_thread_id.is_some() {
+            metadata.forked_from_thread_id = None;
+        }
         metadata.extra.extend(
             self.responses_api_metadata
                 .read()
@@ -345,6 +467,14 @@ impl TurnMetadataState {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        // Extract Guardian's internal parent before filtering configured metadata keys.
+        // Ordinary app-server client metadata stays in `extra`.
+        let parent_response_id =
+            if self.subagent_header.as_deref() == Some(crate::guardian::GUARDIAN_REVIEWER_NAME) {
+                extra.remove("parent_response_id")
+            } else {
+                None
+            };
         for key in self
             .responses_api_metadata
             .read()
@@ -353,7 +483,8 @@ impl TurnMetadataState {
         {
             extra.remove(key);
         }
-        DexResponsesMetadata {
+        let mut metadata = DexResponsesMetadata {
+            parent_response_id,
             turn_id: Some(self.turn_id.clone()),
             agent_name: Some(self.agent_name.clone()),
             forked_from_thread_id: self.forked_from_thread_id,
@@ -363,17 +494,12 @@ impl TurnMetadataState {
             subagent_header: self.subagent_header.clone(),
             subagent_kind: self.subagent_kind.clone(),
             thread_source: self.thread_source.clone(),
-            sandbox: self.sandbox.clone(),
-            sandbox_mode: self.sandbox_mode.clone(),
+            turn_trigger: self.turn_trigger.get().cloned(),
             auto_review_enabled: Some(self.auto_review_enabled),
             node_repl_auto_review_required: Some(self.node_repl_auto_review_required),
             node_repl_disabled: Some(self.node_repl_disabled),
             workspaces: self.current_workspaces(),
-            tool_namespaces_info: self
-                .tool_namespaces_info
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
+            tool_namespaces_info: None,
             turn_started_at_unix_ms: self.current_turn_started_at_unix_ms(),
             extra,
             ..DexResponsesMetadata::new(
@@ -382,7 +508,9 @@ impl TurnMetadataState {
                 self.thread_id.clone(),
                 String::new(),
             )
-        }
+        };
+        self.sandbox_tags.record_metadata(&mut metadata);
+        metadata
     }
 
     fn current_workspaces(&self) -> BTreeMap<String, TurnMetadataWorkspace> {
@@ -407,11 +535,10 @@ impl TurnMetadataState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(turn_started_at_unix_ms);
     }
 
-    pub(crate) fn spawn_git_enrichment_task(self: &Arc<Self>) {
-        let Some(repo_root) = self.repo_root.clone() else {
-            return;
-        };
-
+    pub(crate) fn spawn_git_enrichment_task(
+        self: &Arc<Self>,
+        git_root_discovery: Arc<GitRootDiscovery>,
+    ) {
         let mut task_guard = self
             .enrichment_task
             .lock()
@@ -421,16 +548,16 @@ impl TurnMetadataState {
         }
 
         self.git_enrichment_complete.send_replace(/*value*/ false);
-        let state = Arc::clone(self);
-        *task_guard = Some(tokio::spawn(async move {
-            let workspace_git_metadata = state.fetch_workspace_git_metadata(&repo_root).await;
-
-            if !workspace_git_metadata.is_empty() {
-                let mut workspaces = BTreeMap::new();
-                workspaces.insert(
-                    repo_root.to_string_lossy().into_owned(),
-                    workspace_git_metadata.into(),
-                );
+        // History-only contexts have no active task to cancel enrichment. Keep the
+        // state weak across awaits so dropping its last owner aborts this waiter.
+        let state = Arc::downgrade(self);
+        let cwd = self.cwd.clone();
+        *task_guard = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            let workspaces = git_workspaces(&cwd, git_root_discovery.discover(cwd.clone())).await;
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            if !workspaces.is_empty() {
                 *state
                     .enriched_workspaces
                     .write()
@@ -438,7 +565,7 @@ impl TurnMetadataState {
             }
 
             state.git_enrichment_complete.send_replace(/*value*/ true);
-        }));
+        })));
     }
 
     pub(crate) async fn wait_for_git_enrichment(&self) {
@@ -456,25 +583,22 @@ impl TurnMetadataState {
             self.git_enrichment_complete.send_replace(/*value*/ true);
         }
     }
-
-    async fn fetch_workspace_git_metadata(&self, repo_root: &Path) -> WorkspaceGitMetadata {
-        let (head_commit_hash, associated_remote_urls, has_changes) = tokio::join!(
-            get_head_commit_hash(&self.cwd),
-            get_git_remote_urls_assume_git_repo(&self.cwd),
-            get_has_changes_in_repo(&self.cwd, repo_root),
-        );
-        let latest_git_commit_hash = head_commit_hash.map(|sha| sha.0);
-
-        WorkspaceGitMetadata {
-            associated_remote_urls,
-            latest_git_commit_hash,
-            has_changes,
-        }
-    }
 }
 
-async fn memory_workspaces(cwd: &AbsolutePathBuf) -> BTreeMap<String, TurnMetadataWorkspace> {
-    let Some(repo_root) = get_git_repo_root(cwd) else {
+async fn memory_workspaces(
+    cwd: &AbsolutePathBuf,
+    repo_root: impl Future<Output = Option<PathBuf>>,
+) -> BTreeMap<String, TurnMetadataWorkspace> {
+    tokio::time::timeout(MEMORY_GIT_METADATA_TIMEOUT, git_workspaces(cwd, repo_root))
+        .await
+        .unwrap_or_default()
+}
+
+async fn git_workspaces(
+    cwd: &AbsolutePathBuf,
+    repo_root: impl Future<Output = Option<PathBuf>>,
+) -> BTreeMap<String, TurnMetadataWorkspace> {
+    let Some(repo_root) = repo_root.await else {
         return BTreeMap::new();
     };
     let (head_commit_hash, associated_remote_urls, has_changes) = tokio::join!(

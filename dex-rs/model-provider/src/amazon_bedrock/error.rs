@@ -4,6 +4,9 @@ use dex_protocol::error::DexErr;
 use dex_protocol::error::DexErrorDetails;
 use http::StatusCode;
 
+pub(super) const CREDENTIAL_EXPORT_CONFIG_ERROR_PREFIX: &str =
+    "AWS credential export configuration error:";
+
 pub(super) const BEDROCK_EXPIRED_SIGNATURE_MESSAGE: &str = concat!(
     "Amazon Bedrock rejected the request because its AWS signature has expired. ",
     "Refresh your AWS credentials and retry. If `AWS_BEARER_TOKEN_BEDROCK` is set, ",
@@ -11,6 +14,11 @@ pub(super) const BEDROCK_EXPIRED_SIGNATURE_MESSAGE: &str = concat!(
 );
 
 pub(super) fn map_api_error(error: ApiError) -> DexErr {
+    if let ApiError::Transport(TransportError::Build(message)) = &error
+        && message.starts_with(CREDENTIAL_EXPORT_CONFIG_ERROR_PREFIX)
+    {
+        return DexErr::InvalidRequest(message.clone());
+    }
     let error = dex_api::map_api_error(error);
     if let DexErrorDetails::UnexpectedStatus(response) = error.details()
         && response.status == StatusCode::UNAUTHORIZED
@@ -19,8 +27,8 @@ pub(super) fn map_api_error(error: ApiError) -> DexErr {
         let mut response = response.clone();
         response.user_message = Some(BEDROCK_EXPIRED_SIGNATURE_MESSAGE.to_string());
         let mapped_error = DexErr::new(DexErrorDetails::UnexpectedStatus(response));
-        return match error.retry_delay() {
-            Some(retry_delay) => mapped_error.with_retry_delay(retry_delay),
+        return match error.retry_after() {
+            Some(retry_after) => mapped_error.with_retry_after(retry_after),
             None => mapped_error,
         };
     }

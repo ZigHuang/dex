@@ -5,7 +5,7 @@ use dex_config::types::History;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
-use super::*;
+use crate::*;
 
 fn entry(offset: usize, text: impl Into<String>) -> HistoryEntry {
     HistoryEntry {

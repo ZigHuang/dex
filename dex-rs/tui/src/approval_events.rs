@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use crate::diff_model::FileChange;
 use dex_app_server_protocol::AdditionalPermissionProfile;
 use dex_app_server_protocol::CommandExecutionApprovalDecision;
+use dex_app_server_protocol::CommandExecutionApprovalKind;
 use dex_app_server_protocol::ExecPolicyAmendment;
 use dex_app_server_protocol::NetworkApprovalContext;
 use dex_app_server_protocol::NetworkPolicyAmendment;
@@ -21,6 +22,8 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ExecApprovalRequestEvent {
+    #[serde(default)]
+    pub(crate) kind: CommandExecutionApprovalKind,
     pub(crate) call_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) approval_id: Option<String>,

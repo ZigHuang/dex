@@ -1,6 +1,7 @@
 mod common;
 
 use common::exec_server::exec_server;
+use common::exec_server::exec_server_with_env;
 use dex_config::CONFIG_TOML_FILE;
 use dex_config::ConfigLayerSource;
 use dex_config::format_config_layer_source;
@@ -17,19 +18,22 @@ use pretty_assertions::assert_eq;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_environment_reads_projected_executor_config() -> anyhow::Result<()> {
-    let mut server = exec_server().await?;
+    let mut server =
+        exec_server_with_env([("DEX_EXEC_SERVER_TEST_PREFER_MXC", "true")], &[]).await?;
     let dex_home = AbsolutePathBuf::from_absolute_path(std::fs::canonicalize(server.dex_home())?)?;
     let config_file = dex_home.join(CONFIG_TOML_FILE);
     let project = dex_home.join("project");
+    let nested = project.join("nested");
     let dot_dex = project.join(".dex");
     tokio::fs::create_dir_all(dot_dex.as_path()).await?;
     tokio::fs::write(project.join(".project-root").as_path(), "").await?;
     let project_key = toml::Value::String(project_trust_key(project.as_path())).to_string();
+    let nested_key = toml::Value::String(project_trust_key(nested.as_path())).to_string();
+    let projects_toml =
+        format!("[projects.{project_key}]\ntrust_level = \"trusted\"\n[projects.{nested_key}]\n");
     tokio::fs::write(
         &config_file,
-        format!(
-            "project_root_markers = [\".project-root\"]\n[projects.{project_key}]\ntrust_level = \"trusted\""
-        ),
+        format!("project_root_markers = [\".project-root\"]\n{projects_toml}"),
     )
     .await?;
     tokio::fs::write(
@@ -38,6 +42,9 @@ async fn remote_environment_reads_projected_executor_config() -> anyhow::Result<
 [future_environment]
 relative_path = "./executor-relative"
 unselected = "do not return"
+[features]
+prefer_mxc = false
+private_startup_value = "unselected-private-value"
 "#,
     )
     .await?;
@@ -45,6 +52,10 @@ unselected = "do not return"
     let environment = Environment::create_for_tests(Some(server.websocket_url().to_string()))?;
     let environment_info = environment.info().await?;
     assert!(environment_info.capabilities.environment_config_read);
+    assert_eq!(
+        environment_info.user_home_dir,
+        dirs::home_dir().and_then(|home_dir| PathUri::from_host_native_path(home_dir).ok()),
+    );
 
     let response = environment
         .read_environment_config(EnvironmentConfigReadParams {
@@ -88,6 +99,49 @@ unselected = "do not return"
         }
     );
 
+    let mut expected_projects = response;
+    expected_projects.config.layers[0] = EnvironmentConfigLayer {
+        source: format_config_layer_source(
+            &ConfigLayerSource::User {
+                file: config_file,
+                profile: None,
+            },
+            CONFIG_TOML_FILE,
+        ),
+        base_dir: PathUri::from_abs_path(&dex_home),
+        toml: toml::to_string(&toml::from_str::<toml::Value>(&projects_toml)?)?,
+    };
+    let projects = environment
+        .read_environment_config(EnvironmentConfigReadParams {
+            cwd: PathUri::from_abs_path(&project),
+            config_paths: vec![vec!["projects".to_string()]],
+            requirements_paths: Vec::new(),
+        })
+        .await?;
+    assert_eq!(projects, expected_projects);
+
+    let preference = environment
+        .read_environment_config(EnvironmentConfigReadParams {
+            cwd: PathUri::from_abs_path(&project),
+            config_paths: vec![vec!["features".to_string(), "prefer_mxc".to_string()]],
+            requirements_paths: Vec::new(),
+        })
+        .await?;
+    assert_eq!(preference.config.cloud_insertion_index, 0);
+    assert_eq!(preference.config.layers.len(), 2);
+    let configured = &preference.config.layers[0];
+    let startup = &preference.config.layers[1];
+    assert_eq!(configured.base_dir, PathUri::from_abs_path(&dot_dex));
+    assert_eq!(startup.source, "session-flags");
+    assert_eq!(startup.base_dir, PathUri::from_abs_path(&project));
+    assert_eq!(
+        toml::from_str::<toml::Value>(&configured.toml)?,
+        toml::Value::Table(toml::toml! { [features] prefer_mxc = false }),
+    );
+    assert_eq!(
+        toml::from_str::<toml::Value>(&startup.toml)?,
+        toml::Value::Table(toml::toml! { [features] prefer_mxc = true }),
+    );
     server.shutdown().await?;
     Ok(())
 }

@@ -67,6 +67,7 @@ Use Python's standard `help(openai_dex)`, `help(Dex)`, or
 
 - [Getting started](https://github.com/openai/dex/blob/main/sdk/python/docs/getting-started.md)
 - [API reference](https://github.com/openai/dex/blob/main/sdk/python/docs/api-reference.md)
+- [Untrusted external messages](https://github.com/openai/dex/blob/main/sdk/python/docs/api-reference.md#externalmessage)
 - [FAQ](https://github.com/openai/dex/blob/main/sdk/python/docs/faq.md)
 - [Examples](https://github.com/openai/dex/blob/main/sdk/python/examples/README.md)
 

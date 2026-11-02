@@ -76,11 +76,24 @@ pub fn features_schema(schema_gen: &mut SchemaGenerator) -> Schema {
             );
             continue;
         }
+        if feature.id == dex_features::Feature::GuardianThreadContext {
+            // This setting is already part of the guardianv2 feature table.
+            continue;
+        }
         if feature.id == dex_features::Feature::GuardianV2 {
             validation.properties.insert(
                 feature.key.to_string(),
                 schema_gen
                     .subschema_for::<dex_features::FeatureToml<dex_features::GuardianV2ConfigToml>>(
+                    ),
+            );
+            continue;
+        }
+        if feature.id == dex_features::Feature::GuardianV3 {
+            validation.properties.insert(
+                feature.key.to_string(),
+                schema_gen
+                    .subschema_for::<dex_features::FeatureToml<dex_features::GuardianV3ConfigToml>>(
                     ),
             );
             continue;
@@ -94,11 +107,29 @@ pub fn features_schema(schema_gen: &mut SchemaGenerator) -> Schema {
             );
             continue;
         }
+        if feature.id == dex_features::Feature::AsyncCompaction {
+            validation.properties.insert(
+                feature.key.to_string(),
+                schema_gen.subschema_for::<dex_features::FeatureToml<
+                    dex_features::AsyncCompactionConfigToml,
+                >>(),
+            );
+            continue;
+        }
         if feature.id == dex_features::Feature::TokenBudget {
             validation.properties.insert(
                 feature.key.to_string(),
                 schema_gen.subschema_for::<dex_features::FeatureToml<
                     dex_features::TokenBudgetConfigToml,
+                >>(),
+            );
+            continue;
+        }
+        if feature.id == dex_features::Feature::ContextManagement {
+            validation.properties.insert(
+                feature.key.to_string(),
+                schema_gen.subschema_for::<dex_features::FeatureToml<
+                    dex_features::ContextManagementConfigToml,
                 >>(),
             );
             continue;
@@ -117,6 +148,24 @@ pub fn features_schema(schema_gen: &mut SchemaGenerator) -> Schema {
                 feature.key.to_string(),
                 schema_gen.subschema_for::<dex_features::FeatureToml<
                     dex_features::CurrentTimeReminderConfigToml,
+                >>(),
+            );
+            continue;
+        }
+        if feature.id == dex_features::Feature::SleepTool {
+            validation.properties.insert(
+                feature.key.to_string(),
+                schema_gen
+                    .subschema_for::<dex_features::FeatureToml<dex_features::SleepToolConfigToml>>(
+                    ),
+            );
+            continue;
+        }
+        if feature.id == dex_features::Feature::RuntimeAgentInstances {
+            validation.properties.insert(
+                feature.key.to_string(),
+                schema_gen.subschema_for::<dex_features::FeatureToml<
+                    dex_features::RuntimeAgentInstancesConfigToml,
                 >>(),
             );
             continue;

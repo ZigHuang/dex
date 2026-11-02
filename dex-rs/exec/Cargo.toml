@@ -30,6 +30,7 @@ dex-app-server-protocol = { workspace = true }
 dex-cloud-config = { workspace = true }
 dex-config = { workspace = true }
 dex-core = { workspace = true }
+dex-features = { workspace = true }
 dex-feedback = { workspace = true }
 dex-git-utils = { workspace = true }
 dex-history = { workspace = true }
@@ -37,10 +38,13 @@ dex-login = { workspace = true }
 dex-model-provider-info = { workspace = true }
 dex-otel = { workspace = true }
 dex-protocol = { workspace = true }
+dex-rollout = { workspace = true }
 dex-utils-absolute-path = { workspace = true }
 dex-utils-cli = { workspace = true }
 dex-utils-oss = { workspace = true }
+dex-utils-path-uri = { workspace = true }
 dex-utils-sandbox-summary = { workspace = true }
+dex-worktree = { workspace = true }
 owo-colors = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -67,6 +71,7 @@ assert_cmd = { workspace = true }
 dex-apply-patch = { workspace = true }
 dex-utils-cargo-bin = { workspace = true }
 core_test_support = { workspace = true }
+insta = { workspace = true }
 libc = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
@@ -77,3 +82,4 @@ tracing-opentelemetry = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
 wiremock = { workspace = true }
+zstd = { workspace = true }

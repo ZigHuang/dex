@@ -3,12 +3,13 @@ use crate::context::AppsInstructions;
 use crate::context::ContextualUserFragment;
 use dex_protocol::protocol::APPS_INSTRUCTIONS_CLOSE_TAG;
 use dex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
+use dex_protocol_test_support::ContentItemTestExt;
 
 pub(crate) fn render_apps_section(connectors: &[AppInfo]) -> Option<String> {
     connectors
         .iter()
         .any(|connector| connector.is_accessible && connector.is_enabled)
-        .then(|| AppsInstructions.render())
+        .then(|| AppsInstructions.render().expect_text())
 }
 
 #[cfg(test)]

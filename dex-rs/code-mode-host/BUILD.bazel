@@ -1,6 +1,13 @@
 load("//:defs.bzl", "dex_rust_crate")
+load("//bazel/rules:runtime_package.bzl", "release_binary")
 
 dex_rust_crate(
     name = "code-mode-host",
     crate_name = "dex_code_mode_host",
+)
+
+release_binary(
+    binary = ":dex-code-mode-host",
+    # V8 and its libc++ use aligned new and delete, available on macOS 10.13.
+    macos_x86_64_minimum_os = "10.13",
 )

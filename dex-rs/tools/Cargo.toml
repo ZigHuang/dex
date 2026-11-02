@@ -9,14 +9,15 @@ workspace = true
 
 [dependencies]
 bitflags = { workspace = true }
+dex-attachment-store = { workspace = true }
 dex-code-mode = { workspace = true }
 dex-connectors = { workspace = true }
 dex-features = { workspace = true }
 dex-file-system = { workspace = true }
 dex-extension-items = { workspace = true }
 dex-protocol = { workspace = true }
-dex-utils-absolute-path = { workspace = true }
 dex-utils-output-truncation = { workspace = true }
+dex-utils-path-uri = { workspace = true }
 dex-utils-string = { workspace = true }
 jsonptr = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [

@@ -18,6 +18,7 @@ fn turn_started_notification(thread_id: ThreadId, turn_id: &str) -> ServerNotifi
         thread_id: thread_id.to_string(),
         turn: Turn {
             id: turn_id.to_string(),
+            root_turn_id: None,
             items_view: TurnItemsView::Full,
             items: Vec::new(),
             status: TurnStatus::InProgress,
@@ -38,6 +39,7 @@ fn exec_approval_request(
     ServerRequest::CommandExecutionRequestApproval {
         request_id: AppServerRequestId::Integer(1),
         params: CommandExecutionRequestApprovalParams {
+            kind: Default::default(),
             thread_id: thread_id.to_string(),
             turn_id: turn_id.to_string(),
             item_id: item_id.to_string(),

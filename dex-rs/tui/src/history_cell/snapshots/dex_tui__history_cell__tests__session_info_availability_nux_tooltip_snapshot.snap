@@ -2,11 +2,8 @@
 source: tui/src/history_cell/tests.rs
 expression: rendered
 ---
-╭─────────────────────────────────────╮
-│ >_ Dex (v0.0.0)                     │
-│                                     │
-│ model:     gpt-5   /model to change │
-│ directory: /tmp/project             │
-╰─────────────────────────────────────╯
+
+  >_ Dex (v0.166.0)
+     /tmp/project
 
   Tip: Model just became available

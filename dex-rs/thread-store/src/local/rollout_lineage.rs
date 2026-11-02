@@ -1,10 +1,14 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
 use dex_protocol::ThreadId;
+use dex_protocol::protocol::EventMsg;
 use dex_protocol::protocol::HistoryPosition;
 use dex_protocol::protocol::ThreadHistoryMode;
+
+use dex_rollout::RolloutItem;
 
 use super::LocalThreadStore;
 use super::thread_rollout_resolver;
@@ -33,10 +37,24 @@ impl LocalThreadStore {
     pub(super) async fn resolve_rollout_lineage(
         &self,
         requested_thread_id: ThreadId,
+        initial_path: Option<PathBuf>,
     ) -> ThreadStoreResult<RolloutLineage> {
-        self.resolve_rollout_lineage_with_representation(
+        self.resolve_rollout_lineage_with_mode(
             requested_thread_id,
-            LineageRepresentation::Existing,
+            LineageResolutionMode::Existing,
+            initial_path,
+        )
+        .await
+    }
+
+    pub(super) async fn resolve_rollout_lineage_for_history_page(
+        &self,
+        requested_thread_id: ThreadId,
+    ) -> ThreadStoreResult<RolloutLineage> {
+        self.resolve_rollout_lineage_with_mode(
+            requested_thread_id,
+            LineageResolutionMode::HistoryPage,
+            /*initial_path*/ None,
         )
         .await
     }
@@ -45,39 +63,55 @@ impl LocalThreadStore {
         &self,
         requested_thread_id: ThreadId,
     ) -> ThreadStoreResult<RolloutLineage> {
-        self.resolve_rollout_lineage_with_representation(
+        self.resolve_rollout_lineage_with_mode(
             requested_thread_id,
-            LineageRepresentation::PlainForReference,
+            LineageResolutionMode::PlainForReference,
+            /*initial_path*/ None,
         )
         .await
     }
 
-    async fn resolve_rollout_lineage_with_representation(
+    async fn resolve_rollout_lineage_with_mode(
         &self,
         requested_thread_id: ThreadId,
-        representation: LineageRepresentation,
+        mode: LineageResolutionMode,
+        mut initial_path: Option<PathBuf>,
     ) -> ThreadStoreResult<RolloutLineage> {
         let mut segments = Vec::new();
         let mut seen = HashSet::new();
         let mut next_rollout_id = None;
         let mut end = None;
+        let mut prefetched_paths = HashMap::new();
 
         loop {
             let coordination_id = next_rollout_id.unwrap_or(requested_thread_id);
-            let _writer_guard = match representation {
-                LineageRepresentation::Existing => None,
-                LineageRepresentation::PlainForReference => {
+            let _writer_guard = match mode {
+                LineageResolutionMode::Existing | LineageResolutionMode::HistoryPage => None,
+                LineageResolutionMode::PlainForReference => {
                     Some(self.live_writer_locks.lock(coordination_id).await)
                 }
             };
-            let (rollout_id, rollout_path) = match next_rollout_id {
-                Some(rollout_id) => {
-                    let rollout_path = resolve_rollout_path_by_id(self, rollout_id)
-                        .await?
-                        .ok_or_else(|| malformed_lineage(rollout_id, "missing source rollout"))?;
+            let (rollout_id, rollout_path) = match (next_rollout_id, initial_path.take()) {
+                (Some(rollout_id), _) => {
+                    let rollout_path = resolve_rollout_path_by_id(
+                        self,
+                        rollout_id,
+                        prefetched_paths.remove(&rollout_id),
+                    )
+                    .await?
+                    .ok_or_else(|| malformed_lineage(rollout_id, "missing source rollout"))?;
                     (rollout_id, rollout_path)
                 }
-                None => {
+                (None, Some(path)) => {
+                    let rollout_id =
+                        thread_rollout_resolver::rollout_id_from_path_or_legacy_thread_id(
+                            &path,
+                            requested_thread_id,
+                            ThreadHistoryMode::Paginated,
+                        )?;
+                    (rollout_id, path)
+                }
+                (None, None) => {
                     let resolved = thread_rollout_resolver::resolve_current_including_archived(
                         self,
                         requested_thread_id,
@@ -92,22 +126,35 @@ impl LocalThreadStore {
             if !seen.insert(rollout_id) {
                 return Err(malformed_lineage(requested_thread_id, "cycle detected"));
             }
-            let rollout_path = match representation {
-                LineageRepresentation::Existing => rollout_path,
-                LineageRepresentation::PlainForReference => {
-                    let rollout_path = super::helpers::scoped_rollout_path(
-                        self.config.dex_home.clone(),
-                        rollout_path.as_path(),
-                        "Dex home",
-                    )?;
-                    dex_rollout::materialize_rollout_for_reference(rollout_path.as_path())
-                        .await
-                        .map_err(|err| ThreadStoreError::Internal {
-                            message: format!(
-                                "failed to materialize referenced rollout {}: {err}",
-                                rollout_path.display()
-                            ),
-                        })?
+            let rollout_path = match mode {
+                LineageResolutionMode::Existing | LineageResolutionMode::HistoryPage => {
+                    rollout_path
+                }
+                LineageResolutionMode::PlainForReference => {
+                    let outside_dex_home = || ThreadStoreError::InvalidRequest {
+                        message: format!(
+                            "rollout path `{}` must be in Dex home directory",
+                            rollout_path.display()
+                        ),
+                    };
+                    let canonical_rollout_path = std::fs::canonicalize(rollout_path.as_path())
+                        .map_err(|_| outside_dex_home())?;
+                    // Resume can retain either the logical Dex home path or its canonical
+                    // target. Keep references inside canonical managed roots so nested symlinks
+                    // cannot escape them.
+                    let is_managed_rollout = [
+                        self.config.dex_home.join(dex_rollout::SESSIONS_SUBDIR),
+                        self.config
+                            .dex_home
+                            .join(dex_rollout::ARCHIVED_SESSIONS_SUBDIR),
+                    ]
+                    .into_iter()
+                    .filter_map(|root| std::fs::canonicalize(root).ok())
+                    .any(|root| canonical_rollout_path.starts_with(root));
+                    if !is_managed_rollout {
+                        return Err(outside_dex_home());
+                    }
+                    canonical_rollout_path
                 }
             };
             let meta = dex_rollout::read_session_meta_line(rollout_path.as_path())
@@ -130,6 +177,28 @@ impl LocalThreadStore {
                     "source rollout is not paginated",
                 ));
             }
+            let rollout_path = match mode {
+                LineageResolutionMode::Existing | LineageResolutionMode::HistoryPage => {
+                    rollout_path
+                }
+                LineageResolutionMode::PlainForReference
+                    if next_rollout_id.is_none() && meta.meta.history_base.is_none() =>
+                {
+                    // A newly shared standalone source must remain readable by older binaries.
+                    dex_rollout::materialize_rollout_for_reference(rollout_path.as_path())
+                        .await
+                        .map_err(|err| ThreadStoreError::Internal {
+                            message: format!(
+                                "failed to materialize referenced rollout {}: {err}",
+                                rollout_path.display()
+                            ),
+                        })?
+                }
+                // Already-shared compressed history requires a compatible reader regardless of
+                // new forks. Read it without publishing decoded copies into ancestors' folders;
+                // their owners may concurrently archive or unarchive those immutable files.
+                LineageResolutionMode::PlainForReference => rollout_path,
+            };
             if let Some(end) = end {
                 validate_cutoff_bounds(requested_thread_id, rollout_path.as_path(), &end).await?;
             }
@@ -139,6 +208,20 @@ impl LocalThreadStore {
                 })?,
                 None => 1,
             };
+            // Reverts can point to earlier records of the same child. Stop at the original parent bookmark.
+            let at_parent = matches!(mode, LineageResolutionMode::HistoryPage)
+                && meta.meta.attached_thread
+                && meta.meta.history_base.is_some_and(|base| {
+                    dex_rollout::forked_from_ordinal_exclusive(&meta.meta, Some(&rollout_path))
+                        .is_some_and(|end| base.end_ordinal_exclusive <= end)
+                });
+            let start_ordinal = if at_parent {
+                attached_history_start(&rollout_path, start_ordinal)
+                    .await
+                    .map_err(|e| malformed_lineage(requested_thread_id, &e.to_string()))?
+            } else {
+                start_ordinal
+            };
             segments.push(RolloutLineageSegment {
                 rollout_id,
                 rollout_path,
@@ -146,9 +229,20 @@ impl LocalThreadStore {
                 end,
             });
 
-            let Some(base) = meta.meta.history_base else {
+            let Some(base) = meta.meta.history_base.filter(|_| !at_parent) else {
                 break;
             };
+            if matches!(mode, LineageResolutionMode::HistoryPage)
+                && let [child] = segments.as_slice()
+            {
+                prefetched_paths = dex_rollout::prefetch_sibling_rollout_paths(
+                    &self.config.dex_home,
+                    &child.rollout_path,
+                    base.thread_id,
+                )
+                .await
+                .unwrap_or_default();
+            }
             next_rollout_id = Some(base.thread_id);
             end = Some(base);
         }
@@ -158,10 +252,43 @@ impl LocalThreadStore {
     }
 }
 
+/// A mid-turn fork starts with its header, settings, optional model guidance, and parent abort.
+/// Stop before the first child event; a real child interruption follows its own turn start.
+async fn attached_history_start(path: &Path, start: u64) -> std::io::Result<u64> {
+    let mut reader = dex_rollout::open_rollout_line_reader(path).await?;
+    for _ in 0..4 {
+        let Some(line) = reader.next_line().await? else {
+            break;
+        };
+        let Ok(line) = dex_rollout::parse_rollout_line(&line) else {
+            break;
+        };
+        match line.item {
+            RolloutItem::SessionMeta(_)
+            | RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+            | RolloutItem::ResponseItem(_) => {}
+            RolloutItem::EventMsg(EventMsg::TurnAborted(_)) => {
+                return Ok(line.ordinal.map_or(start, |n| n.saturating_add(1)));
+            }
+            _ => break,
+        }
+    }
+    Ok(start)
+}
+
 async fn resolve_rollout_path_by_id(
     store: &LocalThreadStore,
     rollout_id: ThreadId,
+    prefetched_path: Option<PathBuf>,
 ) -> ThreadStoreResult<Option<PathBuf>> {
+    if let Some(path) = prefetched_path
+        && let Some(path) = dex_rollout::existing_rollout_path(&path).await
+        && tokio::fs::symlink_metadata(&path)
+            .await
+            .is_ok_and(|metadata| metadata.is_file())
+    {
+        return Ok(Some(path));
+    }
     dex_rollout::find_rollout_path_by_rollout_id(store.config.dex_home.as_path(), rollout_id)
         .await
         .map_err(|err| ThreadStoreError::Internal {
@@ -170,8 +297,9 @@ async fn resolve_rollout_path_by_id(
 }
 
 #[derive(Clone, Copy)]
-enum LineageRepresentation {
+enum LineageResolutionMode {
     Existing,
+    HistoryPage,
     PlainForReference,
 }
 
@@ -238,16 +366,24 @@ async fn validate_cutoff_bounds(
             "cutoff cannot include source session metadata",
         ));
     }
-    let file_len = tokio::fs::metadata(rollout_path)
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!(
-                "failed to read lineage metadata {}: {err}",
-                rollout_path.display()
-            ),
-        })?
-        .len();
-    if end.end_byte_offset > file_len {
+    let path = rollout_path.to_path_buf();
+    let end_byte_offset = end.end_byte_offset;
+    let (stop, keep_running) = tokio::sync::oneshot::channel::<()>();
+    let contains_prefix = tokio::task::spawn_blocking(move || {
+        dex_rollout::rollout_contains_prefix(&path, end_byte_offset, || stop.is_closed())
+    })
+    .await
+    .map_err(|err| ThreadStoreError::Internal {
+        message: format!("failed to join rollout prefix validation: {err}"),
+    })?
+    .map_err(|err| ThreadStoreError::Internal {
+        message: format!(
+            "failed to read lineage metadata {}: {err}",
+            rollout_path.display()
+        ),
+    })?;
+    drop(keep_running);
+    if !contains_prefix {
         return Err(malformed_lineage(
             requested_thread_id,
             "cutoff byte offset is past the source rollout",

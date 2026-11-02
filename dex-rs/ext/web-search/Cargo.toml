@@ -17,6 +17,7 @@ dex-api = { workspace = true }
 dex-core = { workspace = true }
 dex-extension-api = { workspace = true }
 dex-extension-items = { workspace = true }
+dex-http-client = { workspace = true }
 dex-login = { workspace = true }
 dex-model-provider = { workspace = true }
 dex-model-provider-info = { workspace = true }
@@ -30,3 +31,5 @@ url = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }

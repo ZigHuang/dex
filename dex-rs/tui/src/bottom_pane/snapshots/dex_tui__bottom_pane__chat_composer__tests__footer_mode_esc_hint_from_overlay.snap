@@ -3,11 +3,11 @@ source: tui/src/bottom_pane/chat_composer.rs
 expression: terminal.backend()
 ---
 "                                                                                                    "
-"› Ask Dex to do anything                                                                          "
+"› Ask Dex to do anything                                                                            "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
-"  esc esc to edit previous message                                                                  "
+"  ? for shortcuts                                                                100% context left  "

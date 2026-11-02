@@ -14,13 +14,12 @@ workspace = true
 
 [dependencies]
 chrono = { workspace = true, features = ["serde"] }
-dex-collaboration-mode-templates = { workspace = true }
 dex-http-client = { workspace = true }
 dex-login = { workspace = true }
 dex-otel = { workspace = true }
 dex-protocol = { workspace = true }
+dex-prompts = { workspace = true }
 dex-utils-output-truncation = { workspace = true }
-dex-utils-template = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["fs", "sync", "time"] }

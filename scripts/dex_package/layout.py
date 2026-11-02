@@ -8,7 +8,6 @@ from pathlib import Path
 from .targets import PackageInputs
 from .targets import PackageVariant
 from .targets import TargetSpec
-from .zsh import ZSH_RESOURCE_PATH
 
 
 LAYOUT_VERSION = 1
@@ -56,14 +55,12 @@ def build_package_dir(
         bin_dir / f"dex-code-mode-host{spec.exe_suffix}",
         is_windows=spec.is_windows,
     )
+    copy_executable(
+        inputs.exec_server_bin,
+        bin_dir / f"dex-exec-server{spec.exe_suffix}",
+        is_windows=spec.is_windows,
+    )
     copy_executable(inputs.rg_bin, path_dir / spec.rg_name, is_windows=spec.is_windows)
-
-    if inputs.zsh_bin is not None:
-        copy_executable(
-            inputs.zsh_bin,
-            resources_dir / ZSH_RESOURCE_PATH,
-            is_windows=False,
-        )
 
     if inputs.bwrap_bin is not None:
         copy_executable(inputs.bwrap_bin, resources_dir / "bwrap", is_windows=False)
@@ -88,6 +85,7 @@ def build_package_dir(
         "target": spec.target,
         "variant": variant.name,
         "entrypoint": f"bin/{entrypoint_name}",
+        "execServer": f"bin/dex-exec-server{spec.exe_suffix}",
         "resourcesDir": "dex-resources",
         "pathDir": "dex-path",
     }
@@ -98,8 +96,6 @@ def validate_package_dir(
     package_dir: Path,
     variant: PackageVariant,
     spec: TargetSpec,
-    *,
-    include_zsh: bool,
 ) -> None:
     required_dirs = [
         Path("bin"),
@@ -123,6 +119,7 @@ def validate_package_dir(
         "target": spec.target,
         "variant": variant.name,
         "entrypoint": f"bin/{variant.entrypoint_name(spec)}",
+        "execServer": f"bin/dex-exec-server{spec.exe_suffix}",
         "resourcesDir": "dex-resources",
         "pathDir": "dex-path",
     }
@@ -136,14 +133,10 @@ def validate_package_dir(
     required_files = [
         Path("bin") / variant.entrypoint_name(spec),
         Path("bin") / f"dex-code-mode-host{spec.exe_suffix}",
+        Path("bin") / f"dex-exec-server{spec.exe_suffix}",
         Path("dex-path") / spec.rg_name,
     ]
     executable_files = list(required_files)
-
-    if include_zsh:
-        zsh_path = Path("dex-resources") / ZSH_RESOURCE_PATH
-        required_files.append(zsh_path)
-        executable_files.append(zsh_path)
 
     if spec.is_linux:
         required_files.append(Path("dex-resources") / "bwrap")

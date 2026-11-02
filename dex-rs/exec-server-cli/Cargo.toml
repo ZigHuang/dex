@@ -1,0 +1,60 @@
+[package]
+name = "dex-exec-server-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dex-exec-server"
+path = "src/main.rs"
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+dex-api = { workspace = true }
+dex-app-server = { workspace = true }
+dex-arg0 = { workspace = true }
+dex-aws-auth = { workspace = true }
+dex-build-info = { workspace = true }
+dex-cloud-config = { workspace = true }
+dex-config = { workspace = true }
+dex-core = { workspace = true }
+dex-exec-server = { workspace = true }
+dex-http-client = { workspace = true }
+dex-login = { workspace = true }
+dex-model-provider = { workspace = true }
+dex-protocol = { workspace = true }
+dex-sandboxing = { workspace = true }
+dex-utils-absolute-path = { workspace = true }
+dex-utils-cli = { workspace = true }
+dex-websocket-auth = { workspace = true }
+http = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+url = { workspace = true }
+
+[target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
+[dev-dependencies]
+assert_matches = { workspace = true }
+chrono = { workspace = true }
+dex-utils-cargo-bin = { workspace = true }
+dex-utils-process = { workspace = true }
+futures = { workspace = true }
+insta = { workspace = true }
+jsonwebtoken = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "process"] }
+wiremock = { workspace = true }

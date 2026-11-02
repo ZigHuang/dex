@@ -10,15 +10,18 @@ use dex_config::types::KeybindingsSpec;
 use dex_config::types::TuiKeymap;
 use std::sync::Arc;
 
-/// Config context in which a keymap action is active.
+/// Runtime context in which a keymap action is active.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum KeymapContext {
     Global,
     Chat,
+    /// Voice-only chat action, inactive in pagers and other overlays.
+    Voice,
     Composer,
     Editor,
     VimNormal,
     VimOperator,
+    VimSearch,
     VimTextObject,
     Pager,
     List,
@@ -30,11 +33,12 @@ impl KeymapContext {
     pub(crate) const fn config_name(self) -> &'static str {
         match self {
             Self::Global => "global",
-            Self::Chat => "chat",
+            Self::Chat | Self::Voice => "chat",
             Self::Composer => "composer",
             Self::Editor => "editor",
             Self::VimNormal => "vim_normal",
             Self::VimOperator => "vim_operator",
+            Self::VimSearch => "vim_search",
             Self::VimTextObject => "vim_text_object",
             Self::Pager => "pager",
             Self::List => "list",
@@ -46,7 +50,7 @@ impl KeymapContext {
     pub(crate) const fn allows_plain_chord_prefix(self) -> bool {
         matches!(
             self,
-            Self::VimNormal | Self::VimOperator | Self::VimTextObject
+            Self::VimNormal | Self::VimOperator | Self::VimSearch | Self::VimTextObject
         )
     }
 
@@ -57,7 +61,11 @@ impl KeymapContext {
 
         matches!(
             (self, other),
-            (Self::List, Self::Approval)
+            (Self::VimSearch, Self::VimNormal | Self::VimOperator)
+                | (Self::VimNormal | Self::VimOperator, Self::VimSearch)
+                | (Self::Voice, Self::Pager)
+                | (Self::Pager, Self::Voice)
+                | (Self::List, Self::Approval)
                 | (Self::Approval, Self::List)
                 | (Self::List, Self::Agents)
                 | (Self::Agents, Self::List)
@@ -69,13 +77,20 @@ impl KeymapContext {
     }
 
     const fn is_shared_main(self) -> bool {
-        matches!(self, Self::Global | Self::Chat | Self::Composer)
+        matches!(
+            self,
+            Self::Global | Self::Chat | Self::Voice | Self::Composer
+        )
     }
 
     const fn is_main_editor(self) -> bool {
         matches!(
             self,
-            Self::Editor | Self::VimNormal | Self::VimOperator | Self::VimTextObject
+            Self::Editor
+                | Self::VimNormal
+                | Self::VimOperator
+                | Self::VimSearch
+                | Self::VimTextObject
         )
     }
 }
@@ -88,6 +103,31 @@ pub(crate) struct KeymapActionId {
 }
 
 impl KeymapActionId {
+    /// Whether two actions can be active together, including list-specific exceptions.
+    pub(super) fn overlaps(self, other: Self) -> bool {
+        use KeymapContext::Chat;
+        use KeymapContext::Global;
+        use KeymapContext::List;
+
+        match (self.context, other.context) {
+            // Presets cannot open while a list owns input.
+            (Chat, List) => self.action != "open_presets",
+            (List, Chat) => other.action != "open_presets",
+
+            // Activity focus, Find, and selection remain available during list navigation.
+            (Global, List) => matches!(
+                self.action,
+                "focus_activity" | "find_transcript" | "select_transcript"
+            ),
+            (List, Global) => matches!(
+                other.action,
+                "focus_activity" | "find_transcript" | "select_transcript"
+            ),
+
+            _ => self.context.overlaps(other.context),
+        }
+    }
+
     pub(crate) fn config_path(self) -> String {
         format!("tui.keymap.{}.{}", self.context.config_name(), self.action)
     }
@@ -108,8 +148,17 @@ macro_rules! runtime_group_mut {
     };
 }
 
+macro_rules! configured_binding_slot {
+    ($keymap:ident, $group:ident, $action:ident, runtime_only) => {
+        None
+    };
+    ($keymap:ident, $group:ident, $action:ident) => {
+        Some(&$keymap.$group.$action)
+    };
+}
+
 macro_rules! define_runtime_action_bindings {
-    ($($context:literal => $context_id:ident, $group:ident, $config_group:ident [$($action:ident),+ $(,)?]),+ $(,)?) => {
+    ($($context:literal => $context_id:ident, $group:ident, $config_group:ident [$($action:ident $(=> $runtime_only:ident)?),+ $(,)?]),+ $(,)?) => {
         /// Resolve a config context/action pair to its runtime identity.
         pub(crate) fn keymap_action_id(
             context: &str,
@@ -128,16 +177,25 @@ macro_rules! define_runtime_action_bindings {
             }
         }
 
-        /// Return the root-config slot for one runtime action.
-        pub(super) fn configured_binding_for_action(
+        /// Return the configured slot for one runtime action, including global fallbacks.
+        pub(crate) fn configured_binding_for_action(
             keymap: &TuiKeymap,
             action: KeymapActionId,
         ) -> Option<&Option<KeybindingsSpec>> {
             match (action.context.config_name(), action.action) {
+                ("composer", "submit") if keymap.composer.submit.is_none() => {
+                    Some(&keymap.global.submit)
+                }
+                ("composer", "queue") if keymap.composer.queue.is_none() => {
+                    Some(&keymap.global.queue)
+                }
+                ("composer", "toggle_shortcuts") if keymap.composer.toggle_shortcuts.is_none() => {
+                    Some(&keymap.global.toggle_shortcuts)
+                }
                 $(
                     $(
                         ($context, stringify!($action)) => {
-                            Some(&keymap.$config_group.$action)
+                            configured_binding_slot!(keymap, $config_group, $action $(, $runtime_only)?)
                         }
                     )+
                 )+
@@ -167,6 +225,7 @@ macro_rules! define_runtime_action_bindings {
             action: &str,
         ) -> Option<&'a [KeyBinding]> {
             match (context, action) {
+                ("global", "leader") => Some(runtime_keymap.chords.leader.as_slice()),
                 $(
                     $(
                         ($context, stringify!($action)) => {
@@ -227,6 +286,10 @@ define_runtime_action_bindings! {
     "global" => Global, app, global [
         open_agents,
         open_transcript,
+        find_transcript,
+        select_transcript,
+        focus_activity,
+        open_warnings => runtime_only,
         open_external_editor,
         copy,
         clear_terminal,
@@ -236,13 +299,18 @@ define_runtime_action_bindings! {
         toggle_side_conversation,
     ],
     "chat" => Chat, chat, chat [
+        open_presets,
+        toggle_voice,
         interrupt_turn,
         decrease_reasoning_effort,
         increase_reasoning_effort,
         previous_permission_mode,
         next_permission_mode,
         edit_queued_message,
+        prompt_stack_back,
+        skip_question,
     ],
+    "chat" => Voice, chat, chat [toggle_voice_mute],
     "composer" => Composer, composer, composer [
         submit,
         queue,
@@ -276,6 +344,7 @@ define_runtime_action_bindings! {
         insert_line_start,
         open_line_below,
         open_line_above,
+        enter_replace_mode,
         move_left,
         move_right,
         move_up,
@@ -285,8 +354,15 @@ define_runtime_action_bindings! {
         move_word_end,
         move_line_start,
         move_line_end,
+        find_forward,
+        find_backward,
+        till_forward,
+        till_backward,
+        jump_top,
+        jump_bottom,
         delete_char,
         replace_char,
+        repeat_last_change,
         substitute_char,
         delete_to_line_end,
         change_to_line_end,
@@ -295,8 +371,11 @@ define_runtime_action_bindings! {
         start_delete_operator,
         start_yank_operator,
         start_change_operator,
+        undo,
+        redo,
         cancel_operator,
     ],
+    "vim_search" => VimSearch, vim_search, vim_search [forward, backward, next, previous],
     "vim_operator" => VimOperator, vim_operator, vim_operator [
         delete_line,
         yank_line,
@@ -309,6 +388,12 @@ define_runtime_action_bindings! {
         motion_word_end,
         motion_line_start,
         motion_line_end,
+        motion_find_forward,
+        motion_find_backward,
+        motion_till_forward,
+        motion_till_backward,
+        motion_jump_top,
+        motion_jump_bottom,
         select_inner_text_object,
         select_around_text_object,
         cancel,
@@ -335,6 +420,7 @@ define_runtime_action_bindings! {
         jump_bottom,
         close,
         close_transcript,
+        find,
     ],
     "list" => List, list, list [
         move_up,
@@ -349,10 +435,17 @@ define_runtime_action_bindings! {
         cancel,
     ],
     "agents" => Agents, agents, agents [
+        resume,
         search,
         new_task,
+        new_worktree,
+        fork,
         rename,
         stop,
+        archive,
+        delete,
+        hide,
+        toggle_pin,
         toggle_grouping,
     ],
     "approval" => Approval, approval, approval [

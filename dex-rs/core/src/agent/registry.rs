@@ -1,5 +1,8 @@
+use crate::agent::types::AgentMetadata;
+use crate::environment_selection::TurnEnvironmentSnapshot;
 use dex_protocol::AgentPath;
 use dex_protocol::ThreadId;
+use dex_protocol::error::AgentErrorContext;
 use dex_protocol::error::DexErr;
 use dex_protocol::error::DexErrorDetails;
 use dex_protocol::error::Result;
@@ -19,7 +22,7 @@ use std::sync::atomic::Ordering;
 /// the current implementation, it limits:
 /// * Total number of sub-agents (i.e. threads) per user session
 ///
-/// This structure is shared by all agents in the same user session (because the `AgentControl`
+/// This structure is shared by all agents in the same user session (because the `LocalAgentControl`
 /// is).
 #[derive(Default)]
 pub(crate) struct AgentRegistry {
@@ -35,9 +38,16 @@ struct ActiveAgents {
     nickname_reset_count: usize,
 }
 
+/// Thread defaults and executor bindings retained while a child's runtime is unloaded.
+#[derive(Clone)]
+pub(crate) struct EvictedEnvironments {
+    pub(crate) selections: Vec<TurnEnvironmentSelection>,
+    pub(crate) bindings: TurnEnvironmentSnapshot,
+}
+
 struct RegisteredAgent {
     path: String,
-    evicted_environments: Option<Vec<TurnEnvironmentSelection>>,
+    evicted_environments: Option<EvictedEnvironments>,
 }
 
 impl RegisteredAgent {
@@ -47,14 +57,6 @@ impl RegisteredAgent {
             evicted_environments: None,
         }
     }
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct AgentMetadata {
-    pub(crate) agent_id: Option<ThreadId>,
-    pub(crate) agent_path: Option<AgentPath>,
-    pub(crate) agent_nickname: Option<String>,
-    pub(crate) agent_role: Option<String>,
 }
 
 fn format_agent_nickname(name: &str, nickname_reset_count: usize) -> String {
@@ -99,9 +101,10 @@ impl AgentRegistry {
     ) -> Result<SpawnReservation> {
         if let Some(max_threads) = max_threads {
             if !self.try_increment_spawned(max_threads) {
-                return Err(DexErr::new(DexErrorDetails::AgentLimitReached {
-                    max_threads,
-                }));
+                return Err(
+                    DexErr::new(DexErrorDetails::AgentLimitReached { max_threads })
+                        .with_agent_context(AgentErrorContext::RegistryCapacity),
+                );
             }
         } else {
             self.total_count.fetch_add(1, Ordering::AcqRel);
@@ -179,7 +182,7 @@ impl AgentRegistry {
     pub(crate) fn save_evicted_environments(
         &self,
         thread_id: ThreadId,
-        environments: Vec<TurnEnvironmentSelection>,
+        environments: EvictedEnvironments,
     ) {
         let mut active_agents = self
             .active_agents
@@ -190,10 +193,7 @@ impl AgentRegistry {
         }
     }
 
-    pub(crate) fn evicted_environments(
-        &self,
-        thread_id: ThreadId,
-    ) -> Option<Vec<TurnEnvironmentSelection>> {
+    pub(crate) fn evicted_environments(&self, thread_id: ThreadId) -> Option<EvictedEnvironments> {
         let active_agents = self
             .active_agents
             .lock()
@@ -306,7 +306,8 @@ impl AgentRegistry {
         match active_agents.agent_tree.entry(agent_path.to_string()) {
             Entry::Occupied(_) => Err(DexErr::UnsupportedOperation(format!(
                 "agent path `{agent_path}` already exists"
-            ))),
+            ))
+            .with_agent_context(AgentErrorContext::DuplicatePath)),
             Entry::Vacant(entry) => {
                 entry.insert(AgentMetadata {
                     agent_path: Some(agent_path.clone()),
@@ -368,6 +369,7 @@ impl SpawnReservation {
             .reserve_agent_nickname(names, preferred)
             .ok_or_else(|| {
                 DexErr::UnsupportedOperation("no available agent nicknames".to_string())
+                    .with_agent_context(AgentErrorContext::NicknameUnavailable)
             })?;
         self.reserved_agent_nickname = Some(agent_nickname.clone());
         Ok(agent_nickname)

@@ -21,7 +21,7 @@ dex-core = { workspace = true }
 dex-exec-server = { workspace = true }
 dex-features = { workspace = true }
 dex-login = { workspace = true }
-dex-models-manager = { workspace = true }
+dex-model-provider = { workspace = true }
 dex-protocol = { workspace = true }
 dex-utils-cargo-bin = { workspace = true }
 serde = { workspace = true }

@@ -1,7 +1,15 @@
 use super::ContextualUserFragment;
 use super::world_state::PreviousSectionState;
 use super::world_state::WorldStateSection;
+use crate::context::world_state::SectionTransition;
+use crate::context::world_state::WorldStateUpdate;
+use dex_context_fragments::AnnotatedContent;
+use dex_context_fragments::message_from_parts;
 use dex_protocol::AgentPath;
+use dex_protocol::models::ContentItem;
+use dex_protocol::models::ContentItemKind;
+use dex_protocol::models::ResponseItem;
+use dex_protocol::models::input_text;
 use dex_protocol::protocol::CONTEXT_WINDOW_CLOSE_TAG;
 use dex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG;
 use dex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
@@ -14,7 +22,6 @@ pub(crate) struct TokenBudgetContext {
     first_window_id: Uuid,
     previous_window_id: Option<Uuid>,
     window_id: Uuid,
-    mcp_result: Option<String>,
 }
 
 impl TokenBudgetContext {
@@ -23,25 +30,38 @@ impl TokenBudgetContext {
         first_window_id: Uuid,
         previous_window_id: Option<Uuid>,
         window_id: Uuid,
-        mcp_result: Option<String>,
     ) -> Self {
         Self {
             agent_path,
             first_window_id,
             previous_window_id,
             window_id,
-            mcp_result,
         }
+    }
+
+    /// Wraps tool hints without losing their source or changing the concatenated prompt text.
+    pub(crate) fn render_with_hints(&self, hints: Vec<AnnotatedContent>) -> ResponseItem {
+        let (open, close) = self.markers();
+        let annotate = |content| {
+            AnnotatedContent::from_parts(content, self.content_kind(), self.content_metadata())
+        };
+        let mut content = vec![annotate(input_text(open)), annotate(self.body())];
+        for hint in hints {
+            content.push(hint);
+            content.push(annotate(input_text("\n")));
+        }
+        content.push(annotate(input_text(close)));
+        message_from_parts(self.role(), content)
     }
 }
 
 impl ContextualUserFragment for TokenBudgetContext {
-    fn role(&self) -> &'static str {
-        "developer"
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("token_budget.context_window".to_string())
     }
 
-    fn requires_separate_message(&self) -> bool {
-        true
+    fn role(&self) -> &'static str {
+        "developer"
     }
 
     fn markers(&self) -> (&'static str, &'static str) {
@@ -52,7 +72,7 @@ impl ContextualUserFragment for TokenBudgetContext {
         (CONTEXT_WINDOW_OPEN_TAG, CONTEXT_WINDOW_CLOSE_TAG)
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let first_window_id = self.first_window_id;
         let window_id = self.window_id;
         let mut lines = vec![
@@ -63,10 +83,7 @@ impl ContextualUserFragment for TokenBudgetContext {
         if let Some(previous_window_id) = self.previous_window_id {
             lines.push(format!("Previous context window id: {previous_window_id}"));
         }
-        if let Some(mcp_result) = &self.mcp_result {
-            lines.push(mcp_result.clone());
-        }
-        format!("\n{}\n", lines.join("\n"))
+        input_text(format!("\n{}\n", lines.join("\n")))
     }
 }
 
@@ -74,16 +91,21 @@ impl WorldStateSection for TokenBudgetContext {
     const ID: &'static str = "context_window";
     type Snapshot = AgentPath;
 
-    fn snapshot(&self) -> Self::Snapshot {
-        self.agent_path.clone()
-    }
-
     fn render_diff(
         &self,
         previous: PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn ContextualUserFragment>> {
-        matches!(previous, PreviousSectionState::Known(agent_path) if agent_path != &self.agent_path)
-            .then(|| Box::new(self.clone()) as Box<dyn ContextualUserFragment>)
+    ) -> SectionTransition<Self::Snapshot> {
+        let current = self.agent_path.clone();
+        let fragment = matches!(previous, PreviousSectionState::Known(agent_path) if agent_path != &self.agent_path)
+            .then(|| Box::new(self.clone()) as Box<dyn ContextualUserFragment>);
+        (
+            Some(current),
+            fragment
+                .into_iter()
+                .map(WorldStateUpdate::boxed_fragment)
+                .map(WorldStateUpdate::standalone)
+                .collect(),
+        )
     }
 }
 
@@ -101,6 +123,10 @@ impl ContextWindowGuidance {
 }
 
 impl ContextualUserFragment for ContextWindowGuidance {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("token_budget.context_window_guidance".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }
@@ -116,8 +142,8 @@ impl ContextualUserFragment for ContextWindowGuidance {
         )
     }
 
-    fn body(&self) -> String {
-        format!("\n{}\n", self.message)
+    fn body(&self) -> ContentItem {
+        input_text(format!("\n{}\n", self.message))
     }
 }
 
@@ -139,6 +165,10 @@ impl TokenBudgetRemainingContext {
 }
 
 impl ContextualUserFragment for TokenBudgetRemainingContext {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("token_budget.remaining_tokens".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }
@@ -151,13 +181,13 @@ impl ContextualUserFragment for TokenBudgetRemainingContext {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        match self.tokens_left {
+    fn body(&self) -> ContentItem {
+        input_text(match self.tokens_left {
             Some(tokens_left) => {
                 format!("You have {tokens_left} tokens left in this context window.")
             }
             None => "You have unknown tokens left in this context window.".to_string(),
-        }
+        })
     }
 }
 
@@ -175,6 +205,10 @@ impl TokenBudgetReminder {
 }
 
 impl ContextualUserFragment for TokenBudgetReminder {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("token_budget.reminder".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }
@@ -187,8 +221,8 @@ impl ContextualUserFragment for TokenBudgetReminder {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        self.message.clone()
+    fn body(&self) -> ContentItem {
+        input_text(self.message.clone())
     }
 }
 
@@ -206,6 +240,10 @@ impl AutoCompactFallbackPrompt {
 }
 
 impl ContextualUserFragment for AutoCompactFallbackPrompt {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("compaction.auto_fallback_prompt".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }
@@ -218,7 +256,7 @@ impl ContextualUserFragment for AutoCompactFallbackPrompt {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        self.message.clone()
+    fn body(&self) -> ContentItem {
+        input_text(self.message.clone())
     }
 }

@@ -3,7 +3,7 @@ source: tui/src/bottom_pane/chat_composer.rs
 expression: terminal.backend()
 ---
 "                          "
-"› Ask Dex to do anythin "
+"› Ask Dex to do anything  "
 "                          "
 "                          "
 "                          "

@@ -11,9 +11,9 @@ use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_exec_command_call;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::mount_compact_json_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
+use core_test_support::responses::namespace_child_tool;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_completed;
 use core_test_support::responses::start_mock_server;
@@ -26,14 +26,18 @@ use core_test_support::wait_for_event_match;
 use core_test_support::wait_for_mcp_server;
 use dex_config::types::McpServerConfig;
 use dex_config::types::McpServerTransportConfig;
+use dex_core::StartThreadOptions;
 use dex_core::TurnInputRequest;
 use dex_core::config::Config;
 use dex_core::config::TokenBudgetConfig;
 use dex_extension_api::ExtensionRegistryBuilder;
 use dex_features::Feature;
+use dex_login::DexAuth;
 use dex_model_provider_info::built_in_model_providers;
 use dex_protocol::config_types::AutoCompactTokenLimitScope;
 use dex_protocol::items::TurnItem;
+use dex_protocol::mcp::McpServerConnectionStatus;
+use dex_protocol::models::ContentItemMetadata;
 use dex_protocol::openai_models::ModelTokenBudgetConfig;
 use dex_protocol::protocol::CONTEXT_WINDOW_CLOSE_TAG;
 use dex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG;
@@ -45,6 +49,8 @@ use dex_protocol::protocol::HookRunStatus;
 use dex_protocol::protocol::ItemCompletedEvent;
 use dex_protocol::protocol::ItemStartedEvent;
 use dex_protocol::protocol::Op;
+use dex_protocol::protocol::SessionSource;
+use dex_protocol::protocol::SubAgentSource;
 use dex_protocol::protocol::ThreadSettingsOverrides;
 use dex_protocol::user_input::UserInput;
 use dex_skills_extension::SkillsExtensionConfig;
@@ -63,6 +69,8 @@ const AUTO_COMPACT_FALLBACK_PROMPT: &str = "Save the important state before roll
 
 fn model_token_budget_config() -> ModelTokenBudgetConfig {
     ModelTokenBudgetConfig {
+        enabled: false,
+        use_history_notes_extension: false,
         reminder_threshold_tokens: 6_144,
         reminder_message_template: "Model reminder: {n_remaining} tokens remain.".to_string(),
         guidance_message: "Use the model-owned context-window guidance.".to_string(),
@@ -74,8 +82,9 @@ fn model_token_budget_config() -> ModelTokenBudgetConfig {
 fn token_budget_contexts(request: &ResponsesRequest) -> Vec<String> {
     let context_window_prefix = format!("{CONTEXT_WINDOW_OPEN_TAG}\n");
     request
-        .message_input_texts("developer")
+        .message_input_text_groups("developer")
         .into_iter()
+        .map(|parts| parts.concat())
         .filter(|text| text.starts_with(&context_window_prefix))
         .collect()
 }
@@ -233,8 +242,12 @@ async fn token_budget_context_is_only_emitted_with_full_context() -> Result<()> 
     Ok(())
 }
 
+#[test_case("features.token_budget.enabled = true"; "token_budget")]
+#[test_case("features.context_management.experimental_mode = true"; "experimental_mode")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn token_budget_guidance_precedes_standalone_context_window() -> Result<()> {
+async fn token_budget_guidance_precedes_standalone_context_window(
+    activation: &'static str,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -247,24 +260,43 @@ async fn token_budget_guidance_precedes_standalone_context_window() -> Result<()
     )
     .await;
     let guidance_message = "Preserve important state before compaction.";
+    let backend_url = format!("{}/backend-api/dex", server.uri());
     let test = test_dex()
+        .with_model_info_override("gpt-5.2", |model| {
+            model.supports_experimental_context = true;
+        })
+        .with_auth(DexAuth::from_external_chatgpt_tokens(
+            "header.e30.signature",
+            "account-123",
+            Some("plus"),
+        )?)
+        .with_pre_build_hook(move |home| {
+            std::fs::write(
+                home.join("config.toml"),
+                format!(
+                    "{activation}\nfeatures.token_budget.guidance_message = {guidance_message:?}\n"
+                ),
+            )
+            .expect("write token-budget guidance configuration");
+        })
         .with_config(move |config| {
+            config.model_provider.base_url = Some(backend_url);
+            config.update_plan_enabled = true;
             config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
-            config.token_budget = Some(TokenBudgetConfig {
-                guidance_message: Some(guidance_message.to_string()),
-                ..TokenBudgetConfig::default()
-            });
-            config
-                .features
-                .enable(Feature::TokenBudget)
-                .expect("test config should allow token budget");
         })
         .build_with_auto_env(&server)
         .await?;
 
     test.submit_turn("inspect context guidance").await?;
 
-    let developer_texts = response.single_request().message_input_texts("developer");
+    let request = response.single_request();
+    assert!(request.has_content_kinds(&[
+        "token_budget.context_window_guidance",
+        "permissions.instructions",
+        "tools.deferred_namespaces",
+    ]));
+    assert!(request.has_content_kinds(&["token_budget.context_window"; 3]));
+    let developer_texts = request.message_input_texts("developer");
     let context_window_index = developer_texts
         .iter()
         .position(|text| text.starts_with(CONTEXT_WINDOW_OPEN_TAG))
@@ -282,23 +314,171 @@ async fn token_budget_guidance_precedes_standalone_context_window() -> Result<()
     Ok(())
 }
 
+#[test_case("OpenAI", "/backend-api/dex", None, true, true; "dex_backend")]
+#[test_case("OpenAI", "/backend-api/dex", None, false, false; "unsupported_model")]
+#[test_case("Custom", "/backend-api/dex", None, true, false; "custom_provider")]
+#[test_case("OpenAI", "/v1", None, true, false; "non_dex_endpoint")]
+#[test_case("OpenAI", "/backend-api/dex", Some("test-provider-token"), true, false; "provider_credentials")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn experimental_context_requires_capable_model_and_dex_backend(
+    provider_name: &'static str,
+    base_path: &'static str,
+    bearer_token: Option<&'static str>,
+    supports_context: bool,
+    expected_enabled: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response = mount_sse_once(&server, sse_completed("resp-1")).await;
+    let base_url = format!("{}{base_path}", server.uri());
+    let test = test_dex()
+        .with_model_info_override("gpt-5.2", move |model| {
+            model.supports_experimental_context = supports_context;
+        })
+        .with_auth(DexAuth::from_external_chatgpt_tokens(
+            "header.e30.signature",
+            "account-123",
+            Some("plus"),
+        )?)
+        .with_config(move |config| {
+            config.model_provider.name = provider_name.to_string();
+            config.model_provider.base_url = Some(base_url);
+            config.model_provider.experimental_bearer_token = bearer_token.map(Into::into);
+            config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
+            config
+                .features
+                .enable(Feature::ContextManagement)
+                .expect("test config should allow experimental context");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_turn("inspect experimental context activation")
+        .await?;
+
+    let request = response.single_request();
+    assert_eq!(
+        tool_names(&request)
+            .iter()
+            .any(|name| name == "new_context"),
+        expected_enabled
+    );
+    assert_eq!(
+        !token_budget_contexts(&request).is_empty(),
+        expected_enabled
+    );
+
+    Ok(())
+}
+
+#[test_case(false, true, false; "explicit_history_notes_without_experimental_capability")]
+#[test_case(false, true, true; "explicit_history_notes_with_experimental_capability")]
+#[test_case(false, false, false; "explicit_standalone_token_budget")]
+#[test_case(true, true, false; "model_default_history_notes_without_experimental_capability")]
+#[test_case(true, true, true; "model_default_history_notes_with_experimental_capability")]
+#[test_case(true, false, false; "model_default_standalone_token_budget")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_budget_history_notes_can_be_enabled_without_experimental_context(
+    use_model_defaults: bool,
+    use_history_notes: bool,
+    supports_context: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let backend_url = format!("{}/backend-api/dex", server.uri());
+    let mut builder = test_dex()
+        .with_auth(DexAuth::from_external_chatgpt_tokens(
+            "header.e30.signature",
+            "account-123",
+            Some("plus"),
+        )?)
+        .with_pre_build_hook(move |home| {
+            let config = if use_model_defaults {
+                "[features.context_management]\nexperimental_mode = false\n".to_string()
+            } else {
+                format!(
+                    "[features.context_management]\nexperimental_mode = false\n[features.token_budget]\nenabled = true\nuse_history_notes_extension = {use_history_notes}\n"
+                )
+            };
+            std::fs::write(home.join("config.toml"), config)
+                .expect("write token-budget configuration");
+        })
+        .with_model_info_override("gpt-5.2", move |model_info| {
+            model_info.supports_experimental_context = supports_context;
+            let mut defaults = model_token_budget_config();
+            defaults.enabled = use_model_defaults;
+            defaults.use_history_notes_extension = use_history_notes;
+            model_info
+                .model_messages
+                .as_mut()
+                .expect("bundled model should have model messages")
+                .token_budget = Some(defaults);
+        })
+        .with_config(move |config| {
+            config.model_provider.base_url = Some(backend_url);
+            config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let response = mount_sse_sequence(
+        &server,
+        vec![sse_completed("resp-1"), sse_completed("resp-2")],
+    )
+    .await;
+    test.submit_turn("inspect token-budget activation").await?;
+    // Builder overrides are consumed by the initial build. Reapply the model and
+    // provider settings so the cold resume exercises the same activation defaults.
+    let initial_config = test.config.clone();
+    let resumed = builder
+        .with_config(move |config| {
+            config.model = initial_config.model;
+            config.model_catalog = initial_config.model_catalog;
+            config.model_provider = initial_config.model_provider;
+            config.model_context_window = initial_config.model_context_window;
+        })
+        .restart(&server, &test)
+        .await?;
+    resumed
+        .submit_turn("inspect token-budget activation after restart")
+        .await?;
+
+    let requests = response.requests();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert!(
+            tool_names(&request)
+                .iter()
+                .any(|name| name == "new_context")
+        );
+        assert_eq!(token_budget_contexts(&request).len(), 1);
+        let turn_metadata: Value = serde_json::from_str(
+            &request
+                .header("x-dex-turn-metadata")
+                .expect("request should include turn metadata"),
+        )?;
+        assert_eq!(
+            turn_metadata["history_ingest_requested"].as_bool(),
+            use_history_notes.then_some(true)
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn token_budget_uses_model_message_defaults() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
     let response = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let model_defaults = model_token_budget_config();
+    let mut model_defaults = model_token_budget_config();
+    model_defaults.enabled = true;
+    model_defaults.use_history_notes_extension = true;
     let expected_guidance = model_defaults.guidance_message.clone();
     let test = test_dex()
-        .with_pre_build_hook(|home| {
-            std::fs::write(
-                home.join("config.toml"),
-                "[features.token_budget]\nenabled = true\nuse_history_notes_extension = true\n",
-            )
-            .expect("write token-budget configuration");
-        })
         .with_model_info_override("gpt-5.2", move |model_info| {
+            model_info.supports_experimental_context = true;
             model_info
                 .model_messages
                 .as_mut()
@@ -307,10 +487,6 @@ async fn token_budget_uses_model_message_defaults() -> Result<()> {
         })
         .with_config(|config| {
             config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
-            config
-                .features
-                .enable(Feature::TokenBudget)
-                .expect("test config should allow token budget");
         })
         .build_with_auto_env(&server)
         .await?;
@@ -380,8 +556,10 @@ async fn token_budget_explicit_default_template_overrides_model_defaults() -> Re
     Ok(())
 }
 
+#[test_case(Feature::TokenBudget; "explicit_activation")]
+#[test_case(Feature::ContextManagement; "experimental_activation")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
+async fn token_budget_defaults_follow_the_active_model(activation: Feature) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -390,8 +568,15 @@ async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
         vec![sse_completed("resp-1"), sse_completed("resp-2")],
     )
     .await;
+    let backend_url = format!("{}/backend-api/dex", server.uri());
     let test = test_dex()
+        .with_auth(DexAuth::from_external_chatgpt_tokens(
+            "header.e30.signature",
+            "account-123",
+            Some("plus"),
+        )?)
         .with_model_info_override("gpt-5.2", |model_info| {
+            model_info.supports_experimental_context = true;
             let mut defaults = model_token_budget_config();
             defaults.guidance_message = "Use first-model context-window guidance.".to_string();
             model_info
@@ -410,11 +595,12 @@ async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
                 .token_budget = Some(defaults);
         })
         .with_model("gpt-5.2")
-        .with_config(|config| {
+        .with_config(move |config| {
+            config.model_provider.base_url = Some(backend_url);
             config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
             config
                 .features
-                .enable(Feature::TokenBudget)
+                .enable(activation)
                 .expect("test config should allow token budget");
         })
         .build_with_auto_env(&server)
@@ -442,6 +628,7 @@ async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].body_json()["model"], "gpt-5.4");
     assert!(requests[0].body_contains_text("Use first-model context-window guidance."));
     assert!(
         requests[1].body_contains_text("Use first-model context-window guidance."),
@@ -455,7 +642,7 @@ async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
         "switching models should preserve the existing model-switch message"
     );
     let expected_guidance = format!(
-        "{CONTEXT_WINDOW_GUIDANCE_OPEN_TAG}\nUse second-model context-window guidance.\n{CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG}"
+        "{CONTEXT_WINDOW_GUIDANCE_OPEN_TAG}\nThis context-window guidance replaces all previously provided context-window guidance.\n\nUse second-model context-window guidance.\n{CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG}"
     );
     assert_eq!(
         developer_texts
@@ -565,13 +752,16 @@ async fn model_token_budget_defaults_do_not_enable_disabled_feature() -> Result<
     Ok(())
 }
 
+#[test_case(false; "root")]
+#[test_case(true; "cached_subagent")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn token_budget_context_injects_plain_thread_hint_text() -> Result<()> {
+async fn token_budget_context_injects_plain_thread_hint_text(cached_subagent: bool) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
     let rmcp_test_server_bin = stdio_server_bin()?;
     let test = test_dex()
+        .with_model_info_override("gpt-5.5", |model| model.use_responses_lite = true)
         .with_config(move |config| {
             config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
             config
@@ -593,13 +783,15 @@ async fn token_budget_context_injects_plain_thread_hint_text() -> Result<()> {
                     environment_id: "local".to_string(),
                     enabled: true,
                     required: false,
+                    startup_readiness: Default::default(),
                     supports_parallel_tool_calls: false,
+                    tool_input_schema_max_bytes: None,
                     omit_tools_from: None,
                     disabled_reason: None,
                     startup_timeout_sec: Some(Duration::from_secs(10)),
                     tool_timeout_sec: None,
                     default_tools_approval_mode: None,
-                    enabled_tools: None,
+                    enabled_tools: Some(vec!["thread_hint".to_string()]),
                     disabled_tools: None,
                     scopes: None,
                     oauth: None,
@@ -615,19 +807,55 @@ async fn token_budget_context_injects_plain_thread_hint_text() -> Result<()> {
         .build(&server)
         .await?;
     wait_for_mcp_server(&test.dex, "notes").await?;
-    let responses = mount_sse_sequence(
+    let (thread, thread_id) = if cached_subagent {
+        let subagent = test
+            .thread_manager
+            .start_thread(StartThreadOptions {
+                session_source: Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: test.session_configured.thread_id,
+                    depth: 1,
+                    agent_path: None,
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+                ..test.start_thread_options().await
+            })
+            .await?;
+        wait_for_event(&subagent.thread, |event| {
+            matches!(event, EventMsg::McpStartupComplete(_))
+        })
+        .await;
+        let (mcp_config, _) = subagent
+            .thread
+            .current_mcp_config_and_runtime_context()
+            .await;
+        assert_eq!(
+            subagent
+                .thread
+                .mcp_connection_statuses(&mcp_config)
+                .await
+                .get("notes"),
+            Some(&McpServerConnectionStatus::NotStarted),
+        );
+        (subagent.thread, subagent.thread_id)
+    } else {
+        (Arc::clone(&test.dex), test.session_configured.thread_id)
+    };
+    let responses = mount_sse_once(
         &server,
-        vec![sse(vec![
-            ev_response_created("resp-1"),
-            ev_completed("resp-1"),
-        ])],
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
     )
     .await;
 
-    test.submit_turn("inject the history hint").await?;
+    thread
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "inject the history hint".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     let request = responses.single_request();
-    let thread_id = test.session_configured.thread_id;
     let token_budgets = token_budget_contexts(&request);
     assert_eq!(token_budgets.len(), 1);
     let captures = assert_regex_match(
@@ -640,12 +868,31 @@ async fn token_budget_context_injects_plain_thread_hint_text() -> Result<()> {
         captures.get(1).expect("first window id capture").as_str(),
         captures.get(2).expect("current window id capture").as_str()
     );
+    let tools = request.inputs_of_type("additional_tools");
+    assert_eq!(tools.len(), 1);
     assert!(
-        !tool_names(&request)
-            .iter()
-            .any(|name| name == "mcp__notes__thread_hint"),
+        namespace_child_tool(&tools[0], "mcp__notes", "thread_hint").is_none(),
         "thread_hint should be hidden from model tool exposure"
     );
+    let metadata = request.input().into_iter().find_map(|item| {
+        let index = item["content"].as_array()?.iter().position(|content| {
+            content["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("manual history hint for thread "))
+        })?;
+        Some(
+            item["internal_chat_message_metadata_passthrough"]["content_item_metadata"][index]
+                .clone(),
+        )
+    });
+    assert_eq!(
+        metadata,
+        Some(json!(ContentItemMetadata::tool(Some(
+            "mcp__notes".to_string().into()
+        )))),
+        "the first Notes hint must retain its exact tool namespace"
+    );
+    thread.shutdown_and_wait().await?;
 
     Ok(())
 }
@@ -973,8 +1220,6 @@ async fn token_budget_context_uses_new_window_after_compaction(
         ],
     )
     .await;
-    let compact = mount_compact_json_once(&server, json!({ "output": [] })).await;
-
     let mut model_provider = built_in_model_providers(/*openai_base_url*/ None)["openai"].clone();
     model_provider.base_url = Some(format!("{}/v1", server.uri()));
     model_provider.supports_websockets = false;
@@ -1013,10 +1258,6 @@ async fn token_budget_context_uses_new_window_after_compaction(
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
-    assert!(
-        compact.requests().is_empty(),
-        "token budget compaction should not call server-side compaction"
-    );
 
     let initial_token_budget = token_budget_contexts(&requests[0]);
     assert_eq!(initial_token_budget.len(), 1);
@@ -1454,14 +1695,17 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install(&mut extensions, |config: &Config| SkillsExtensionConfig {
         include_instructions: config.include_skill_instructions,
+        catalog_deltas_enabled: config.features.enabled(Feature::SkillCatalogDeltas),
+        omit_descriptions: false,
         max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: config.bundled_skills_enabled(),
-        orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+        cloud_skill_enabled: config.cloud_skill_enabled,
         shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
     });
     let test = test_dex()
         .with_extensions(Arc::new(extensions.build()))
         .with_config(|config| {
+            config.update_plan_enabled = true;
             config.model_context_window = Some(10_000);
             config.token_budget = Some(TokenBudgetConfig {
                 auto_compact_fallback_prompt: Some(AUTO_COMPACT_FALLBACK_PROMPT.to_string()),
@@ -1512,11 +1756,8 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
     let snapshot = context_snapshot::format_labeled_requests_snapshot(
         "New context window tool installs fresh full context before the next follow-up request.",
         &[("Final Follow-Up Request", &requests[2])],
-        &ContextSnapshotOptions::default(),
+        &ContextSnapshotOptions::default().rewrite_known_segments(),
     );
-    let snapshot = snapshot
-        .replace(&new_first_window_id, "<FIRST_WINDOW_ID>")
-        .replace(&new_window_id, "<WINDOW_ID>");
     insta::assert_snapshot!(
         "token_budget_new_context_window_tool_full_context",
         snapshot

@@ -6,10 +6,12 @@ use app_test_support::create_apply_patch_sse_response;
 use app_test_support::create_command_execution_sse_response;
 use app_test_support::create_fake_paginated_rollout;
 use app_test_support::create_fake_rollout;
+use app_test_support::create_fake_rollout_with_source;
 use app_test_support::create_fake_rollout_with_text_elements;
 use app_test_support::create_fake_rollout_with_token_usage;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_repeating_assistant;
+use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::rollout_path;
 use app_test_support::test_absolute_path;
@@ -26,12 +28,16 @@ use dex_app_server_protocol::ActivePermissionProfile;
 use dex_app_server_protocol::ApprovalsReviewer;
 use dex_app_server_protocol::AskForApproval;
 use dex_app_server_protocol::ClientInfo;
+use dex_app_server_protocol::ClientRequest;
 use dex_app_server_protocol::CommandExecutionApprovalDecision;
 use dex_app_server_protocol::CommandExecutionRequestApprovalResponse;
+use dex_app_server_protocol::DeprecationNoticeNotification;
 use dex_app_server_protocol::FileChangeApprovalDecision;
 use dex_app_server_protocol::FileChangeRequestApprovalResponse;
+use dex_app_server_protocol::GeneratedImageRef;
 use dex_app_server_protocol::ItemStartedNotification;
 use dex_app_server_protocol::JSONRPCError;
+use dex_app_server_protocol::JSONRPCErrorError;
 use dex_app_server_protocol::JSONRPCResponse;
 use dex_app_server_protocol::McpToolCallAppContext;
 use dex_app_server_protocol::PatchApplyStatus;
@@ -47,11 +53,15 @@ use dex_app_server_protocol::ThreadActiveFlag;
 use dex_app_server_protocol::ThreadForkParams;
 use dex_app_server_protocol::ThreadForkResponse;
 use dex_app_server_protocol::ThreadGoalClearResponse;
+use dex_app_server_protocol::ThreadGoalGetParams;
+use dex_app_server_protocol::ThreadGoalGetResponse;
 use dex_app_server_protocol::ThreadGoalSetResponse;
 use dex_app_server_protocol::ThreadGoalStatus;
 use dex_app_server_protocol::ThreadHistoryMode;
-use dex_app_server_protocol::ThreadItem;
+use dex_app_server_protocol::ThreadItemPayload;
 use dex_app_server_protocol::ThreadListResponse;
+use dex_app_server_protocol::ThreadLoadedListParams;
+use dex_app_server_protocol::ThreadLoadedListResponse;
 use dex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
 use dex_app_server_protocol::ThreadMetadataUpdateParams;
 use dex_app_server_protocol::ThreadReadParams;
@@ -61,7 +71,6 @@ use dex_app_server_protocol::ThreadResumeParams;
 use dex_app_server_protocol::ThreadResumeResponse;
 use dex_app_server_protocol::ThreadSettingsUpdateParams;
 use dex_app_server_protocol::ThreadSettingsUpdateResponse;
-use dex_app_server_protocol::ThreadSource;
 use dex_app_server_protocol::ThreadStartParams;
 use dex_app_server_protocol::ThreadStartResponse;
 use dex_app_server_protocol::ThreadStatus;
@@ -69,6 +78,7 @@ use dex_app_server_protocol::ThreadStatusChangedNotification;
 use dex_app_server_protocol::ThreadTurnsListParams;
 use dex_app_server_protocol::ThreadTurnsListResponse;
 use dex_app_server_protocol::ThreadUnsubscribeParams;
+use dex_app_server_protocol::TurnEnvironmentParams;
 use dex_app_server_protocol::TurnItemsView;
 use dex_app_server_protocol::TurnStartParams;
 use dex_app_server_protocol::TurnStartResponse;
@@ -76,6 +86,7 @@ use dex_app_server_protocol::TurnStatus;
 use dex_app_server_protocol::UserInput;
 use dex_config::types::AuthCredentialsStoreMode;
 use dex_core::ARCHIVED_SESSIONS_SUBDIR;
+use dex_exec_server::LOCAL_ENVIRONMENT_ID;
 use dex_features::Feature;
 use dex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use dex_protocol::ThreadId;
@@ -88,6 +99,7 @@ use dex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use dex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
 use dex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use dex_protocol::models::ContentItem;
+use dex_protocol::models::PermissionProfile;
 use dex_protocol::models::ResponseItem;
 use dex_protocol::openai_models::ReasoningEffort;
 use dex_protocol::protocol::AgentMessageEvent;
@@ -99,6 +111,8 @@ use dex_protocol::protocol::MultiAgentVersion;
 use dex_protocol::protocol::SessionMeta;
 use dex_protocol::protocol::SessionMetaLine;
 use dex_protocol::protocol::SessionSource as RolloutSessionSource;
+use dex_protocol::protocol::SubAgentSource;
+use dex_protocol::protocol::ThreadSettingsAppliedEvent;
 use dex_protocol::protocol::TokenCountEvent;
 use dex_protocol::protocol::TokenUsage;
 use dex_protocol::protocol::TokenUsageInfo;
@@ -109,6 +123,7 @@ use dex_protocol::user_input::ByteRange;
 use dex_protocol::user_input::TextElement;
 use dex_rollout::CompactedItem;
 use dex_rollout::RolloutItem;
+use dex_rollout::RolloutRecorder;
 use dex_rollout::append_rollout_item_to_path;
 use dex_rollout::read_session_meta_line;
 use dex_state::StateRuntime;
@@ -117,6 +132,7 @@ use dex_utils_absolute_path::test_support::PathExt;
 use dex_utils_path_uri::LegacyAppPathString;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::collections::HashMap;
 use std::fs::FileTimes;
 use std::io::Write;
 use std::path::Path;
@@ -124,6 +140,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -133,16 +150,22 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
+use super::analytics::mount_analytics_capture;
+
+#[cfg(target_os = "linux")]
+#[path = "thread_resume_network_tests.rs"]
+mod network_tests;
+
 #[cfg(windows)]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 #[cfg(not(windows))]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const DEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT: &str = "You are Dex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
 
 #[tokio::test]
 async fn thread_resume_paginated_model_context_preserves_original_metadata() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
+    let saved_cwd = normalized_existing_path(dex_home.path())?;
     mock_responses_config(&server.uri()).write(dex_home.path())?;
     let conversation_id = create_fake_paginated_rollout(
         dex_home.path(),
@@ -153,17 +176,39 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
         /*git_info*/ None,
     )?;
     let path = rollout_path(dex_home.path(), "2025-01-05T12-00-00", &conversation_id);
+    let settings: ThreadSettingsAppliedEvent = serde_json::from_value(json!({
+        "thread_id": conversation_id,
+        "thread_settings": {
+            "model": "gpt-5.4",
+            "model_provider_id": "mock_provider",
+            "cwd": saved_cwd,
+            "approval_policy": "never",
+            "approvals_reviewer": "user",
+            "permission_profile": PermissionProfile::read_only(),
+            "collaboration_mode": { "mode": "default", "settings": { "model": "gpt-5.4" } },
+        },
+    }))?;
     append_rollout_item_to_path(
         &path,
-        &RolloutItem::Compacted(CompactedItem {
+        &RolloutItem::Compacted(Box::new(CompactedItem {
             message: "compacted history".to_string(),
             replacement_history: Some(Vec::new()),
+            retained_context: None,
+            guardian_history: None,
             mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
-        }),
+            compaction_response_id: None,
+            latest_token_usage_record: None,
+            resume_metadata: None,
+        })),
+    )
+    .await?;
+    append_rollout_item_to_path(
+        &path,
+        &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(settings)),
     )
     .await?;
 
@@ -181,8 +226,11 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
         })
         .await?;
     let ThreadResumeResponse {
-        thread: resumed, ..
+        thread: resumed,
+        cwd,
+        ..
     } = timeout(DEFAULT_READ_TIMEOUT, primary.read_response(resume_id)).await??;
+    assert_eq!(cwd.as_path(), saved_cwd);
     assert_eq!(resumed.id, conversation_id);
     assert_eq!(resumed.history_mode, ThreadHistoryMode::Paginated);
     assert_eq!(resumed.preview, "Saved user message");
@@ -216,8 +264,13 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
         })
         .await?;
     let ThreadResumeResponse {
-        thread: resumed, ..
+        thread: resumed,
+        cwd,
+        ..
     } = timeout(DEFAULT_READ_TIMEOUT, secondary.read_response(resume_id)).await??;
+    // The resume checkpoint keeps the effective cwd inside the bounded replay,
+    // even after the original settings snapshot falls outside its window.
+    assert_eq!(cwd.as_path(), saved_cwd);
     assert_eq!(resumed.preview, "Saved user message");
     assert!(resumed.turns.is_empty());
 
@@ -386,8 +439,15 @@ async fn wait_for_responses_request_count(
     Ok(())
 }
 
+#[test_case(ThreadHistoryMode::Legacy, false; "legacy with turns")]
+#[test_case(ThreadHistoryMode::Legacy, true; "legacy without turns")]
+#[test_case(ThreadHistoryMode::Paginated, false; "paginated with turns")]
+#[test_case(ThreadHistoryMode::Paginated, true; "paginated without turns")]
 #[tokio::test]
-async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
+async fn thread_resume_rejects_unmaterialized_thread(
+    history_mode: ThreadHistoryMode,
+    exclude_turns: bool,
+) -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(dex_home.path())?;
@@ -401,6 +461,7 @@ async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
     let start_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
+            history_mode: Some(history_mode),
             ..Default::default()
         })
         .await?;
@@ -411,6 +472,7 @@ async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread.id.clone(),
+            exclude_turns,
             ..Default::default()
         })
         .await?;
@@ -435,7 +497,9 @@ async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
 async fn thread_resume_with_empty_path_uses_running_thread_id() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
-    mock_responses_config(&server.uri()).write(dex_home.path())?;
+    mock_responses_config(&server.uri())
+        .enable_feature(Feature::FastMode)
+        .write(dex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
@@ -444,7 +508,8 @@ async fn thread_resume_with_empty_path_uses_running_thread_id() -> Result<()> {
 
     let start_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("gpt-5.4".to_string()),
+            model: Some("gpt-daybreak-blue-latest".to_string()),
+            service_tier: Some(Some("priority".to_string())),
             ..Default::default()
         })
         .await?;
@@ -477,6 +542,7 @@ async fn thread_resume_with_empty_path_uses_running_thread_id() -> Result<()> {
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread.id.clone(),
             path: Some(PathBuf::new()),
+            service_tier: Some(Some("priority".to_string())),
             exclude_turns: true,
             ..Default::default()
         })
@@ -486,6 +552,55 @@ async fn thread_resume_with_empty_path_uses_running_thread_id() -> Result<()> {
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
 
     assert_eq!(resumed.id, thread.id);
+    mcp.start_turn_and_wait_for_completion(TurnStartParams {
+        thread_id: resumed.id,
+        input: vec![UserInput::Text {
+            text: "after warm resume".to_string(),
+            text_elements: Vec::new(),
+        }],
+        ..Default::default()
+    })
+    .await?;
+    let requests = responses::received_responses_requests(&server).await;
+    let initialization = requests
+        .iter()
+        .map(|request| {
+            let body = request.body_json();
+            let metadata: serde_json::Value = serde_json::from_str(
+                body["client_metadata"]["x-dex-turn-metadata"]
+                    .as_str()
+                    .expect("turn metadata"),
+            )
+            .expect("valid turn metadata");
+            metadata["history_initialization"].clone()
+        })
+        .collect::<Vec<_>>();
+    // Rejoining the live runtime must not relabel it as reconstructed history.
+    assert_eq!(
+        serde_json::Value::Array(initialization),
+        json!(["new", "new"])
+    );
+
+    timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+    mock_responses_config(&server.uri())
+        .enable_feature(Feature::FastMode)
+        .with_root_config("service_tier = \"flex\"")
+        .write(dex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .build_initialized()
+        .await?;
+    let resumed: ThreadResumeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadResume {
+            request_id,
+            params: ThreadResumeParams {
+                thread_id: thread.id,
+                ..Default::default()
+            },
+        })
+        .await?;
+    // The startup selection still wins over the new global flex tier, but remains ineffective.
+    assert_eq!(resumed.service_tier, None);
     Ok(())
 }
 
@@ -566,58 +681,71 @@ async fn thread_resume_running_thread_uses_cached_instruction_sources() -> Resul
 }
 
 #[tokio::test]
-async fn turn_start_updates_runtime_workspace_roots_for_loaded_thread() -> Result<()> {
+async fn thread_resume_restores_startup_and_updated_runtime_workspace_roots() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(dex_home.path())?;
 
-    let extra_root_tmp = TempDir::new()?;
-    let extra_root = extra_root_tmp.path().join("extra-root");
-    std::fs::create_dir_all(&extra_root)?;
+    let initial_workspace = TempDir::new()?;
+    let initial_cwd = normalized_existing_path(initial_workspace.path())?.abs();
+    let extra_workspace = TempDir::new()?;
+    let extra_root = extra_workspace.path();
+    let initial_roots = vec![initial_cwd.clone(), extra_root.abs()];
+    let explicit_workspace = TempDir::new()?;
+    let explicit_cwd = normalized_existing_path(explicit_workspace.path())?.abs();
+    let explicit_environments = vec![TurnEnvironmentParams {
+        environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+        cwd: explicit_cwd.clone().into(),
+        runtime_workspace_roots: Some(vec![explicit_cwd.clone().into()]),
+    }];
 
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
+        // These compatibility parameters carry host-native paths, not foreign environment paths.
+        .without_auto_env()
         .build_initialized()
         .await?;
 
     let start_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
+        .send_thread_start_request(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
+            cwd: Some(initial_cwd.to_string_lossy().into_owned()),
+            runtime_workspace_roots: Some(initial_roots.clone()),
+            environments: Some(explicit_environments.clone()),
             ..Default::default()
         })
         .await?;
     let ThreadStartResponse { thread, .. } =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
 
-    let turn_id = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id.clone(),
-            client_user_message_id: None,
-            input: vec![UserInput::Text {
-                text: "Hello".to_string(),
-                text_elements: Vec::new(),
-            }],
-            runtime_workspace_roots: Some(vec![
-                AbsolutePathBuf::from_absolute_path(&extra_root)?,
-                AbsolutePathBuf::from_absolute_path(extra_root.join("."))?,
-            ]),
-            ..Default::default()
-        })
-        .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
-    )
-    .await??;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
+    let updated_roots = vec![initial_cwd.clone(), explicit_cwd.clone(), extra_root.abs()];
+    let mut roots_with_duplicate = updated_roots.clone();
+    roots_with_duplicate.push(extra_root.abs());
+    for (environments, roots) in [
+        // Materialize the rollout before settings updates begin emitting persisted snapshots.
+        (None, None),
+        (None, Some(roots_with_duplicate)),
+        // Explicit environments own their live roots; the top-level list is ignored.
+        (Some(explicit_environments), Some(initial_roots.clone())),
+    ] {
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.start_turn_and_wait_for_completion(TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![UserInput::Text {
+                    text: "update workspace selection".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                environments,
+                runtime_workspace_roots: roots,
+                ..Default::default()
+            }),
+        )
+        .await??;
+    }
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
-            thread_id: thread.id,
+            thread_id: thread.id.clone(),
             exclude_turns: true,
             ..Default::default()
         })
@@ -626,12 +754,427 @@ async fn turn_start_updates_runtime_workspace_roots_for_loaded_thread() -> Resul
         runtime_workspace_roots,
         ..
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    assert_eq!(runtime_workspace_roots, vec![explicit_cwd.clone()]);
 
+    // A cwd-only update must retain the fallback's additional folder, not the live roots.
+    mcp.clear_message_buffer();
+    let update_id = mcp
+        .send_thread_settings_update_request(ThreadSettingsUpdateParams {
+            thread_id: thread.id.clone(),
+            cwd: Some(initial_cwd.to_path_buf()),
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadSettingsUpdateResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(update_id)).await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/settings/updated"),
+    )
+    .await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+
+    // The header preserves the startup fallback selection, not the explicit environment's roots.
+    let startup = read_session_meta_line(thread.path.as_ref().expect("rollout path")).await?;
     assert_eq!(
-        runtime_workspace_roots,
-        vec![AbsolutePathBuf::from_absolute_path(extra_root)?]
+        startup.meta.runtime_workspace_roots,
+        Some(
+            initial_roots
+                .iter()
+                .map(AbsolutePathBuf::to_path_buf)
+                .collect()
+        )
+    );
+    // Check both input deduplication and cwd retargeting before resume can normalize roots.
+    let expected_roots = vec![initial_cwd.clone(), extra_root.abs()];
+    let (items, _, _) =
+        RolloutRecorder::load_rollout_items(thread.path.as_ref().expect("rollout path")).await?;
+    let snapshot_roots: Vec<_> = items
+        .into_iter()
+        .rev()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
+                Some(event.thread_settings.runtime_workspace_roots)
+            }
+            _ => None,
+        })
+        .take(/*n*/ 3)
+        .collect();
+    assert_eq!(
+        snapshot_roots,
+        vec![
+            Some(expected_roots.clone()),
+            Some(vec![explicit_cwd, extra_root.abs()]),
+            Some(updated_roots),
+        ]
     );
 
+    let mut mcp = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse {
+        cwd,
+        runtime_workspace_roots,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    assert_eq!(
+        (cwd, runtime_workspace_roots),
+        (initial_cwd.clone(), expected_roots)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cold_resume_workspace_roots_honor_owned_snapshot_and_caller_overrides() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let response_mock =
+        responses::mount_sse_sequence(&server, vec![responses::sse_completed("done"); 3]).await;
+    let dex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_sandbox_mode("workspace-write")
+        .with_extra_config(
+            r#"[sandbox_workspace_write]
+exclude_tmpdir_env_var = true
+exclude_slash_tmp = true
+
+[windows]
+sandbox = "unelevated"
+"#,
+        )
+        .write(dex_home.path())?;
+    let saved_cwd = normalized_existing_path(dex_home.path())?.abs();
+    let new_workspace = TempDir::new()?;
+    let new_cwd = normalized_existing_path(new_workspace.path())?.abs();
+    let extra_workspace = TempDir::new()?;
+    let extra_root = extra_workspace.path().abs();
+    let thread_id = create_fake_rollout(
+        dex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved workspace selection",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let path = rollout_path(dex_home.path(), "2025-01-05T12-00-00", &thread_id);
+    let owned: ThreadSettingsAppliedEvent = serde_json::from_value(json!({
+        "thread_id": thread_id,
+        "thread_settings": {
+            "model": "gpt-5.5",
+            "model_provider_id": "mock_provider",
+            "cwd": saved_cwd,
+            "runtime_workspace_roots": [saved_cwd, new_cwd, extra_root],
+            "approval_policy": "never",
+            "approvals_reviewer": "user",
+            "permission_profile": PermissionProfile::workspace_write()
+                .materialize_project_roots_with_workspace_roots(
+                    &[saved_cwd.clone(), new_cwd.clone(), extra_root.clone()]
+                ),
+            "service_tier": "flex",
+            "reasoning_summary": "concise",
+            "personality": "friendly",
+            "collaboration_mode": { "mode": "default", "settings": { "model": "gpt-5.5" } },
+        },
+    }))?;
+    let mut foreign = owned.clone();
+    foreign.thread_id = Some(ThreadId::new());
+    foreign.thread_settings.runtime_workspace_roots = Some(vec![extra_root.clone()]);
+    foreign.thread_settings.permission_profile = PermissionProfile::Disabled;
+    foreign.thread_settings.service_tier = Some("default".to_string());
+    let mut ownerless = owned.clone();
+    ownerless.thread_id = None;
+    ownerless.thread_settings.service_tier = Some("priority".to_string());
+    for settings in [owned, ownerless.clone(), foreign] {
+        append_rollout_item_to_path(
+            &path,
+            &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(settings)),
+        )
+        .await?;
+    }
+    // Every iteration is a cold resume; the final one must retain the preceding explicit clear.
+    for (index, (cwd_override, roots_override, expected_cwd, expected_roots)) in [
+        (
+            Some(&new_cwd),
+            None,
+            &new_cwd,
+            vec![new_cwd.clone(), extra_root.clone()],
+        ),
+        (
+            Some(&saved_cwd),
+            Some(vec![new_cwd.clone()]),
+            &saved_cwd,
+            vec![new_cwd.clone()],
+        ),
+        (None, Some(Vec::new()), &saved_cwd, Vec::new()),
+        (None, None, &saved_cwd, Vec::new()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut mcp = TestAppServer::builder()
+            .with_dex_home(dex_home.path())
+            .without_auto_env()
+            .without_managed_config()
+            .build_initialized()
+            .await?;
+        let resume_id = mcp
+            .send_thread_resume_request(ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                cwd: cwd_override.map(|cwd| cwd.to_string_lossy().into_owned()),
+                runtime_workspace_roots: roots_override,
+                service_tier: (index == 2).then_some(Some("priority".to_string())),
+                personality: (index == 2).then_some(Personality::None),
+                config: (index == 1).then(|| {
+                    std::collections::HashMap::from([
+                        ("model_reasoning_summary".to_string(), json!("detailed")),
+                        ("personality".to_string(), json!("none")),
+                    ])
+                }),
+                ..Default::default()
+            })
+            .await?;
+        let resumed: ThreadResumeResponse =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+        assert_eq!(
+            (resumed.cwd, resumed.runtime_workspace_roots),
+            (expected_cwd.clone(), expected_roots.clone())
+        );
+        if index < 3 {
+            mcp.start_turn_and_wait_for_completion(TurnStartParams {
+                thread_id: thread_id.clone(),
+                ..Default::default()
+            })
+            .await?;
+            let request = response_mock.last_request().expect("response request");
+            assert_eq!(
+                (
+                    request.body_json()["service_tier"].as_str(),
+                    request.body_json()["reasoning"]["summary"].as_str(),
+                    request.body_contains_text("# Personality"),
+                ),
+                [
+                    (Some("flex"), Some("concise"), true),
+                    (Some("priority"), Some("detailed"), false),
+                    (Some("priority"), Some("detailed"), false),
+                ][index]
+            );
+        }
+
+        // Inspect persistence before shutdown or another resume can hide a missing checkpoint.
+        let expected_thread_id = ThreadId::from_string(&thread_id)?;
+        let (items, _, _) = RolloutRecorder::load_rollout_items(&path).await?;
+        let persisted = items.into_iter().rev().find_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+                if event.thread_id == Some(expected_thread_id) =>
+            {
+                Some((
+                    event.thread_settings.cwd,
+                    event.thread_settings.runtime_workspace_roots,
+                    event.thread_settings.permission_profile,
+                ))
+            }
+            _ => None,
+        });
+        let (persisted_cwd, persisted_roots, permission_profile) =
+            persisted.expect("resumed thread settings");
+        assert_eq!(
+            (persisted_cwd, persisted_roots),
+            (expected_cwd.clone(), Some(expected_roots.clone()))
+        );
+        let file_system = permission_profile.file_system_sandbox_policy();
+        for root in [&saved_cwd, &new_cwd, &extra_root] {
+            assert_eq!(
+                file_system.can_write_local_path_with_cwd(root.as_path(), expected_cwd.as_path()),
+                expected_roots.contains(root),
+                "resumed write permission at {root:?}"
+            );
+        }
+        timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+        if index == 0 {
+            append_rollout_item_to_path(
+                &path,
+                &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(ownerless.clone())),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_and_fork_restore_unnamed_permissions_from_a_legacy_update() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let dex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_sandbox_mode("workspace-write")
+        .write(dex_home.path())?;
+    let stamp = "2025-01-05T12-00-00";
+    let thread_id = create_fake_rollout(
+        dex_home.path(),
+        stamp,
+        "2025-01-05T12:00:00Z",
+        "Unnamed permissions",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let path = rollout_path(dex_home.path(), stamp, &thread_id);
+    let owned: ThreadSettingsAppliedEvent = serde_json::from_value(json!({
+        "thread_id": thread_id,
+        "thread_settings": {
+            "model": "gpt-5.5",
+            "model_provider_id": "mock_provider",
+            "cwd": normalized_existing_path(dex_home.path())?,
+            "approval_policy": "never",
+            "approvals_reviewer": "user",
+            "permission_profile": PermissionProfile::workspace_write(),
+            "collaboration_mode": {"mode": "default", "settings": {"model": "gpt-5.5"}},
+        },
+    }))?;
+    let mut legacy = owned.clone();
+    legacy.thread_id = None;
+    legacy.thread_settings.permission_profile = PermissionProfile::read_only();
+    for event in [owned, legacy] {
+        append_rollout_item_to_path(
+            &path,
+            &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)),
+        )
+        .await?;
+    }
+
+    let mut mcp = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .without_managed_config()
+        .build_initialized()
+        .await?;
+    // Fork first so it reads the original history before resume writes a checkpoint.
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: thread_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let fork: ThreadForkResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            ..Default::default()
+        })
+        .await?;
+    let resumed: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    let expected = (
+        AppSandboxPolicy::ReadOnly {
+            network_access: false,
+        },
+        None,
+    );
+    assert_eq!(
+        (resumed.sandbox, resumed.active_permission_profile),
+        expected
+    );
+    assert_eq!((fork.sandbox, fork.active_permission_profile), expected);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cold_resume_workspace_roots_validate_foreign_startup_paths() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let dex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(dex_home.path())?;
+    let local_cwd = normalized_existing_path(dex_home.path())?.abs();
+    let extra_workspace = TempDir::new()?;
+    let extra_root = normalized_existing_path(extra_workspace.path())?.abs();
+    let extra_root_string = extra_root.to_string_lossy();
+    let unnormalized_extra_root = extra_root
+        .as_path()
+        .join("child")
+        .join("..")
+        .to_string_lossy()
+        .into_owned();
+    let (foreign_cwd, foreign_extra) = if cfg!(windows) {
+        ("/foreign/project", "/foreign/extra")
+    } else {
+        (r"C:\foreign\project", r"C:\foreign\extra")
+    };
+    let mut mcp = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        // Startup metadata uses the app-server host's paths, not executor paths.
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    for (saved_roots, roots_override, expected_roots) in [
+        (
+            vec![
+                foreign_cwd,
+                extra_root_string.as_ref(),
+                unnormalized_extra_root.as_str(),
+            ],
+            None,
+            Some(vec![local_cwd.clone(), extra_root.clone()]),
+        ),
+        (vec![foreign_cwd, foreign_extra], None, None),
+        (
+            vec![foreign_cwd, foreign_extra],
+            Some(Vec::new()),
+            Some(Vec::new()),
+        ),
+    ] {
+        let thread_id = create_fake_rollout(
+            dex_home.path(),
+            "2025-01-05T12-00-00",
+            "2025-01-05T12:00:00Z",
+            "Foreign startup paths",
+            Some("mock_provider"),
+            /*git_info*/ None,
+        )?;
+        let path = rollout_path(dex_home.path(), "2025-01-05T12-00-00", &thread_id);
+        let contents = std::fs::read_to_string(&path)?;
+        let (meta, history) = contents.split_once('\n').expect("rollout metadata line");
+        let mut meta: serde_json::Value = serde_json::from_str(meta)?;
+        meta["payload"]["cwd"] = json!(foreign_cwd);
+        meta["payload"]["runtime_workspace_roots"] = json!(saved_roots);
+        std::fs::write(&path, format!("{meta}\n{history}"))?;
+
+        let resume_id = mcp
+            .send_thread_resume_request(ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                cwd: Some(local_cwd.to_string_lossy().into_owned()),
+                runtime_workspace_roots: roots_override,
+                ..Default::default()
+            })
+            .await?;
+        if let Some(expected_roots) = expected_roots {
+            let ThreadResumeResponse {
+                thread,
+                cwd,
+                runtime_workspace_roots,
+                ..
+            } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+            assert_eq!(
+                (thread.id, cwd, runtime_workspace_roots),
+                (thread_id, local_cwd.clone(), expected_roots)
+            );
+        } else {
+            let error = timeout(
+                DEFAULT_READ_TIMEOUT,
+                mcp.read_stream_until_error_message(RequestId::Integer(resume_id)),
+            )
+            .await??;
+            assert_eq!(error.error.code, -32602);
+            assert!(error.error.message.contains(foreign_extra));
+            assert!(error.error.message.contains("runtimeWorkspaceRoots"));
+        }
+    }
     Ok(())
 }
 
@@ -845,13 +1388,9 @@ stream_max_retries = 0
 async fn thread_resume_preserves_goal_first_and_fork_approvals_reviewer() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
-    mock_responses_config(&server.uri()).write(dex_home.path())?;
-    let config_path = dex_home.path().join("config.toml");
-    let config = std::fs::read_to_string(&config_path)?;
-    std::fs::write(
-        &config_path,
-        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
-    )?;
+    mock_responses_config(&server.uri())
+        .enable_feature(Feature::Goals)
+        .write(dex_home.path())?;
 
     let (thread_id, fork_thread_id) = {
         let mut mcp = TestAppServer::builder()
@@ -864,6 +1403,7 @@ async fn thread_resume_preserves_goal_first_and_fork_approvals_reviewer() -> Res
             .send_thread_start_request_with_auto_env(ThreadStartParams {
                 model: Some("gpt-5.2-dex".to_string()),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+                history_mode: Some(ThreadHistoryMode::Legacy),
                 ..Default::default()
             })
             .await?;
@@ -915,10 +1455,29 @@ async fn thread_resume_preserves_goal_first_and_fork_approvals_reviewer() -> Res
             ..
         } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
         assert_eq!(approvals_reviewer, ApprovalsReviewer::User);
+        timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+        let (items, _, _) =
+            RolloutRecorder::load_rollout_items(fork_thread.path.as_ref().expect("fork rollout"))
+                .await?;
+        assert_eq!(
+            items
+                .into_iter()
+                .filter_map(|item| match item {
+                    RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) =>
+                        event.thread_id,
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ThreadId::from_string(&thread.id)?,
+                ThreadId::from_string(&fork_thread.id)?,
+            ]
+        );
 
         (thread.id, fork_thread.id)
     };
 
+    let config_path = dex_home.path().join("config.toml");
     let config = std::fs::read_to_string(&config_path)?;
     std::fs::write(
         config_path,
@@ -972,7 +1531,7 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
         ),
     )?;
 
-    let thread_id = {
+    let (thread_id, rollout_path) = {
         let mut mcp = TestAppServer::builder()
             .with_dex_home(dex_home.path())
             .build_initialized()
@@ -981,6 +1540,10 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
         let start_id = mcp
             .send_thread_start_request_with_auto_env(ThreadStartParams {
                 model: Some("gpt-5.4".to_string()),
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                approval_policy: Some(AskForApproval::Never),
+                approvals_reviewer: Some(ApprovalsReviewer::User),
+                permissions: Some(":workspace".to_string()),
                 ..Default::default()
             })
             .await?;
@@ -1009,12 +1572,23 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
         )
         .await??;
 
+        let fork_id = mcp
+            .send_thread_fork_request(ThreadForkParams {
+                thread_id: thread.id.clone(),
+                ..Default::default()
+            })
+            .await?;
+        let ThreadForkResponse { thread, .. } =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+
         let update_id = mcp
             .send_thread_settings_update_request(ThreadSettingsUpdateParams {
                 thread_id: thread.id.clone(),
                 model: Some("gpt-5.2-dex".to_string()),
                 effort: Some(ReasoningEffort::Ultra),
+                approval_policy: Some(AskForApproval::OnRequest),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+                permissions: Some(":read-only".to_string()),
                 cwd: Some(persisted_cwd.clone()),
                 ..Default::default()
             })
@@ -1033,7 +1607,7 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
                 include_turns: false,
             })
             .await?;
-        let ThreadReadResponse { thread: read } =
+        let ThreadReadResponse { thread: read, .. } =
             timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
         assert_eq!(read.cwd.as_path(), persisted_cwd);
 
@@ -1052,7 +1626,7 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
             Some(&read.cwd)
         );
 
-        thread.id
+        (thread.id, read.path.expect("materialized rollout path"))
     };
 
     let mut mcp = TestAppServer::builder()
@@ -1078,18 +1652,19 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
     assert_eq!(model, "gpt-5.2-dex");
     assert_eq!(reasoning_effort, Some(ReasoningEffort::Ultra));
     assert_eq!(approvals_reviewer, ApprovalsReviewer::AutoReview);
-    assert_eq!(thread.cwd.as_path(), persisted_cwd);
+    assert_eq!(thread.cwd.as_path(), live_cwd);
     assert_eq!(cwd.as_path(), live_cwd);
 
     let update_id = mcp
         .send_thread_settings_update_request(ThreadSettingsUpdateParams {
             thread_id: thread_id.clone(),
+            cwd: Some(persisted_cwd.clone()),
             collaboration_mode: Some(CollaborationMode {
-                mode: ModeKind::Default,
+                mode: ModeKind::Plan,
                 settings: Settings {
                     model: "gpt-5.2-dex".to_string(),
                     reasoning_effort: None,
-                    developer_instructions: None,
+                    developer_instructions: Some("Persisted plan instructions".to_string()),
                 },
             }),
             ..Default::default()
@@ -1102,24 +1677,148 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
         mcp.read_stream_until_notification_message("thread/settings/updated"),
     )
     .await??;
-    drop(mcp);
+    timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
 
+    // A running turn can record its original permissions after the thread accepts an update.
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    let frozen_context = items
+        .into_iter()
+        .find(|item| matches!(item, RolloutItem::TurnContext(_)))
+        .expect("initial turn context");
+    append_rollout_item_to_path(&rollout_path, &frozen_context).await?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .build_initialized()
+        .await?;
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: thread_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let fork: ThreadForkResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+    assert_eq!(fork.approval_policy, AskForApproval::OnRequest);
+    assert_eq!(fork.approvals_reviewer, ApprovalsReviewer::AutoReview);
+    assert_eq!(
+        fork.active_permission_profile,
+        Some(ActivePermissionProfile::new(":read-only"))
+    );
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            model: Some("gpt-5.4".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse {
+        cwd,
+        reasoning_effort,
+        collaboration_mode,
+        approval_policy,
+        approvals_reviewer,
+        active_permission_profile,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(cwd.as_path(), persisted_cwd);
+    assert_eq!(
+        (
+            approval_policy,
+            approvals_reviewer,
+            active_permission_profile
+        ),
+        (
+            AskForApproval::OnRequest,
+            ApprovalsReviewer::AutoReview,
+            Some(ActivePermissionProfile::new(":read-only")),
+        )
+    );
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    let mode = items.iter().rev().find_map(|item| match item {
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+            if event
+                .thread_id
+                .is_some_and(|id| id.to_string() == thread_id) =>
+        {
+            Some(event.thread_settings.collaboration_mode.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(collaboration_mode, mode);
+    assert_eq!(
+        mode,
+        Some(CollaborationMode {
+            mode: ModeKind::Plan,
+            settings: Settings {
+                model: "gpt-5.4".to_string(),
+                reasoning_effort: Some(ReasoningEffort::High),
+                developer_instructions: Some("Persisted plan instructions".to_string())
+            },
+        })
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_restores_collaboration_mode_from_legacy_turn_context() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let dex_home = TempDir::new()?;
+    let fixture = setup_rollout_fixture(dex_home.path(), &server.uri()).await?;
+    mock_responses_config(&server.uri())
+        .with_root_config("model_reasoning_effort = \"high\"")
+        .write(dex_home.path())?;
+    let saved_mode = CollaborationMode {
+        mode: ModeKind::Plan,
+        settings: Settings {
+            model: "gpt-5.2-dex".into(),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            developer_instructions: Some("Legacy plan instructions".into()),
+        },
+    };
+    let context = serde_json::from_value(json!({
+        "cwd": dex_home.path(),
+        "approval_policy": "never",
+        "sandbox_policy": {"type": "read-only"},
+        "model": saved_mode.settings.model,
+        "effort": saved_mode.settings.reasoning_effort,
+        "summary": "auto",
+        "collaboration_mode": saved_mode,
+    }))?;
+    append_rollout_item_to_path(
+        &fixture.rollout_file_path,
+        &RolloutItem::TurnContext(context),
+    )
+    .await?;
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&fixture.rollout_file_path).await?;
+    assert!(!items.iter().any(|item| matches!(
+        item,
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+    )));
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
         .build_initialized()
         .await?;
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
-            thread_id,
+            thread_id: fixture.conversation_id,
+            model: Some("gpt-5.4".into()),
             ..Default::default()
         })
         .await?;
-    let ThreadResumeResponse {
-        reasoning_effort, ..
-    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
-
-    assert_eq!(reasoning_effort, None);
-
+    let response: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    assert_eq!(
+        response.collaboration_mode,
+        Some(saved_mode.with_updates(
+            Some("gpt-5.4".into()),
+            Some(Some(ReasoningEffort::High)),
+            /*developer_instructions*/ None,
+        ))
+    );
     Ok(())
 }
 
@@ -1129,7 +1828,15 @@ async fn cold_resume_reresolves_persisted_active_permission_profile() -> Result<
     for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
         let dex_home = TempDir::new()?;
         let previous_workspace_root = TempDir::new()?;
+        let profile_workspace = TempDir::new()?;
         write_dev_permission_config(&server.uri(), dex_home.path(), ":workspace")?;
+        let profile_root = serde_json::to_string(profile_workspace.path())?;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(dex_home.path().join("config.toml"))?,
+            "\n[permissions.dev.workspace_roots]\n{profile_root} = true"
+        )?;
         let thread_id = {
             let mut mcp = TestAppServer::builder()
                 .with_dex_home(dex_home.path())
@@ -1182,10 +1889,9 @@ async fn cold_resume_reresolves_persisted_active_permission_profile() -> Result<
                 extends: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
             })
         );
-        assert!(
-            !runtime_workspace_roots.contains(&AbsolutePathBuf::from_absolute_path(
-                previous_workspace_root.path(),
-            )?)
+        assert_eq!(
+            runtime_workspace_roots,
+            vec![previous_workspace_root.path().abs()]
         );
     }
     Ok(())
@@ -1298,32 +2004,87 @@ async fn cold_resume_permission_overrides_win_over_persisted_profile() -> Result
     Ok(())
 }
 
+// Unelevated Windows sandboxes cannot enforce managed deny-read.
+#[cfg_attr(unix, test_case(
+    SandboxMode::DangerFullAccess,
+    BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
+    "[permissions.filesystem]\ndeny_read = [\"./private\"]",
+    AppSandboxPolicy::WorkspaceWrite {
+        writable_roots: Vec::new(),
+        network_access: false,
+        exclude_tmpdir_env_var: false,
+        exclude_slash_tmp: false,
+    };
+    "managed deny-read"
+))]
+#[test_case(
+    SandboxMode::DangerFullAccess,
+    BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
+    "", AppSandboxPolicy::DangerFullAccess;
+    "restore saved full access"
+)]
+#[test_case(
+    SandboxMode::DangerFullAccess,
+    BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
+    "allowed_sandbox_modes = [\"read-only\"]",
+    AppSandboxPolicy::ReadOnly { network_access: false };
+    "managed modes"
+)]
+#[test_case(
+    SandboxMode::DangerFullAccess,
+    BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
+    "default_permissions = \":read-only\"\n[allowed_permission_profiles]\n\":read-only\" = true",
+    AppSandboxPolicy::ReadOnly { network_access: false };
+    "managed catalog"
+)]
+#[test_case(
+    SandboxMode::ReadOnly,
+    BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
+    "allowed_sandbox_modes = [\"read-only\"]",
+    AppSandboxPolicy::ReadOnly { network_access: false };
+    "saved read-only wins before incompatible default validation"
+)]
 #[tokio::test]
-async fn cold_resume_without_active_permission_profile_uses_current_config() -> Result<()> {
+async fn cold_resume_without_active_permission_profile_restores_base_permissions(
+    saved_sandbox: SandboxMode,
+    configured_default: &str,
+    requirements: &str,
+    expected: AppSandboxPolicy,
+) -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(dex_home.path())?;
+    // Only deny-read names a path on the app-server host.
+    let local = requirements.contains("deny_read");
     let thread_id = {
-        let mut mcp = TestAppServer::builder()
+        let mut builder = TestAppServer::builder()
             .with_dex_home(dex_home.path())
-            .without_managed_config()
-            .build_initialized()
-            .await?;
-        let ThreadStartResponse { thread, .. } = mcp
-            .start_thread(ThreadStartParams {
-                model: Some("mock-model".to_string()),
-                ..Default::default()
-            })
-            .await?;
+            .without_managed_config();
+        if local {
+            builder = builder.without_auto_env();
+        }
+        let mut mcp = builder.build_initialized().await?;
+        let params = ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            sandbox: Some(saved_sandbox),
+            approval_policy: Some(AskForApproval::Never),
+            ..Default::default()
+        };
+        let request_id = if local {
+            mcp.send_thread_start_request(params).await?
+        } else {
+            mcp.send_thread_start_request_with_auto_env(params).await?
+        };
+        let ThreadStartResponse { thread, .. } =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
         timeout(
             DEFAULT_READ_TIMEOUT,
             mcp.start_turn_and_wait_for_completion(TurnStartParams {
                 thread_id: thread.id.clone(),
                 input: vec![UserInput::Text {
-                    text: "persist full access".to_string(),
+                    text: "persist permissions".to_string(),
                     text_elements: Vec::new(),
                 }],
-                sandbox_policy: Some(AppSandboxPolicy::DangerFullAccess),
                 ..Default::default()
             }),
         )
@@ -1332,33 +2093,27 @@ async fn cold_resume_without_active_permission_profile_uses_current_config() -> 
     };
 
     MockResponsesConfig::new(&server.uri())
-        .with_root_config(&format!(
-            "default_permissions = \"{BUILT_IN_PERMISSION_PROFILE_WORKSPACE}\""
-        ))
+        .with_approval_policy("on-request")
+        .with_root_config(&format!("default_permissions = \"{configured_default}\""))
         .write(dex_home.path())?;
-    let mut mcp = TestAppServer::builder()
-        .with_dex_home(dex_home.path())
-        .without_managed_config()
-        .build_initialized()
-        .await?;
+    std::fs::write(dex_home.path().join("requirements.toml"), requirements)?;
+    let mut builder = TestAppServer::builder().with_dex_home(dex_home.path());
+    if local {
+        builder = builder.without_auto_env();
+    }
+    let mut mcp = builder.build_initialized().await?;
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
             thread_id,
             ..Default::default()
         })
         .await?;
-    let ThreadResumeResponse {
-        sandbox,
-        active_permission_profile,
-        ..
-    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
-
-    assert!(matches!(sandbox, AppSandboxPolicy::WorkspaceWrite { .. }));
+    let response: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
     assert_eq!(
-        active_permission_profile,
-        Some(ActivePermissionProfile::new(
-            BUILT_IN_PERMISSION_PROFILE_WORKSPACE
-        ))
+        (response.sandbox, response.approval_policy),
+        (expected, AskForApproval::Never),
+        "requirements: {requirements}"
     );
     Ok(())
 }
@@ -1479,13 +2234,9 @@ fn write_dev_permission_config(
 async fn thread_goal_get_rejects_unmaterialized_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
-    mock_responses_config(&server.uri()).write(dex_home.path())?;
-    let config_path = dex_home.path().join("config.toml");
-    let config = std::fs::read_to_string(&config_path)?;
-    std::fs::write(
-        &config_path,
-        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
-    )?;
+    mock_responses_config(&server.uri())
+        .enable_feature(Feature::Goals)
+        .write(dex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
@@ -1525,6 +2276,121 @@ async fn thread_goal_get_rejects_unmaterialized_thread() -> Result<()> {
         goal_err.error.message
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn unloaded_thread_goal_mutations_respect_parent_ownership() -> Result<()> {
+    const TIMESTAMP: &str = "2026-08-20T12-00-00";
+    let server = responses::start_mock_server().await;
+    let dex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .enable_feature(Feature::Goals)
+        .enable_feature(Feature::Sqlite)
+        .write(dex_home.path())?;
+    let child_source = RolloutSessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::new(),
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let mut app = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .build_initialized()
+        .await?;
+
+    for (source, version) in [
+        (child_source.clone(), Some(MultiAgentVersion::V2)),
+        (child_source.clone(), Some(MultiAgentVersion::V1)),
+        (child_source, None),
+        (RolloutSessionSource::Cli, Some(MultiAgentVersion::V2)),
+    ] {
+        let rejects_mutation = matches!(source, RolloutSessionSource::SubAgent(_))
+            && version == Some(MultiAgentVersion::V2);
+        let thread_id = create_fake_rollout_with_source(
+            dex_home.path(),
+            TIMESTAMP,
+            "2026-08-20T12:00:00Z",
+            "Saved task",
+            Some("mock_provider"),
+            /*git_info*/ None,
+            source,
+        )?;
+        let path = rollout_path(dex_home.path(), TIMESTAMP, &thread_id);
+        let params = json!({
+            "threadId": thread_id,
+            "objective": "Original goal",
+            "status": "paused",
+        });
+        let request_id = app
+            .send_raw_request("thread/goal/set", Some(params))
+            .await?;
+        let original: ThreadGoalSetResponse =
+            timeout(DEFAULT_READ_TIMEOUT, app.read_response(request_id)).await??;
+
+        // The initial header has no version, as in older rollouts. Later metadata
+        // must take precedence, just as it does when the thread resumes.
+        let mut meta = read_session_meta_line(&path).await?;
+        meta.meta.multi_agent_version = version;
+        append_rollout_item_to_path(&path, &RolloutItem::SessionMeta(Box::new(meta))).await?;
+
+        for (method, params) in [
+            (
+                "thread/goal/set",
+                json!({"threadId": thread_id, "objective": "Replacement goal", "status": "paused"}),
+            ),
+            ("thread/goal/clear", json!({"threadId": thread_id})),
+        ] {
+            let request_id = app.send_raw_request(method, Some(params)).await?;
+            if rejects_mutation {
+                let error = timeout(
+                    DEFAULT_READ_TIMEOUT,
+                    app.read_stream_until_error_message(RequestId::Integer(request_id)),
+                )
+                .await??;
+                assert_eq!(
+                    error.error,
+                    JSONRPCErrorError {
+                        code: -32600,
+                        message:
+                            "direct app-server input is not allowed for multi-agent v2 sub-agents"
+                                .to_string(),
+                        data: None,
+                    },
+                );
+                let retained: ThreadGoalGetResponse = app
+                    .request(|request_id| ClientRequest::ThreadGoalGet {
+                        request_id,
+                        params: ThreadGoalGetParams {
+                            thread_id: thread_id.clone(),
+                        },
+                    })
+                    .await?;
+                assert_eq!(
+                    retained,
+                    ThreadGoalGetResponse {
+                        goal: Some(original.goal.clone()),
+                    },
+                );
+            } else if method == "thread/goal/set" {
+                let _: ThreadGoalSetResponse =
+                    timeout(DEFAULT_READ_TIMEOUT, app.read_response(request_id)).await??;
+            } else {
+                let cleared: ThreadGoalClearResponse =
+                    timeout(DEFAULT_READ_TIMEOUT, app.read_response(request_id)).await??;
+                assert_eq!(cleared, ThreadGoalClearResponse { cleared: true });
+            }
+        }
+    }
+
+    let loaded: ThreadLoadedListResponse = app
+        .request(|request_id| ClientRequest::ThreadLoadedList {
+            request_id,
+            params: ThreadLoadedListParams::default(),
+        })
+        .await?;
+    assert_eq!(loaded.data, Vec::<String>::new());
     Ok(())
 }
 
@@ -1665,13 +2531,9 @@ async fn goal_first_live_thread_appears_in_state_db_thread_list() -> Result<()> 
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
     let dex_home_path = normalized_existing_path(dex_home.path())?;
-    mock_responses_config(&server.uri()).write(&dex_home_path)?;
-    let config_path = dex_home_path.join("config.toml");
-    let config = std::fs::read_to_string(&config_path)?;
-    std::fs::write(
-        &config_path,
-        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
-    )?;
+    mock_responses_config(&server.uri())
+        .enable_feature(Feature::Goals)
+        .write(&dex_home_path)?;
 
     let sqlite_home = dex_home_path
         .as_path()
@@ -1737,116 +2599,6 @@ async fn goal_first_live_thread_appears_in_state_db_thread_list() -> Result<()> 
     Ok(())
 }
 
-#[tokio::test]
-async fn thread_resume_tracks_thread_initialized_analytics() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
-
-    let dex_home = TempDir::new()?;
-    mock_responses_config(&server.uri())
-        .with_root_config(&format!(r#"chatgpt_base_url = "{}""#, server.uri()))
-        .write(dex_home.path())?;
-
-    let conversation_id = create_fake_rollout(
-        dex_home.path(),
-        "2025-01-05T12-00-00",
-        "2025-01-05T12:00:00Z",
-        "Saved user message",
-        Some("mock_provider"),
-        /*git_info*/ None,
-    )?;
-    set_session_meta_on_fake_rollout(
-        dex_home.path(),
-        "2025-01-05T12-00-00",
-        &conversation_id,
-        "user",
-        "dex_work_desktop",
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_dex_home(dex_home.path())
-        .without_managed_config()
-        .build_initialized()
-        .await?;
-
-    let resume_id = mcp
-        .send_thread_resume_request(ThreadResumeParams {
-            thread_id: conversation_id,
-            ..Default::default()
-        })
-        .await?;
-    let ThreadResumeResponse { thread, .. } =
-        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
-    assert!(
-        !thread.session_id.is_empty(),
-        "session id should not be empty"
-    );
-    assert_eq!(thread.thread_source, Some(ThreadSource::User));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn thread_resume_running_thread_tracks_thread_originator_in_analytics() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
-
-    let dex_home = TempDir::new()?;
-    mock_responses_config(&server.uri())
-        .with_root_config(&format!(r#"chatgpt_base_url = "{}""#, server.uri()))
-        .write(dex_home.path())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_dex_home(dex_home.path())
-        .without_managed_config()
-        .build_initialized()
-        .await?;
-
-    let start_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("mock-model".to_string()),
-            thread_source: Some(ThreadSource::User),
-            service_name: Some("dex_work_desktop".to_string()),
-            ..Default::default()
-        })
-        .await?;
-    let ThreadStartResponse { thread, .. } =
-        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
-
-    let turn_id = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id.clone(),
-            client_user_message_id: None,
-            input: vec![UserInput::Text {
-                text: "materialize rollout".to_string(),
-                text_elements: Vec::new(),
-            }],
-            ..Default::default()
-        })
-        .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
-    )
-    .await??;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
-    let resume_id = mcp
-        .send_thread_resume_request(ThreadResumeParams {
-            thread_id: thread.id.clone(),
-            exclude_turns: true,
-            ..Default::default()
-        })
-        .await?;
-    let ThreadResumeResponse {
-        thread: _resumed, ..
-    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
-
-    Ok(())
-}
-
 fn set_session_meta_on_fake_rollout(
     dex_home: &std::path::Path,
     filename_ts: &str,
@@ -1872,6 +2624,7 @@ fn set_session_meta_on_fake_rollout(
 async fn thread_resume_returns_rollout_history() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
+    let saved_cwd = normalized_existing_path(dex_home.path())?;
     mock_responses_config(&server.uri()).write(dex_home.path())?;
 
     let preview = "Saved user message";
@@ -1891,6 +2644,24 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
+    // Old snapshots have no owner ID: keep them readable without adopting their cwd.
+    let settings: ThreadSettingsAppliedEvent = serde_json::from_value(json!({
+        "thread_settings": {
+            "model": "gpt-5.4",
+            "model_provider_id": "mock_provider",
+            "cwd": saved_cwd,
+            "approval_policy": "never",
+            "approvals_reviewer": "user",
+            "permission_profile": PermissionProfile::read_only(),
+            "service_tier": "flex",
+            "collaboration_mode": { "mode": "default", "settings": { "model": "gpt-5.4" } },
+        },
+    }))?;
+    append_rollout_item_to_path(
+        &rollout_path(dex_home.path(), "2025-01-05T12-00-00", &conversation_id),
+        &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(settings)),
+    )
+    .await?;
 
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
@@ -1903,19 +2674,24 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    let ThreadResumeResponse { thread, .. } =
-        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    let ThreadResumeResponse {
+        thread,
+        cwd,
+        service_tier,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
 
     assert_eq!(thread.id, conversation_id);
     assert_eq!(thread.preview, preview);
     assert_eq!(thread.model_provider, "mock_provider");
     assert!(thread.path.as_ref().expect("thread path").is_absolute());
-    assert_eq!(thread.cwd, test_absolute_path("/"));
+    assert_eq!(thread.cwd.as_path(), cwd.as_path());
+    assert_eq!(cwd, test_absolute_path("/"));
     assert_eq!(thread.cli_version, "0.0.0");
     assert_eq!(thread.source, SessionSource::Cli);
     assert_eq!(thread.git_info, None);
     assert_eq!(thread.status, ThreadStatus::Idle);
-
+    assert_eq!(service_tier.as_deref(), Some("flex"));
     assert_eq!(
         thread.turns.len(),
         1,
@@ -1924,8 +2700,8 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
     let turn = &thread.turns[0];
     assert_eq!(turn.status, TurnStatus::Completed);
     assert_eq!(turn.items.len(), 1, "expected user message item");
-    match &turn.items[0] {
-        ThreadItem::UserMessage { content, .. } => {
+    match &turn.items[0].payload {
+        ThreadItemPayload::UserMessage { content, .. } => {
             assert_eq!(
                 content,
                 &vec![UserInput::Text {
@@ -1960,16 +2736,16 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
             let remote_mcp_item = remote_turn
                 .items
                 .iter()
-                .find(|item| matches!(item, ThreadItem::McpToolCall { .. }))
+                .find(|item| matches!(&item.payload, ThreadItemPayload::McpToolCall { .. }))
                 .expect("remote resume should include redacted MCP item");
-            let ThreadItem::McpToolCall {
+            let ThreadItemPayload::McpToolCall {
                 arguments,
                 app_context,
                 read_only_hint,
                 result,
                 error,
                 ..
-            } = remote_mcp_item
+            } = &remote_mcp_item.payload
             else {
                 unreachable!("matched MCP item");
             };
@@ -2000,7 +2776,7 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
                 !remote_turn
                     .items
                     .iter()
-                    .any(|item| matches!(item, ThreadItem::ImageGeneration(_))),
+                    .any(|item| matches!(&item.payload, ThreadItemPayload::ImageGeneration(_))),
                 "remote resume should drop image generation items for {client_name}"
             );
         }
@@ -2015,15 +2791,15 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
     let normal_mcp_item = normal_turn
         .items
         .iter()
-        .find(|item| matches!(item, ThreadItem::McpToolCall { .. }))
+        .find(|item| matches!(&item.payload, ThreadItemPayload::McpToolCall { .. }))
         .expect("normal resume should include MCP item");
-    let ThreadItem::McpToolCall {
+    let ThreadItemPayload::McpToolCall {
         arguments,
         app_context,
         read_only_hint,
         result,
         ..
-    } = normal_mcp_item
+    } = &normal_mcp_item.payload
     else {
         unreachable!("matched MCP item");
     };
@@ -2054,9 +2830,13 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
     assert_eq!(result.meta, Some(json!({"secret":"meta"})));
     assert!(
         normal_turn.items.iter().any(|item| matches!(
-            item,
-            ThreadItem::ImageGeneration(item)
-                if item.result == "base64-image-result"
+            &item.payload,
+            ThreadItemPayload::ImageGeneration(item)
+                if matches!(
+                    &item.image,
+                    GeneratedImageRef::Inline { result }
+                        if result == "base64-image-result"
+                )
                     && item.revised_prompt.as_deref() == Some("secret revised prompt")
         )),
         "normal resume should keep image generation items"
@@ -2129,6 +2909,7 @@ fn append_resume_redaction_history(
     let persisted_rollout = std::fs::read_to_string(&rollout_file_path)?;
     let appended_rollout = [
         EventMsg::McpToolCallEnd(McpToolCallEndEvent {
+            turn_id: String::new(),
             call_id: "mcp-1".to_string(),
             invocation: McpInvocation {
                 server: "docs".to_string(),
@@ -2137,6 +2918,7 @@ fn append_resume_redaction_history(
             },
             connector_id: Some("calendar".to_string()),
             mcp_app_resource_uri: Some("ui://widget/lookup.html".to_string()),
+            mcp_app_ui: None,
             link_id: Some("link_calendar".to_string()),
             app_name: Some("Calendar".to_string()),
             action_name: Some("lookup".to_string()),
@@ -2157,10 +2939,14 @@ fn append_resume_redaction_history(
             call_id: "ig-1".to_string(),
             status: "completed".to_string(),
             revised_prompt: Some("secret revised prompt".to_string()),
-            result: "base64-image-result".to_string(),
+            image: GeneratedImageRef::Inline {
+                result: "base64-image-result".to_string(),
+            },
             transparent_background: None,
             failure: None,
             saved_path: Some(test_absolute_path("/tmp/ig-1.png")),
+            input_images: Vec::new(),
+            generation_id: None,
         }),
     ]
     .into_iter()
@@ -2219,6 +3005,80 @@ async fn thread_resume_can_skip_turns_for_metadata_only_resume() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_resume_warns_for_paginated_full_history_hydration() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let dex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(dex_home.path())?;
+
+    let conversation_id = create_fake_paginated_rollout(
+        dex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    let cold_resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let notice: DeprecationNoticeNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("deprecationNotice"),
+    )
+    .await??;
+    assert_eq!(
+        notice,
+        DeprecationNoticeNotification {
+            summary: "Full-history hydration is deprecated for paginated threads; use `excludeTurns: true`, then page with `thread/turns/list` and `thread/items/list`.".to_string(),
+            details: None,
+        }
+    );
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(cold_resume_id)).await??;
+
+    mcp.clear_message_buffer();
+    let loaded_resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let _: DeprecationNoticeNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("deprecationNotice"),
+    )
+    .await??;
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(loaded_resume_id)).await??;
+
+    mcp.clear_message_buffer();
+    let metadata_resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id,
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(metadata_resume_id)).await??;
+    assert!(
+        !mcp.pending_notification_methods()
+            .contains(&"deprecationNotice".to_string())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_resume_rejects_archived_session_by_id() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
@@ -2272,16 +3132,29 @@ async fn thread_resume_rejects_archived_session_by_id() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
+async fn thread_resume_keeps_tool_paused_goal_paused() -> Result<()> {
+    let server = create_mock_responses_server_sequence(vec![
+        responses::sse(vec![
+            responses::ev_response_created("create-goal"),
+            responses::ev_function_call(
+                "create-goal-call",
+                "create_goal",
+                r#"{"objective":"keep polishing"}"#,
+            ),
+            responses::ev_completed("create-goal"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("pause-goal"),
+            responses::ev_function_call("pause-goal-call", "update_goal", r#"{"status":"paused"}"#),
+            responses::ev_completed("pause-goal"),
+        ]),
+        create_final_assistant_message_sse_response("The goal is paused.")?,
+    ])
+    .await;
     let dex_home = TempDir::new()?;
-    mock_responses_config(&server.uri()).write(dex_home.path())?;
-    let config_path = dex_home.path().join("config.toml");
-    let config = std::fs::read_to_string(&config_path)?;
-    std::fs::write(
-        &config_path,
-        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
-    )?;
+    mock_responses_config(&server.uri())
+        .enable_feature(Feature::Goals)
+        .write(dex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
@@ -2303,7 +3176,7 @@ async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
             thread_id: thread.id.clone(),
             client_user_message_id: None,
             input: vec![UserInput::Text {
-                text: "materialize this thread".to_string(),
+                text: "Create a goal to keep polishing, then pause it.".to_string(),
                 text_elements: Vec::new(),
             }],
             ..Default::default()
@@ -2321,22 +3194,14 @@ async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
     .await??;
 
     let goal_id = mcp
-        .send_raw_request(
-            "thread/goal/set",
-            Some(json!({
-                "threadId": thread.id,
-                "objective": "keep polishing",
-                "status": "paused",
-            })),
-        )
+        .send_raw_request("thread/goal/get", Some(json!({ "threadId": thread.id })))
         .await?;
-    let _goal: ThreadGoalSetResponse =
+    let goal: ThreadGoalGetResponse =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(goal_id)).await??;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("thread/goal/updated"),
-    )
-    .await??;
+    assert_eq!(
+        goal.goal.expect("goal should exist").status,
+        ThreadGoalStatus::Paused
+    );
     mcp.clear_message_buffer();
 
     let resume_id = mcp
@@ -2371,14 +3236,10 @@ async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
 async fn thread_goal_set_enforces_configured_maximum_token_budget() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
-    mock_responses_config(&server.uri()).write(dex_home.path())?;
-    let config_path = dex_home.path().join("config.toml");
-    let config = std::fs::read_to_string(&config_path)?;
-    let config = config.replace("personality = true\n", "personality = true\ngoals = true\n");
-    std::fs::write(
-        config_path,
-        format!("{config}\n[goals]\nmax_goal_token_budget = 200\n"),
-    )?;
+    mock_responses_config(&server.uri())
+        .enable_feature(Feature::Goals)
+        .with_extra_config("[goals]\nmax_goal_token_budget = 200")
+        .write(dex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
@@ -2468,13 +3329,9 @@ async fn thread_goal_set_enforces_configured_maximum_token_budget() -> Result<()
 async fn thread_goal_set_preserves_budget_limited_same_objective() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
-    mock_responses_config(&server.uri()).write(dex_home.path())?;
-    let config_path = dex_home.path().join("config.toml");
-    let config = std::fs::read_to_string(&config_path)?;
-    std::fs::write(
-        &config_path,
-        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
-    )?;
+    mock_responses_config(&server.uri())
+        .enable_feature(Feature::Goals)
+        .write(dex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
@@ -2558,13 +3415,9 @@ async fn thread_goal_set_preserves_budget_limited_same_objective() -> Result<()>
 async fn thread_goal_set_persists_resumable_stopped_statuses() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
-    mock_responses_config(&server.uri()).write(dex_home.path())?;
-    let config_path = dex_home.path().join("config.toml");
-    let config = std::fs::read_to_string(&config_path)?;
-    std::fs::write(
-        &config_path,
-        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
-    )?;
+    mock_responses_config(&server.uri())
+        .enable_feature(Feature::Goals)
+        .write(dex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
@@ -2640,13 +3493,9 @@ async fn thread_goal_set_persists_resumable_stopped_statuses() -> Result<()> {
 async fn thread_goal_set_edits_objective_without_resetting_usage() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
-    mock_responses_config(&server.uri()).write(dex_home.path())?;
-    let config_path = dex_home.path().join("config.toml");
-    let config = std::fs::read_to_string(&config_path)?;
-    std::fs::write(
-        &config_path,
-        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
-    )?;
+    mock_responses_config(&server.uri())
+        .enable_feature(Feature::Goals)
+        .write(dex_home.path())?;
     let thread_id = create_fake_rollout(
         dex_home.path(),
         "2025-01-05T12-00-00",
@@ -2744,7 +3593,218 @@ async fn thread_goal_set_edits_objective_without_resetting_usage() -> Result<()>
 }
 
 #[tokio::test]
-async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Result<()> {
+async fn thread_goal_keeps_original_root_until_external_objective_edit() -> Result<()> {
+    let (release_original_turn, original_turn_gate) = oneshot::channel();
+    let (release_edited_turn, edited_turn_gate) = oneshot::channel();
+    let (server, _response_completions) = start_streaming_sse_server(vec![
+        ungated_goal_response(responses::sse(vec![
+            responses::ev_response_created("create-original-goal"),
+            responses::ev_function_call(
+                "create-original-goal-call",
+                "create_goal",
+                r#"{"objective":"keep its original owner","token_budget":100}"#,
+            ),
+            responses::ev_completed_with_tokens("create-original-goal", /*total_tokens*/ 5),
+        ])),
+        vec![StreamingSseChunk {
+            gate: Some(original_turn_gate),
+            body: responses::sse_completed("finish-original-user-turn"),
+        }],
+        ungated_goal_response(responses::sse_completed("reopen-original-user-turn")),
+        ungated_goal_response(responses::sse_completed("finish-intervening-user-turn")),
+        ungated_goal_response(responses::sse(vec![
+            responses::ev_response_created("goal-continuation-after-intervening-turn"),
+            responses::ev_completed_with_tokens(
+                "goal-continuation-after-intervening-turn",
+                /*total_tokens*/ 40,
+            ),
+        ])),
+        vec![StreamingSseChunk {
+            gate: Some(edited_turn_gate),
+            body: responses::sse_completed("second-goal-continuation"),
+        }],
+        ungated_goal_response(responses::sse_completed("reopened-goal-turn")),
+        ungated_goal_response(responses::sse(vec![
+            responses::ev_response_created("rootless-goal-continuation"),
+            responses::ev_completed_with_tokens(
+                "rootless-goal-continuation",
+                /*total_tokens*/ 100,
+            ),
+        ])),
+    ])
+    .await;
+    let dex_home = TempDir::new()?;
+    mock_responses_config(server.uri())
+        .enable_feature(Feature::Goals)
+        .write(dex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .without_managed_config()
+        .build_initialized()
+        .await?;
+    let thread = mcp.start_thread(ThreadStartParams::default()).await?.thread;
+
+    let start_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "create the original goal".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let original_turn: TurnStartResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        server.wait_for_request_count(/*count*/ 2),
+    )
+    .await?;
+
+    let injection_id = mcp
+        .send_raw_request(
+            "thread/inject_items",
+            Some(json!({
+                "threadId": thread.id,
+                "items": [{
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "externally injected context",
+                    }],
+                }],
+            })),
+        )
+        .await?;
+    let _: serde_json::Value =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(injection_id)).await??;
+
+    let queue_id = mcp
+        .send_raw_request(
+            "thread/queue/add",
+            Some(json!({
+                "threadId": thread.id,
+                "input": [{
+                    "type": "text",
+                    "text": "an intervening user message",
+                    "textElements": [],
+                }],
+                "clientUserMessageId": "intervening-goal-message",
+            })),
+        )
+        .await?;
+    let _: serde_json::Value = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(queue_id)).await??;
+    release_original_turn
+        .send(())
+        .expect("original turn should remain open until the user message is queued");
+
+    for _ in 0..3 {
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+    }
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        server.wait_for_request_count(/*count*/ 6),
+    )
+    .await?;
+
+    let edit_id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({
+                "threadId": thread.id,
+                "objective": "externally updated goal",
+                "status": "active",
+            })),
+        )
+        .await?;
+    let edited_goal: ThreadGoalSetResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(edit_id)).await??;
+    assert_eq!(edited_goal.goal.objective, "externally updated goal");
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/goal/updated"),
+    )
+    .await??;
+
+    let get_id = mcp
+        .send_raw_request("thread/goal/get", Some(json!({ "threadId": thread.id })))
+        .await?;
+    let _: dex_app_server_protocol::ThreadGoalGetResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(get_id)).await??;
+    release_edited_turn
+        .send(())
+        .expect("goal turn should remain open until its external edit");
+
+    for _ in 0..2 {
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+    }
+
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 8);
+    let reopened_original_request = serde_json::from_slice::<serde_json::Value>(&requests[2])?;
+    assert_eq!(
+        reopened_original_request["client_metadata"]["turn_id"].as_str(),
+        Some(original_turn.turn.id.as_str())
+    );
+    responses::assert_root_turn(
+        &reopened_original_request,
+        Some(original_turn.turn.id.as_str()),
+    )?;
+    let intervening_request = serde_json::from_slice::<serde_json::Value>(&requests[3])?;
+    let intervening_turn_id = intervening_request["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("intervening user turn ID");
+    responses::assert_root_turn(&intervening_request, Some(intervening_turn_id))?;
+    let first_continuation = serde_json::from_slice::<serde_json::Value>(&requests[4])?;
+    let first_continuation_turn_id = first_continuation["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("first continuation turn ID");
+    let second_continuation = serde_json::from_slice::<serde_json::Value>(&requests[5])?;
+    for (request, parent_turn_id) in [
+        (&first_continuation, intervening_turn_id),
+        (&second_continuation, first_continuation_turn_id),
+    ] {
+        responses::assert_root_turn(request, Some(original_turn.turn.id.as_str()))?;
+        responses::assert_parent_turn(request, Some(parent_turn_id))?;
+    }
+    let edited_turn_id = second_continuation["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("second continuation turn ID");
+
+    let reopened_request = serde_json::from_slice::<serde_json::Value>(&requests[6])?;
+    assert_eq!(
+        reopened_request["client_metadata"]["turn_id"].as_str(),
+        Some(edited_turn_id)
+    );
+    responses::assert_root_turn(&reopened_request, Some(original_turn.turn.id.as_str()))?;
+    let continuation_request = serde_json::from_slice::<serde_json::Value>(&requests[7])?;
+    let continuation_turn_id = continuation_request["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("independent continuation turn ID");
+    assert_ne!(continuation_turn_id, edited_turn_id);
+    responses::assert_root_turn(&continuation_request, Some(continuation_turn_id))?;
+    responses::assert_parent_turn(&continuation_request, /*expected*/ None)?;
+
+    server.shutdown().await;
+    Ok(())
+}
+
+fn ungated_goal_response(body: String) -> Vec<StreamingSseChunk> {
+    vec![StreamingSseChunk { gate: None, body }]
+}
+
+#[tokio::test]
+async fn thread_goal_lifecycle_and_clear_deletes_goal() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(vec![
         responses::sse(vec![
             responses::ev_response_created("materialize-thread"),
@@ -2758,14 +3818,10 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
     .await;
     let dex_home = TempDir::new()?;
     mock_responses_config(&server.uri())
+        .enable_feature(Feature::Goals)
         .with_root_config(&format!(r#"chatgpt_base_url = "{}""#, server.uri()))
         .write(dex_home.path())?;
-    let config_path = dex_home.path().join("config.toml");
-    let config = std::fs::read_to_string(&config_path)?;
-    std::fs::write(
-        &config_path,
-        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
-    )?;
+    mount_analytics_capture(&server, dex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
@@ -2822,6 +3878,33 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
     )
     .await??;
 
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock should record response requests");
+    let response_requests = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .collect::<Vec<_>>();
+    assert_eq!(response_requests.len(), 2);
+    let metadata_header = response_requests[1]
+        .headers
+        .get("x-dex-turn-metadata")
+        .expect("goal continuation should include turn metadata")
+        .to_str()?;
+    let metadata: serde_json::Value = serde_json::from_str(metadata_header)?;
+    assert_eq!(metadata["turn_trigger"].as_str(), Some("goal"));
+
+    let requests = server.received_requests().await.expect("wiremock requests");
+    let goal_request = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .nth(1)
+        .expect("externally created goal continuation request");
+    let goal_request_body = goal_request.body_json::<serde_json::Value>()?;
+
+    responses::assert_parent_turn(&goal_request_body, /*expected*/ None)?;
+
     let clear_id = mcp
         .send_raw_request(
             "thread/goal/clear",
@@ -2860,8 +3943,9 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
             })),
         )
         .await?;
-    let _clear_again: ThreadGoalClearResponse =
+    let clear_again: ThreadGoalClearResponse =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(clear_again_id)).await??;
+    assert!(!clear_again.cleared);
 
     Ok(())
 }
@@ -2935,7 +4019,9 @@ async fn cold_paginated_resume_restores_usage_without_loading_turns() -> Result<
     append_rollout_item_to_path(
         &path,
         &RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_attribution: None,
             turn_id: canonical_turn_id.to_string(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -2953,6 +4039,7 @@ async fn cold_paginated_resume_restores_usage_without_loading_turns() -> Result<
                     total_tokens: 150,
                     ..Default::default()
                 },
+                last_usage_includes_reasoning: None,
                 last_token_usage: TokenUsage {
                     input_tokens: 70,
                     output_tokens: 20,
@@ -3006,6 +4093,38 @@ async fn cold_paginated_resume_restores_usage_without_loading_turns() -> Result<
         timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(turns_id)).await??;
     assert_eq!(notification.turn_id, turns.data[0].id);
 
+    let id = app_server
+        .send_raw_request(
+            "thread/fork",
+            Some(json!({"threadId": notification.thread_id, "attachToSource": true})),
+        )
+        .await?;
+    let child: ThreadForkResponse = app_server.read_response(id).await?;
+    app_server.shutdown_gracefully().await?;
+
+    let mut app_server = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .build_initialized()
+        .await?;
+    for (method, params) in [
+        ("thread/resume", json!({"threadId": child.thread.id})),
+        ("thread/resume", json!({"threadId": child.thread.id})),
+        ("thread/fork", json!({"threadId": child.thread.id})),
+    ] {
+        let id = app_server.send_raw_request(method, Some(params)).await?;
+        let _: serde_json::Value = app_server.read_response(id).await?;
+    }
+    app_server
+        .read_stream_until_notification_message("thread/started")
+        .await?;
+    assert!(
+        app_server
+            .pending_notification_methods()
+            .iter()
+            .all(|method| method != "thread/tokenUsage/updated"),
+        "an empty attached thread must not replay its parent's usage"
+    );
+
     Ok(())
 }
 
@@ -3032,6 +4151,7 @@ async fn cold_paginated_resume_omits_usage_when_its_turn_is_ambiguous() -> Resul
                     total_tokens: 150,
                     ..Default::default()
                 },
+                last_usage_includes_reasoning: None,
                 last_token_usage: TokenUsage {
                     total_tokens: 90,
                     ..Default::default()
@@ -3046,7 +4166,9 @@ async fn cold_paginated_resume_omits_usage_when_its_turn_is_ambiguous() -> Resul
     append_rollout_item_to_path(
         &path,
         &RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_attribution: None,
             turn_id: interrupted_turn_id.to_string(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -3188,7 +4310,9 @@ async fn thread_resume_token_usage_replay_ignores_stale_interrupted_tail_turn() 
             "timestamp": meta_rfc3339,
             "type": "event_msg",
             "payload": serde_json::to_value(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_attribution: None,
                 turn_id: stale_turn_id.to_string(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3204,6 +4328,7 @@ async fn thread_resume_token_usage_replay_ignores_stale_interrupted_tail_turn() 
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }))?,
         })
         .to_string(),
@@ -3275,7 +4400,9 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
             "timestamp": meta_rfc3339,
             "type": "event_msg",
             "payload": serde_json::to_value(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_attribution: None,
                 turn_id: interrupted_turn_id.to_string(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3291,6 +4418,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }))?,
         })
         .to_string(),
@@ -3308,6 +4436,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
                         total_tokens: 230,
                         dex_rollout_budget_units: None,
                     },
+                    last_usage_includes_reasoning: None,
                     last_token_usage: TokenUsage {
                         input_tokens: 90,
                         cached_input_tokens: 30,
@@ -3327,9 +4456,11 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
             "timestamp": meta_rfc3339,
             "type": "event_msg",
             "payload": serde_json::to_value(EventMsg::TurnAborted(TurnAbortedEvent {
+                root_turn_id: None,
                 turn_id: Some(interrupted_turn_id.to_string()),
                 started_at: None,
                 reason: TurnAbortReason::Interrupted,
+                error: None,
                 completed_at: None,
                 duration_ms: None,
             }))?,
@@ -3448,12 +4579,17 @@ async fn thread_resume_prefers_persisted_git_metadata_for_local_threads() -> Res
     let rollout_dir = rollout_path.parent().expect("rollout parent directory");
     std::fs::create_dir_all(rollout_dir)?;
     let session_meta = SessionMeta {
+        attached_thread: false,
+        creator_user_id: None,
+        creator_account_id: None,
         session_id: conversation_id.into(),
         id: conversation_id,
         forked_from_id: None,
+        forked_from_ordinal_exclusive: None,
         parent_thread_id: None,
         timestamp: "2025-01-05T12:00:00Z".to_string(),
         cwd: repo_path.clone(),
+        runtime_workspace_roots: None,
         originator: "dex".to_string(),
         cli_version: "0.0.0".to_string(),
         source: RolloutSessionSource::Cli,
@@ -3526,6 +4662,7 @@ async fn thread_resume_prefers_persisted_git_metadata_for_local_threads() -> Res
         .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
             thread_id: thread_id.clone(),
             project_id: None,
+            daybreak_enabled: None,
             git_info: Some(ThreadMetadataGitInfoUpdateParams {
                 sha: None,
                 branch: Some(Some("feature/pr-branch".to_string())),
@@ -3584,7 +4721,9 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
             "timestamp": meta_rfc3339,
             "type": "event_msg",
             "payload": serde_json::to_value(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_attribution: None,
                 turn_id: turn_id.to_string(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3600,6 +4739,7 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }))?,
         })
         .to_string(),
@@ -3666,7 +4806,7 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
 }
 
 #[tokio::test]
-async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
+async fn thread_resume_checkpoints_settings_without_advancing_recency() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
     let rollout = setup_rollout_fixture(dex_home.path(), &server.uri()).await?;
@@ -3697,12 +4837,16 @@ async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
     let ThreadResumeResponse { thread, .. } =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
 
-    assert_eq!(thread.updated_at, before_resume.updated_at);
     assert_eq!(thread.recency_at, before_resume.recency_at);
     assert_eq!(thread.status, ThreadStatus::Idle);
 
-    let after_modified = std::fs::metadata(&rollout.rollout_file_path)?.modified()?;
-    assert_eq!(after_modified, rollout.before_modified);
+    let expected_thread_id = ThreadId::from_string(&thread_id)?;
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout.rollout_file_path).await?;
+    assert!(items.iter().any(|item| matches!(
+        item,
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+            if event.thread_id == Some(expected_thread_id)
+    )));
 
     let unsubscribe_id = mcp
         .send_thread_unsubscribe_request(ThreadUnsubscribeParams {
@@ -3765,9 +4909,6 @@ async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
-
-    let after_turn_modified = std::fs::metadata(&rollout.rollout_file_path)?.modified()?;
-    assert!(after_turn_modified > rollout.before_modified);
 
     Ok(())
 }
@@ -3943,6 +5084,8 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread_id.clone(),
             history: Some(vec![ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -4153,14 +5296,24 @@ async fn thread_resume_rejoins_running_paginated_thread_with_initial_page() -> R
                 responses::ev_completed("resp-1"),
             ]),
         }],
-        vec![StreamingSseChunk {
-            gate: Some(running_turn_gate),
-            body: responses::sse(vec![
-                responses::ev_response_created("resp-2"),
-                responses::ev_assistant_message("msg-2", "Done"),
-                responses::ev_completed("resp-2"),
-            ]),
-        }],
+        vec![
+            StreamingSseChunk {
+                gate: None,
+                body: responses::sse(vec![
+                    responses::ev_response_created("resp-2"),
+                    responses::ev_message_item_added("progress", ""),
+                    responses::ev_assistant_message("progress", "Checking"),
+                    responses::ev_message_item_added("msg-2", ""),
+                ]),
+            },
+            StreamingSseChunk {
+                gate: Some(running_turn_gate),
+                body: responses::sse(vec![
+                    responses::ev_assistant_message("msg-2", "Done"),
+                    responses::ev_completed("resp-2"),
+                ]),
+            },
+        ],
     ])
     .await;
     let dex_home = TempDir::new()?;
@@ -4224,6 +5377,20 @@ async fn thread_resume_rejoins_running_paginated_thread_with_initial_page() -> R
         primary.read_stream_until_notification_message("turn/started"),
     )
     .await??;
+    // Starting the gated reply means the prompt and the progress message have completed.
+    let mut message_starts = HashMap::new();
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let started: ItemStartedNotification =
+                primary.read_notification("item/started").await?;
+            assert_eq!(started.turn_id, running_turn.id);
+            if started.item.id() == "msg-2" {
+                return Ok::<(), anyhow::Error>(());
+            }
+            message_starts.insert(started.item.id().to_owned(), started.started_at_ms);
+        }
+    })
+    .await??;
 
     let resume_id = primary
         .send_thread_resume_request(ThreadResumeParams {
@@ -4276,6 +5443,13 @@ async fn thread_resume_rejoins_running_paginated_thread_with_initial_page() -> R
         primary.read_response(metadata_resume_id),
     )
     .await??;
+    assert_eq!(metadata_resume.thread.id, thread.id);
+    assert_eq!(
+        metadata_resume.thread.status,
+        ThreadStatus::Active {
+            active_flags: Vec::new()
+        }
+    );
     assert!(metadata_resume.thread.turns.is_empty());
     assert!(metadata_resume.initial_turns_page.is_none());
     assert!(
@@ -4287,6 +5461,53 @@ async fn thread_resume_rejoins_running_paginated_thread_with_initial_page() -> R
         .is_err(),
         "hot paginated resume should wait for a real token usage update"
     );
+
+    for (exclude_turns, items_view) in [
+        (true, None),
+        (true, Some(TurnItemsView::Full)),
+        (false, Some(TurnItemsView::Summary)),
+    ] {
+        let resume_id = primary
+            .send_thread_resume_request(ThreadResumeParams {
+                thread_id: thread.id.clone(),
+                exclude_turns,
+                initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
+                    limit: Some(1),
+                    sort_direction: Some(SortDirection::Desc),
+                    items_view,
+                }),
+                ..Default::default()
+            })
+            .await?;
+        let resumed: ThreadResumeResponse =
+            timeout(DEFAULT_READ_TIMEOUT, primary.read_response(resume_id)).await??;
+        let page = resumed.initial_turns_page.expect("initial turns page");
+        assert_eq!(page.data.len(), 1);
+        assert_eq!(page.data[0].id, running_turn.id);
+        assert_eq!(page.data[0].status, TurnStatus::InProgress);
+        assert_eq!(
+            page.data[0].items_view,
+            items_view.unwrap_or(TurnItemsView::Summary)
+        );
+        assert!(matches!(
+            page.data[0].items.as_slice(),
+            [dex_app_server_protocol::ThreadItem { payload: ThreadItemPayload::UserMessage { .. }, .. }, dex_app_server_protocol::ThreadItem { payload: ThreadItemPayload::AgentMessage { text, .. }, .. }] if text == "Checking"
+        ));
+        assert_eq!(
+            page.data[0]
+                .items
+                .iter()
+                .filter_map(|item| Some((item.id().to_owned(), item.started_at_ms?)))
+                .collect::<std::collections::HashMap<_, _>>(),
+            message_starts
+        );
+        if !exclude_turns {
+            let full_turn = resumed.thread.turns.last().expect("full active turn");
+            assert_eq!(full_turn.id, running_turn.id);
+            assert_eq!(full_turn.items_view, TurnItemsView::Full);
+            assert!(!full_turn.items.is_empty());
+        }
+    }
 
     let asc_resume_id = primary
         .send_thread_resume_request(ThreadResumeParams {
@@ -4628,14 +5849,14 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
                 .await?;
             let started: ItemStartedNotification =
                 serde_json::from_value(notification.params.clone().expect("item/started params"))?;
-            if let ThreadItem::FileChange { .. } = started.item {
-                return Ok::<ThreadItem, anyhow::Error>(started.item);
+            if let ThreadItemPayload::FileChange { .. } = started.item.payload {
+                return Ok::<ThreadItemPayload, anyhow::Error>(started.item.payload);
             }
         }
     })
     .await??;
     let expected_readme_path = workspace.join("README.md");
-    let expected_file_change = ThreadItem::FileChange {
+    let expected_file_change = ThreadItemPayload::FileChange {
         id: "patch-call".to_string(),
         changes: vec![dex_app_server_protocol::FileUpdateChange {
             path: expected_readme_path.to_string_lossy().into_owned(),
@@ -4725,7 +5946,7 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
 }
 
 #[tokio::test]
-async fn thread_resume_with_overrides_defers_updated_at_until_turn_start() -> Result<()> {
+async fn thread_resume_with_overrides_preserves_recency_and_checkpoints_model() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let dex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(dex_home.path())?;
@@ -4734,11 +5955,8 @@ async fn thread_resume_with_overrides_defers_updated_at_until_turn_start() -> Re
         mut mcp,
         thread_id,
         rollout_file_path,
-        updated_at,
+        recency_at,
     } = start_materialized_thread_and_restart(dex_home.path(), "materialize").await?;
-    let expected_updated_at_rfc3339 = "2025-01-07T00:00:00Z";
-    set_rollout_mtime(rollout_file_path.as_path(), expected_updated_at_rfc3339)?;
-    let before_modified = std::fs::metadata(&rollout_file_path)?.modified()?;
 
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
@@ -4752,11 +5970,19 @@ async fn thread_resume_with_overrides_defers_updated_at_until_turn_start() -> Re
         ..
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
 
-    assert_eq!(resumed_thread.updated_at, updated_at);
+    assert_eq!(resumed_thread.recency_at, recency_at);
     assert_eq!(resumed_thread.status, ThreadStatus::Idle);
-
-    let after_resume_modified = std::fs::metadata(&rollout_file_path)?.modified()?;
-    assert_eq!(after_resume_modified, before_modified);
+    let expected_thread_id = ThreadId::from_string(&resumed_thread.id)?;
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_file_path).await?;
+    let persisted_model = items.iter().rev().find_map(|item| match item {
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+            if event.thread_id == Some(expected_thread_id) =>
+        {
+            Some(event.thread_settings.model.as_str())
+        }
+        _ => None,
+    });
+    assert_eq!(persisted_model, Some("mock-model"));
 
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
@@ -4780,8 +6006,50 @@ async fn thread_resume_with_overrides_defers_updated_at_until_turn_start() -> Re
     )
     .await??;
 
-    let after_turn_modified = std::fs::metadata(&rollout_file_path)?.modified()?;
-    assert!(after_turn_modified > before_modified);
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_does_not_checkpoint_unchanged_settings() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let dex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(dex_home.path())?;
+
+    let RestartedThreadFixture {
+        mut mcp,
+        thread_id,
+        rollout_file_path,
+        ..
+    } = start_materialized_thread_and_restart(dex_home.path(), "materialize").await?;
+
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_file_path).await?;
+    let settings_before_resume = items
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some(event),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!settings_before_resume.is_empty());
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_file_path).await?;
+    let settings_after_resume = items
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some(event),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(settings_after_resume, settings_before_resume);
 
     Ok(())
 }
@@ -5005,6 +6273,8 @@ async fn thread_resume_supports_history_and_overrides() -> Result<()> {
 
     let history_text = "Hello from history";
     let history = vec![ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -5034,6 +6304,24 @@ async fn thread_resume_supports_history_and_overrides() -> Result<()> {
     assert_eq!(resumed.preview, history_text);
     assert_eq!(resumed.status, ThreadStatus::Idle);
 
+    mcp.start_turn_and_wait_for_completion(TurnStartParams {
+        thread_id: resumed.id,
+        input: vec![UserInput::Text {
+            text: "after supplied history".to_string(),
+            text_elements: Vec::new(),
+        }],
+        ..Default::default()
+    })
+    .await?;
+    let requests = responses::received_responses_requests(&server).await;
+    let body = requests.last().expect("resumed model request").body_json();
+    let metadata: serde_json::Value = serde_json::from_str(
+        body["client_metadata"]["x-dex-turn-metadata"]
+            .as_str()
+            .expect("turn metadata"),
+    )?;
+    assert_eq!(metadata["history_initialization"], "supplied_history");
+
     Ok(())
 }
 
@@ -5041,7 +6329,7 @@ struct RestartedThreadFixture {
     mcp: TestAppServer,
     thread_id: String,
     rollout_file_path: PathBuf,
-    updated_at: i64,
+    recency_at: Option<i64>,
 }
 
 async fn start_materialized_thread_and_restart(
@@ -5097,7 +6385,7 @@ async fn start_materialized_thread_and_restart(
     let rollout_file_path = thread
         .path
         .ok_or_else(|| anyhow::anyhow!("thread path missing from thread/start response"))?;
-    let updated_at = thread.updated_at;
+    let recency_at = thread.recency_at;
 
     drop(first_mcp);
 
@@ -5110,12 +6398,12 @@ async fn start_materialized_thread_and_restart(
         mcp: second_mcp,
         thread_id,
         rollout_file_path: rollout_file_path.to_path_buf(),
-        updated_at,
+        recency_at,
     })
 }
 
 #[tokio::test]
-async fn thread_resume_accepts_personality_override() -> Result<()> {
+async fn thread_resume_accepts_deprecated_personality_override() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -5141,7 +6429,7 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
 
     let start_id = primary
         .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("gpt-5.4".to_string()),
+            model: Some("exp-dex-personality".to_string()),
             ..Default::default()
         })
         .await?;
@@ -5179,7 +6467,7 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     let resume_id = secondary
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread.id,
-            model: Some("gpt-5.4".to_string()),
+            model: Some("exp-dex-personality".to_string()),
             personality: Some(Personality::Friendly),
             ..Default::default()
         })
@@ -5212,6 +6500,8 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     .await??;
 
     let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2, "expected initial and resumed turns");
+    let initial_instructions_text = requests[0].instructions_text();
     let request = requests
         .last()
         .expect("expected request for resumed thread turn");
@@ -5219,22 +6509,20 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     assert!(
         developer_texts
             .iter()
-            .any(|text| text.contains("<personality_spec>")),
-        "expected a personality update message in developer input, got {developer_texts:?}"
+            .all(|text| !text.contains("<personality_spec>")),
+        "deprecated personality override emitted a developer update: {developer_texts:?}"
     );
     let instructions_text = request.instructions_text();
-    assert!(
-        instructions_text.contains(DEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT),
-        "expected default base instructions from history, got {instructions_text:?}"
+    assert_eq!(
+        instructions_text, initial_instructions_text,
+        "resume should retain the original base instructions"
     );
 
     Ok(())
 }
 
 fn mock_responses_config(server_uri: &str) -> MockResponsesConfig {
-    MockResponsesConfig::new(server_uri)
-        .with_model("gpt-5.4")
-        .enable_feature(Feature::Personality)
+    MockResponsesConfig::new(server_uri).with_model("gpt-5.4")
 }
 
 #[allow(dead_code)]
@@ -5251,7 +6539,6 @@ fn set_rollout_mtime(path: &Path, updated_at_rfc3339: &str) -> Result<()> {
 struct RolloutFixture {
     conversation_id: String,
     rollout_file_path: PathBuf,
-    before_modified: std::time::SystemTime,
 }
 
 async fn setup_rollout_fixture(dex_home: &Path, server_uri: &str) -> Result<RolloutFixture> {
@@ -5273,13 +6560,232 @@ async fn setup_rollout_fixture(dex_home: &Path, server_uri: &str) -> Result<Roll
     let rollout_file_path = rollout_path(dex_home, filename_ts, &conversation_id);
     let mut session_meta = read_session_meta_line(&rollout_file_path).await?;
     session_meta.meta.multi_agent_version = Some(MultiAgentVersion::V1);
-    append_rollout_item_to_path(&rollout_file_path, &RolloutItem::SessionMeta(session_meta))
-        .await?;
+    append_rollout_item_to_path(
+        &rollout_file_path,
+        &RolloutItem::SessionMeta(Box::new(session_meta)),
+    )
+    .await?;
     set_rollout_mtime(rollout_file_path.as_path(), expected_updated_at_rfc3339)?;
-    let before_modified = std::fs::metadata(&rollout_file_path)?.modified()?;
     Ok(RolloutFixture {
         conversation_id,
         rollout_file_path,
-        before_modified,
     })
+}
+
+#[test_case::test_case(false, false; "missing_definition_config_override")]
+#[test_case::test_case(false, true; "missing_definition_typed_override")]
+#[test_case::test_case(true, false; "policy_conflict_config_override")]
+#[test_case::test_case(true, true; "policy_conflict_typed_override")]
+#[tokio::test]
+async fn thread_resume_returns_provider_error_even_with_provider_override(
+    policy_conflict: bool,
+    typed_override: bool,
+) -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(home.path())?;
+    let thread_id = create_fake_rollout(
+        home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved history",
+        Some("old_provider"),
+        /*git_info*/ None,
+    )?;
+    if policy_conflict {
+        let config_path = home.path().join("config.toml");
+        let config = std::fs::read_to_string(&config_path)?;
+        let server_uri = server.uri();
+        std::fs::write(
+            config_path,
+            format!(
+                "{config}\n[model_providers.old_provider]\nname = 'Original provider'\nbase_url = '{server_uri}/v1'\n"
+            ),
+        )?;
+        std::fs::write(
+            home.path().join("requirements.toml"),
+            "model_provider = 'mock_provider'",
+        )?;
+    }
+    let mut client = TestAppServer::builder()
+        .with_dex_home(home.path())
+        .build_initialized()
+        .await?;
+    let expected = if policy_conflict {
+        dex_app_server_protocol::ModelProviderError::ModelProviderPolicyConflict {
+            model_provider: "old_provider".into(),
+            required_model_provider: "mock_provider".into(),
+        }
+    } else {
+        dex_app_server_protocol::ModelProviderError::ModelProviderNotConfigured {
+            model_provider: "old_provider".into(),
+        }
+    };
+    // Model and reasoning overrides must not discard the provider being validated.
+    for mut params in [
+        ThreadResumeParams::default(),
+        ThreadResumeParams {
+            model: Some("gpt-5.1-dex".into()),
+            ..Default::default()
+        },
+        ThreadResumeParams {
+            config: Some(std::collections::HashMap::from([(
+                "model".into(),
+                json!("gpt-5.1-dex"),
+            )])),
+            ..Default::default()
+        },
+        ThreadResumeParams {
+            config: Some(std::collections::HashMap::from([(
+                "model_reasoning_effort".into(),
+                json!("high"),
+            )])),
+            ..Default::default()
+        },
+    ] {
+        params.thread_id = thread_id.clone();
+        let id = client.send_thread_resume_request(params).await?;
+        let error = client
+            .read_stream_until_error_message(RequestId::Integer(id))
+            .await?;
+        assert_eq!(
+            error.error,
+            JSONRPCErrorError {
+                code: -32600,
+                message: expected.to_string(),
+                data: Some(serde_json::to_value(&expected)?),
+            }
+        );
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("mock server should record received requests")
+            .iter()
+            .all(|request| !request.url.path().ends_with("/responses"))
+    );
+    // Failure leaves the history readable and does not create a live session with a new provider.
+    let id = client
+        .send_raw_request(
+            "thread/read",
+            Some(json!({"threadId": thread_id, "includeTurns": true})),
+        )
+        .await?;
+    let read: dex_app_server_protocol::ThreadReadResponse = client.read_response(id).await?;
+    assert_eq!(read.thread.model_provider, "old_provider");
+    // Provider overrides must not bypass admission for the saved provider.
+    let id = client
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            model: Some("gpt-5.1-dex".into()),
+            model_provider: typed_override.then(|| "mock_provider".into()),
+            config: (!typed_override).then(|| {
+                std::collections::HashMap::from([("model_provider".into(), json!("mock_provider"))])
+            }),
+            ..Default::default()
+        })
+        .await?;
+    let error = client
+        .read_stream_until_error_message(RequestId::Integer(id))
+        .await?;
+    assert_eq!(error.error.data, Some(serde_json::to_value(expected)?));
+    Ok(())
+}
+
+#[test_case::test_case(false; "missing_definition")]
+#[test_case::test_case(true; "provider_mismatch")]
+#[tokio::test]
+async fn thread_resume_recovers_after_provider_configuration_is_restored(
+    configured: bool,
+) -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(home.path())?;
+    let thread_id = create_fake_rollout(
+        home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved history",
+        Some("old_provider"),
+        /*git_info*/ None,
+    )?;
+    let config_path = home.path().join("config.toml");
+    if configured {
+        let config = std::fs::read_to_string(&config_path)?;
+        let server_uri = server.uri();
+        std::fs::write(
+            &config_path,
+            format!(
+                "{config}\n[model_providers.old_provider]\nname = 'Original provider'\nbase_url = '{server_uri}/v1'\n"
+            ),
+        )?;
+    }
+    let mut client = TestAppServer::builder()
+        .with_dex_home(home.path())
+        .build_initialized()
+        .await?;
+    let params = ThreadResumeParams {
+        thread_id,
+        ..Default::default()
+    };
+    let id = client.send_thread_resume_request(params.clone()).await?;
+    let error = client
+        .read_stream_until_error_message(RequestId::Integer(id))
+        .await?;
+    assert_eq!(
+        error
+            .error
+            .data
+            .as_ref()
+            .expect("provider error should include structured data")["type"],
+        if configured {
+            "modelProviderMismatch"
+        } else {
+            "modelProviderNotConfigured"
+        }
+    );
+    if configured {
+        for overrides in [
+            ThreadResumeParams {
+                model_provider: Some("mock_provider".into()),
+                ..params.clone()
+            },
+            ThreadResumeParams {
+                config: Some(std::collections::HashMap::from([(
+                    "model_provider".into(),
+                    json!("mock_provider"),
+                )])),
+                ..params.clone()
+            },
+        ] {
+            let id = client.send_thread_resume_request(overrides).await?;
+            let overridden = client
+                .read_stream_until_error_message(RequestId::Integer(id))
+                .await?;
+            assert_eq!(overridden.error, error.error);
+        }
+    }
+    let id = client
+        .send_raw_request(
+            "thread/read",
+            Some(json!({"threadId": params.thread_id, "includeTurns": true})),
+        )
+        .await?;
+    let read: dex_app_server_protocol::ThreadReadResponse = client.read_response(id).await?;
+    assert_eq!(read.thread.model_provider, "old_provider");
+    let config = std::fs::read_to_string(&config_path)?;
+    let restored = if configured {
+        config.replace(
+            "model_provider = \"mock_provider\"",
+            "model_provider = \"old_provider\"",
+        )
+    } else {
+        config.replace("mock_provider", "old_provider")
+    };
+    std::fs::write(config_path, restored)?;
+    let id = client.send_thread_resume_request(params).await?;
+    let resumed: ThreadResumeResponse = client.read_response(id).await?;
+    assert_eq!(resumed.model_provider, "old_provider");
+    Ok(())
 }

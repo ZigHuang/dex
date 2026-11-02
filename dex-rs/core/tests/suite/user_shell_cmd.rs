@@ -1,5 +1,6 @@
 use anyhow::Context;
 use core_test_support::PathBufExt;
+use core_test_support::PathExt;
 use core_test_support::assert_regex_match;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
@@ -11,7 +12,8 @@ use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::submit_thread_settings;
-use core_test_support::test_dex::local_selections;
+use core_test_support::test_dex::local;
+use core_test_support::test_dex::local_requests;
 use core_test_support::test_dex::test_dex;
 use core_test_support::test_dex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -32,6 +34,8 @@ use dex_protocol::protocol::ExecOutputStream;
 use dex_protocol::protocol::Op;
 use dex_protocol::protocol::ThreadSettingsOverrides;
 use dex_protocol::protocol::TurnAbortReason;
+use dex_protocol::protocol::TurnEnvironmentRequests;
+use dex_protocol::protocol::TurnEnvironmentSelection;
 use dex_protocol::user_input::UserInput;
 use pretty_assertions::assert_eq;
 use regex_lite::escape;
@@ -65,30 +69,38 @@ async fn user_shell_cmd_ls_and_cat_in_temp_dir() {
 
     // 1) shell command should list the file
     let list_cmd = "ls".to_string();
-    dex.submit(Op::RunUserShellCommand { command: list_cmd })
-        .await
-        .unwrap();
+    dex.submit(Op::RunUserShellCommand {
+        command: list_cmd,
+        timeout_ms: None,
+    })
+    .await
+    .unwrap();
     let msg = wait_for_event(&dex, |ev| matches!(ev, EventMsg::ExecCommandEnd(_))).await;
     let EventMsg::ExecCommandEnd(ExecCommandEndEvent {
-        stdout, exit_code, ..
+        aggregated_output,
+        exit_code,
+        ..
     }) = msg
     else {
         unreachable!()
     };
     assert_eq!(exit_code, 0);
     assert!(
-        stdout.contains(file_name),
-        "ls output should include {file_name}, got: {stdout:?}"
+        aggregated_output.contains(file_name),
+        "ls output should include {file_name}, got: {aggregated_output:?}"
     );
 
     // 2) shell command should print the file contents verbatim
     let cat_cmd = format!("cat {file_name}");
-    dex.submit(Op::RunUserShellCommand { command: cat_cmd })
-        .await
-        .unwrap();
+    dex.submit(Op::RunUserShellCommand {
+        command: cat_cmd,
+        timeout_ms: None,
+    })
+    .await
+    .unwrap();
     let msg = wait_for_event(&dex, |ev| matches!(ev, EventMsg::ExecCommandEnd(_))).await;
     let EventMsg::ExecCommandEnd(ExecCommandEndEvent {
-        mut stdout,
+        mut aggregated_output,
         exit_code,
         ..
     }) = msg
@@ -98,9 +110,9 @@ async fn user_shell_cmd_ls_and_cat_in_temp_dir() {
     assert_eq!(exit_code, 0);
     if cfg!(windows) {
         // Windows shells emit CRLF line endings; normalize so the assertion remains portable.
-        stdout = stdout.replace("\r\n", "\n");
+        aggregated_output = aggregated_output.replace("\r\n", "\n");
     }
-    assert_eq!(stdout, contents);
+    assert_eq!(aggregated_output, contents);
 }
 
 #[tokio::test]
@@ -111,7 +123,7 @@ async fn user_shell_command_without_local_environment_emits_error() -> anyhow::R
     submit_thread_settings(
         &test.dex,
         ThreadSettingsOverrides {
-            environments: Some(dex_protocol::protocol::TurnEnvironmentSelections::new(
+            environments: Some(dex_protocol::protocol::TurnEnvironmentRequests::new(
                 test.config.cwd.clone(),
                 vec![],
             )),
@@ -123,6 +135,7 @@ async fn user_shell_command_without_local_environment_emits_error() -> anyhow::R
     test.dex
         .submit(Op::RunUserShellCommand {
             command: "echo shell".to_string(),
+            timeout_ms: None,
         })
         .await?;
 
@@ -148,18 +161,18 @@ async fn user_shell_cmd_can_be_interrupted() {
         .expect("create new conversation");
     let dex = &fixture.dex;
 
-    // Start a long-running command and then interrupt it.
-    let sleep_cmd = "sleep 5".to_string();
-    dex.submit(Op::RunUserShellCommand { command: sleep_cmd })
-        .await
-        .unwrap();
+    // Start a long-running command and then interrupt it before its deadline.
+    dex.submit(Op::RunUserShellCommand {
+        command: slow_user_shell_command().to_string(),
+        timeout_ms: Some(28_800_000),
+    })
+    .await
+    .unwrap();
 
-    // Wait until it has started (ExecCommandBegin), then interrupt.
-    let _begin = wait_for_event_match(dex, |ev| match ev {
-        EventMsg::ExecCommandBegin(event) if event.source == ExecCommandSource::UserShell => {
-            Some(event.clone())
-        }
-        _ => None,
+    // Output proves that the process was spawned before cancellation.
+    wait_for_event(dex, |event| {
+        matches!(event, EventMsg::ExecCommandOutputDelta(delta)
+            if String::from_utf8_lossy(&delta.chunk).contains("shell-timeout-ready"))
     })
     .await;
     dex.submit(Op::Interrupt).await.unwrap();
@@ -175,6 +188,93 @@ async fn user_shell_cmd_can_be_interrupted() {
         unreachable!()
     };
     assert_eq!(ev.reason, TurnAbortReason::Interrupted);
+}
+
+#[tokio::test]
+async fn user_shell_command_honors_default_and_extended_deadlines() -> anyhow::Result<()> {
+    for (timeout_ms, expected_ms) in [(None, 3_600_000), (Some(28_800_000), 28_800_000)] {
+        let server = start_mock_server().await;
+        // Honor the CI executor while retaining the local environment used by user shell commands.
+        let mut builder = test_dex();
+        let fixture = builder.build_with_remote_and_local_env(&server).await?;
+        // The remote cwd need not exist on the host, and may use a different path convention.
+        let local_cwd = fixture.cwd_path().abs();
+        let mut environments = vec![local(local_cwd.clone())];
+        if fixture.executor_environment().environment().is_remote() {
+            environments.insert(
+                /*index*/ 0,
+                fixture.executor_environment().selection().clone(),
+            );
+        }
+        submit_thread_settings(
+            &fixture.dex,
+            ThreadSettingsOverrides {
+                environments: Some(TurnEnvironmentRequests::new(
+                    local_cwd,
+                    environments
+                        .into_iter()
+                        .map(TurnEnvironmentSelection::into_request)
+                        .collect(),
+                )),
+                ..Default::default()
+            },
+        )
+        .await?;
+        fixture
+            .dex
+            .submit(Op::RunUserShellCommand {
+                command: slow_user_shell_command().to_string(),
+                timeout_ms,
+            })
+            .await?;
+        wait_for_event(&fixture.dex, |event| {
+            matches!(event, EventMsg::ExecCommandOutputDelta(delta)
+                if String::from_utf8_lossy(&delta.chunk).contains("shell-timeout-ready"))
+        })
+        .await;
+
+        let completed = async {
+            loop {
+                let event = fixture.dex.next_event().await.expect("read shell event");
+                if let EventMsg::ExecCommandEnd(end) = event.msg {
+                    break end;
+                }
+            }
+        };
+        tokio::pin!(completed);
+
+        // Leave time for shell startup, and let process I/O and reaping use real time.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_millis(expected_ms - 60_000)).await;
+        tokio::time::resume();
+        assert!(
+            timeout(Duration::from_millis(250), &mut completed)
+                .await
+                .is_err(),
+            "shell command expired before its {expected_ms} ms deadline"
+        );
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::resume();
+        let end = timeout(Duration::from_secs(10), &mut completed).await?;
+        assert_eq!(end.exit_code, -1);
+        assert!(end.aggregated_output.contains("Timeout"));
+        assert!(end.aggregated_output.contains("shell-timeout-ready"));
+        wait_for_event(&fixture.dex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+    }
+    Ok(())
+}
+
+fn slow_user_shell_command() -> &'static str {
+    match dex_core::shell::default_user_shell().name() {
+        "powershell" => "Write-Output shell-timeout-ready; Start-Sleep -Seconds 60",
+        "cmd" => "echo shell-timeout-ready & ping -n 61 127.0.0.1 > nul",
+        _ => "printf 'shell-timeout-ready\\n'; exec sleep 60",
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -218,7 +318,7 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd)),
+                environments: Some(local_requests(cwd)),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -253,6 +353,7 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
         .dex
         .submit(Op::RunUserShellCommand {
             command: user_shell_command,
+            timeout_ms: None,
         })
         .await?;
 
@@ -318,6 +419,7 @@ async fn user_shell_command_history_is_persisted_and_shared_with_model() -> anyh
     test.dex
         .submit(Op::RunUserShellCommand {
             command: command.clone(),
+            timeout_ms: None,
         })
         .await?;
 
@@ -351,7 +453,7 @@ async fn user_shell_command_history_is_persisted_and_shared_with_model() -> anyh
     })
     .await;
     assert_eq!(end_event.exit_code, 0);
-    assert_eq!(end_event.stdout.trim(), "not-set");
+    assert_eq!(end_event.aggregated_output.trim(), "not-set");
 
     let _ = wait_for_event(&test.dex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -401,12 +503,16 @@ async fn user_shell_command_does_not_set_network_sandbox_env_var() -> anyhow::Re
     #[cfg(not(windows))]
     let command = r#"sh -c "printf '%s' \"${DEX_SANDBOX_NETWORK_DISABLED:-not-set}\"""#.to_string();
 
-    test.dex.submit(Op::RunUserShellCommand { command }).await?;
+    test.dex
+        .submit(Op::RunUserShellCommand {
+            command,
+            timeout_ms: None,
+        })
+        .await?;
 
     let ExecCommandEndEvent {
         exit_code,
-        stdout,
-        stderr,
+        aggregated_output,
         ..
     } = wait_for_event_match(&test.dex, |ev| match ev {
         EventMsg::ExecCommandEnd(event) => Some(event.clone()),
@@ -416,9 +522,9 @@ async fn user_shell_command_does_not_set_network_sandbox_env_var() -> anyhow::Re
 
     assert_eq!(
         exit_code, 0,
-        "shell command should execute successfully. stdout=`{stdout}`, stderr=`{stderr}`",
+        "shell command should execute successfully. output=`{aggregated_output}`",
     );
-    assert_eq!(stdout.trim(), "not-set");
+    assert_eq!(aggregated_output.trim(), "not-set");
 
     Ok(())
 }
@@ -443,6 +549,7 @@ async fn user_shell_command_output_is_truncated_in_history() -> anyhow::Result<(
     test.dex
         .submit(Op::RunUserShellCommand {
             command: command.clone(),
+            timeout_ms: None,
         })
         .await?;
 

@@ -24,6 +24,7 @@ use core_test_support::submit_thread_settings;
 use core_test_support::test_dex::local;
 use core_test_support::test_dex::test_dex;
 use core_test_support::wait_for_event;
+use dex_config::test_support::CloudConfigBundleFixture;
 use dex_core::StartThreadOptions;
 use dex_core::TurnInputRequest;
 use dex_core::config::Constrained;
@@ -44,10 +45,13 @@ use dex_protocol::protocol::AskForApproval;
 use dex_protocol::protocol::EventMsg;
 use dex_protocol::protocol::ThreadSettingsOverrides;
 use dex_protocol::user_input::UserInput;
+use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use test_case::test_case;
 use wiremock::ResponseTemplate;
+
+use super::direct_tool_metadata::tool_call_metadata;
 
 fn tool_names(body: &Value) -> Vec<String> {
     body.get("tools")
@@ -79,6 +83,7 @@ async fn strict_tool_collisions_fail_the_turn_before_sampling(
     let server = start_mock_server().await;
     let mut builder = test_dex().with_config(move |config| {
         config.tool_registry.error_on_tool_collisions = true;
+        config.update_plan_enabled = true;
         if pre_compact {
             config.model_auto_compact_token_limit = Some(0);
         }
@@ -121,20 +126,27 @@ async fn strict_tool_collisions_fail_the_turn_before_sampling(
             defer_loading: false,
         })]
     };
-    let thread = test
+    let dex_core::NewThread {
+        thread_id, thread, ..
+    } = test
         .thread_manager
         .start_thread(StartThreadOptions {
             dynamic_tools,
             ..StartThreadOptions::new(test.config.clone())
         })
-        .await?
-        .thread;
+        .await?;
 
     thread
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "use the planning tool".to_string(),
-            text_elements: Vec::new(),
-        }]))
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "use the planning tool".to_string(),
+                text_elements: Vec::new(),
+            }])
+            .on_start(dex_core::TurnStartOptions {
+                root_turn_id: Some("root-turn".into()),
+                ..Default::default()
+            }),
+        )
         .await?;
 
     let EventMsg::Error(error) =
@@ -155,6 +167,24 @@ async fn strict_tool_collisions_fail_the_turn_before_sampling(
         unreachable!("event predicate guarantees turn completion");
     };
     assert_eq!(completed.error, Some(error));
+    thread.flush_rollout().await?;
+    let history = test
+        .thread_store
+        .load_latest_model_context(dex_thread_store::LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await?;
+    let attribution = history.items.iter().find_map(|item| match item {
+        dex_history::RolloutItem::EventMsg(EventMsg::TurnStarted(event))
+            if event.turn_id == completed.turn_id =>
+        {
+            event.root_turn_id.as_deref()
+        }
+        _ => None,
+    });
+    assert_eq!(attribution, Some("root-turn"));
+
     assert!(
         server
             .received_requests()
@@ -215,7 +245,7 @@ async fn strict_tool_collisions_do_not_duplicate_unrelated_compaction_errors() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_turn_environments_omits_environment_backed_tools() -> Result<()> {
+async fn empty_turn_environments_keeps_environment_backed_tools() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -230,6 +260,7 @@ async fn empty_turn_environments_omits_environment_backed_tools() -> Result<()> 
     .await;
 
     let mut builder = test_dex().with_config(|config| {
+        config.update_plan_enabled = true;
         config
             .features
             .enable(Feature::UnifiedExec)
@@ -247,8 +278,8 @@ async fn empty_turn_environments_omits_environment_backed_tools() -> Result<()> 
     );
     for environment_tool in ["exec_command", "write_stdin", "apply_patch", "view_image"] {
         assert!(
-            !tools.contains(&environment_tool.to_string()),
-            "{environment_tool} should be omitted for explicit empty turn environments; got {tools:?}"
+            tools.contains(&environment_tool.to_string()),
+            "{environment_tool} should remain available for explicit empty turn environments; got {tools:?}"
         );
     }
 
@@ -427,6 +458,7 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
                         "name": format!("{namespace}__{tool_name}"),
                         "arguments": input,
                     }],
+                    "tool_calls_complete": true,
                 },
             }),
         )
@@ -463,26 +495,22 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
     .await?;
     let escaped_request = escaped_mock.single_request();
     assert_eq!(
-        escaped_request.custom_tool_call_output(call_id)["internal_chat_message_metadata_passthrough"]
-            ["executed_tool_calls"],
-        json!([{
-            "name": format!("{namespace}__{tool_name}"),
-            "arguments": input,
-        }]),
+        tool_call_metadata(escaped_request.custom_tool_call_output(call_id)),
+        json!({
+            "executed_tool_calls": [{
+                "name": format!("{namespace}__{tool_name}"),
+                "arguments": input,
+            }],
+            "tool_calls_complete": true,
+        }),
     );
     let expected_escaped_calls = json!([{
         "name": format!("{namespace}__{tool_name}"),
-        "arguments": {
-            "_dex_executed_tool_call_truncated": {
-                "original_bytes": serde_json::to_vec(&escaped_input)?.len(),
-                "max_bytes": 8 * 1024,
-            },
-        },
+        "arguments": escaped_input,
     }]);
     assert_eq!(
-        escaped_request.custom_tool_call_output(escaped_call_id)["internal_chat_message_metadata_passthrough"]
-            ["executed_tool_calls"],
-        expected_escaped_calls,
+        tool_call_metadata(escaped_request.custom_tool_call_output(escaped_call_id)),
+        json!({"executed_tool_calls": expected_escaped_calls, "tool_calls_complete": true}),
     );
 
     let direct_exec_call_id = "custom-direct-exec";
@@ -513,17 +541,12 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
 
     let direct_exec_request = direct_exec_mock.single_request();
     assert_eq!(
-        direct_exec_request.custom_tool_call_output(call_id)["internal_chat_message_metadata_passthrough"]
-            ["executed_tool_calls"],
-        json!([{
-            "name": format!("{namespace}__{tool_name}"),
-            "arguments": input,
-        }]),
+        tool_call_metadata(direct_exec_request.custom_tool_call_output(call_id)),
+        tool_call_metadata(escaped_request.custom_tool_call_output(call_id)),
     );
     assert_eq!(
-        direct_exec_request.custom_tool_call_output(escaped_call_id)["internal_chat_message_metadata_passthrough"]
-            ["executed_tool_calls"],
-        expected_escaped_calls,
+        tool_call_metadata(direct_exec_request.custom_tool_call_output(escaped_call_id)),
+        tool_call_metadata(escaped_request.custom_tool_call_output(escaped_call_id)),
     );
     let direct_exec_output = direct_exec_request.custom_tool_call_output(direct_exec_call_id);
     assert_eq!(
@@ -531,11 +554,14 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
         json!("unsupported custom tool call: exec"),
     );
     assert_eq!(
-        direct_exec_output["internal_chat_message_metadata_passthrough"]["executed_tool_calls"],
-        json!([{
-            "name": dex_code_mode::PUBLIC_TOOL_NAME,
-            "arguments": input,
-        }]),
+        tool_call_metadata(direct_exec_output),
+        json!({
+            "executed_tool_calls": [{
+                "name": dex_code_mode::PUBLIC_TOOL_NAME,
+                "arguments": input,
+            }],
+            "tool_calls_complete": true,
+        }),
     );
 
     Ok(())
@@ -834,7 +860,7 @@ async fn exec_command_enforces_glob_deny_read_policy() -> Result<()> {
 #[derive(Clone, Copy, Debug)]
 enum CommandToolAvailability {
     Default,
-    LegacyUnifiedExecDisabled,
+    ManagedUnifiedExecDisabled,
     ShellToolDisabled,
     ModelDisabled,
 }
@@ -851,12 +877,15 @@ async fn collect_tools(availability: CommandToolAvailability) -> Result<Vec<Stri
 
     let mut builder = match availability {
         CommandToolAvailability::Default => test_dex(),
-        CommandToolAvailability::LegacyUnifiedExecDisabled => test_dex().with_config(|config| {
-            config
-                .features
-                .disable(Feature::UnifiedExec)
-                .expect("test config should allow feature update");
-        }),
+        CommandToolAvailability::ManagedUnifiedExecDisabled => test_dex().with_cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                r#"
+[features]
+unified_exec = false
+shell_tool = true
+"#,
+            ),
+        ),
         CommandToolAvailability::ShellToolDisabled => test_dex().with_config(|config| {
             config
                 .features
@@ -899,10 +928,7 @@ async fn unified_exec_spec_toggle_end_to_end() -> Result<()> {
         }
     }
 
-    for availability in [
-        CommandToolAvailability::Default,
-        CommandToolAvailability::LegacyUnifiedExecDisabled,
-    ] {
+    for availability in [CommandToolAvailability::Default] {
         let tools = collect_tools(availability).await?;
         for command_tool in ["exec_command", "write_stdin"] {
             assert!(
@@ -911,6 +937,16 @@ async fn unified_exec_spec_toggle_end_to_end() -> Result<()> {
             );
         }
     }
+
+    let tools = collect_tools(CommandToolAvailability::ManagedUnifiedExecDisabled).await?;
+    assert!(
+        tools.iter().any(|name| name == "exec_command"),
+        "managed unified-exec disable should keep one-shot command execution: {tools:?}"
+    );
+    assert!(
+        !tools.iter().any(|name| name == "write_stdin"),
+        "managed unified-exec disable must not expose retained process authority: {tools:?}"
+    );
 
     Ok(())
 }

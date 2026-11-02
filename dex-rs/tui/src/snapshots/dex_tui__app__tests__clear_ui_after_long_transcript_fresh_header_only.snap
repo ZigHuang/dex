@@ -1,10 +1,8 @@
 ---
 source: tui/src/app/tests.rs
+assertion_line: 5874
 expression: rendered
 ---
-╭─────────────────────────────────────────────╮
-│ >_ Dex (v<VERSION>)                         │
-│                                             │
-│ model:     gpt-test high   /model to change │
-│ directory: /tmp/project                     │
-╰─────────────────────────────────────────────╯
+
+  >_ Dex (v<VERSION>)
+     /tmp/project

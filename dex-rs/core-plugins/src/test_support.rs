@@ -19,14 +19,15 @@ use dex_exec_server::LOCAL_FS;
 use dex_http_client::ClientRouteClass;
 use dex_http_client::HttpClientFactory;
 use dex_http_client::OutboundProxyPolicy;
+use dex_http_client::RequestBuilder;
 use dex_http_client::RouteAwareClientPool;
-use dex_http_client::RouteAwareRequestBuilder;
 use dex_login::AuthHeaders;
 use dex_login::AuthManager;
 use dex_login::DexAuth;
 use dex_login::ExternalAuth;
 use dex_login::ExternalAuthFuture;
 use dex_login::ExternalAuthRefreshContext;
+use dex_login::auth::BedrockAccessKeysAuth;
 use dex_login::auth::BedrockApiKeyAuth;
 use dex_login::test_support::auth_manager_from_optional_auth;
 use dex_protocol::auth::AuthMode;
@@ -41,6 +42,7 @@ use dex_skills::SkillRootLoadRequest;
 use dex_skills::SkillRootLoader;
 use dex_skills::parse_skill_frontmatter_metadata;
 use dex_utils_absolute_path::AbsolutePathBuf;
+use dex_utils_path_uri::PathUri;
 use dex_utils_plugins::PluginSkillRoot;
 use dex_utils_plugins::SkillDiscoveryMode;
 use dex_utils_plugins::migrated_command_skills_root;
@@ -49,6 +51,18 @@ use toml::Value;
 
 pub(crate) const TEST_CURATED_PLUGIN_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 pub(crate) const TEST_CURATED_PLUGIN_CACHE_VERSION: &str = "01234567";
+
+#[cfg(windows)]
+/// Model redirected directories without requiring Windows symlink privileges.
+pub(crate) fn create_directory_junction(target: &Path, alias: &Path) {
+    let output = dex_utils_process::background_command("cmd")
+        .args(["/D", "/C", "mklink", "/J"])
+        .arg(alias)
+        .arg(target)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "mklink /J failed: {output:?}");
+}
 
 pub(crate) fn test_plugins_manager(dex_home: PathBuf) -> PluginsManager {
     PluginsManager::new(
@@ -117,6 +131,11 @@ fn test_dex_auth(auth_mode: Option<AuthMode>) -> Option<DexAuth> {
         AuthMode::BedrockApiKey => DexAuth::BedrockApiKey(BedrockApiKeyAuth {
             api_key: "test-api-key".to_string(),
             region: "us-east-1".to_string(),
+        }),
+        AuthMode::BedrockAccessKeys => DexAuth::BedrockAccessKeys(BedrockAccessKeysAuth {
+            access_key_id: "test-access-key-id".to_string(),
+            secret_access_key: "test-secret-access-key".to_string(),
+            session_token: None,
         }),
         AuthMode::AgentIdentity | AuthMode::PersonalAccessToken => {
             panic!("test auth mode requires a purpose-built DexAuth")
@@ -195,9 +214,17 @@ impl SkillRootLoader<PluginSkillRoot> for TestSkillRootLoader {
                 outcome.errors.extend(snapshot.errors);
             }
             outcome.skills.sort_by(|left, right| {
-                left.name
-                    .cmp(&right.name)
-                    .then_with(|| left.path_to_skills_md.cmp(&right.path_to_skills_md))
+                left.name.cmp(&right.name).then_with(|| {
+                    left.path_to_skills_md
+                        .to_abs_path()
+                        .expect("host test skill path")
+                        .cmp(
+                            &right
+                                .path_to_skills_md
+                                .to_abs_path()
+                                .expect("host test skill path"),
+                        )
+                })
             });
             outcome
         })
@@ -255,7 +282,10 @@ fn load_test_skill_root(root: &PluginSkillRoot) -> LoadedSkillRoot {
                 });
             match parsed {
                 Ok(parsed) => {
-                    discovery_paths.insert(canonical_path.clone(), path);
+                    discovery_paths.insert(
+                        PathUri::from_abs_path(&canonical_path),
+                        PathUri::from_abs_path(&path),
+                    );
                     skills.push(SkillMetadata {
                         name: format!("{}:{}", root.plugin_namespace, parsed.name),
                         description: parsed.description,
@@ -263,7 +293,7 @@ fn load_test_skill_root(root: &PluginSkillRoot) -> LoadedSkillRoot {
                         interface: None,
                         dependencies: None,
                         policy: None,
-                        path_to_skills_md: canonical_path,
+                        path_to_skills_md: PathUri::from_abs_path(&canonical_path),
                         scope: SkillScope::User,
                         plugin_id: Some(root.plugin_identity.plugin_id.clone()),
                         remote_plugin_id: root.plugin_identity.remote_plugin_id.clone(),
@@ -314,7 +344,7 @@ impl RecordingHttpClientSelector {
 }
 
 impl HttpClientSelector for RecordingHttpClientSelector {
-    fn request(&self, method: Method, url: &str) -> RouteAwareRequestBuilder {
+    fn request(&self, method: Method, url: &str) -> RequestBuilder {
         match self.selected_urls.lock() {
             Ok(mut selected_urls) => selected_urls.push(url.to_string()),
             Err(error) => panic!("selected URL recorder lock should not be poisoned: {error}"),
@@ -333,6 +363,7 @@ pub(crate) fn recording_remote_plugin_service_config(
     (
         RemotePluginServiceConfig {
             chatgpt_base_url,
+            product_sku: crate::remote::DEX_PRODUCT_SKU.to_string(),
             http_clients,
         },
         selected_urls,
@@ -482,6 +513,11 @@ pub(crate) async fn load_plugins_config(dex_home: &Path, cwd: &Path) -> PluginsC
         .to_string();
     PluginsConfigInput::new(
         config_layer_stack,
+        effective_config
+            .clone()
+            .try_into::<dex_config::config_toml::ConfigToml>()
+            .unwrap()
+            .plugins,
         model_provider_id,
         feature_enabled(&effective_config, "plugins", /*default_enabled*/ true),
         feature_enabled(
@@ -491,6 +527,7 @@ pub(crate) async fn load_plugins_config(dex_home: &Path, cwd: &Path) -> PluginsC
         ),
         "https://chatgpt.com/backend-api/".to_string(),
         test_http_client_factory(),
+        /*product_sku*/ None,
     )
 }
 

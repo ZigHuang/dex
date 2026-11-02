@@ -2,12 +2,12 @@
 source: tui/src/bottom_pane/list_selection_view.rs
 expression: "render_lines_with_width(&view, 80)"
 ---
-                                                                                
   Select Model and Effort                                                       
                                                                                 
-› 1. gpt-5.1-dex (current)  Optimized for Dex. Balance of reasoning         
-                              quality and coding ability.                       
-  2. gpt-5.1-dex-mini       Optimized for Dex. Cheaper, faster, but less    
-                              capable.                                          
-  3. gpt-4.1-dex            Legacy model. Use when you need compatibility     
-                              with older automations.
+                                                                                
+› 1. gpt-5.1-dex (current)  Optimized for Dex. Balance of reasoning quality and 
+                            coding ability.                                     
+  2. gpt-5.1-dex-mini       Optimized for Dex. Cheaper, faster, but less        
+                            capable.                                            
+  3. gpt-4.1-dex            Legacy model. Use when you need compatibility with  
+                            older automations.

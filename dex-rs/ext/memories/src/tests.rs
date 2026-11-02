@@ -7,10 +7,12 @@ use dex_extension_api::ExtensionRegistryBuilder;
 use dex_extension_api::NoopTurnItemEmitter;
 use dex_extension_api::PromptSlot;
 use dex_extension_api::ToolCall;
+use dex_extension_api::ToolCallSource;
 use dex_extension_api::ToolContributor;
 use dex_extension_api::ToolExecutor;
 use dex_extension_api::ToolName;
 use dex_extension_api::ToolPayload;
+use dex_protocol::models::ContentItem;
 use dex_tools::ToolOutput;
 use dex_utils_absolute_path::test_support::PathBufExt;
 use dex_utils_absolute_path::test_support::PathExt;
@@ -59,6 +61,7 @@ fn tools_are_not_contributed_when_disabled() {
     let extension = MemoriesExtension::default();
     let thread_store = ExtensionData::new("thread");
     thread_store.insert(MemoriesExtensionConfig {
+        version: dex_protocol::MemoryVersion::V1,
         enabled: false,
         dedicated_tools: true,
         dex_home: test_path_buf("/tmp/dex-home").abs(),
@@ -76,6 +79,7 @@ fn tools_are_not_contributed_when_dedicated_tools_disabled() {
     let extension = MemoriesExtension::default();
     let thread_store = ExtensionData::new("thread");
     thread_store.insert(MemoriesExtensionConfig {
+        version: dex_protocol::MemoryVersion::V1,
         enabled: true,
         dedicated_tools: false,
         dex_home: test_path_buf("/tmp/dex-home").abs(),
@@ -93,6 +97,7 @@ fn tools_are_contributed_when_enabled_with_dedicated_tools() {
     let extension = MemoriesExtension::default();
     let thread_store = ExtensionData::new("thread");
     thread_store.insert(MemoriesExtensionConfig {
+        version: dex_protocol::MemoryVersion::V1,
         enabled: true,
         dedicated_tools: true,
         dex_home: test_path_buf("/tmp/dex-home").abs(),
@@ -122,6 +127,7 @@ fn install_registers_dedicated_tool_contributor() {
     let registry = builder.build();
     let thread_store = ExtensionData::new("thread");
     thread_store.insert(MemoriesExtensionConfig {
+        version: dex_protocol::MemoryVersion::V1,
         enabled: true,
         dedicated_tools: true,
         dex_home: test_path_buf("/tmp/dex-home").abs(),
@@ -182,6 +188,7 @@ async fn prompt_contribution_uses_memory_summary_when_enabled() {
     let extension = MemoriesExtension::default();
     let thread_store = ExtensionData::new("thread");
     thread_store.insert(MemoriesExtensionConfig {
+        version: dex_protocol::MemoryVersion::V1,
         enabled: true,
         dedicated_tools: false,
         dex_home: tempdir.path().abs(),
@@ -193,11 +200,11 @@ async fn prompt_contribution_uses_memory_summary_when_enabled() {
 
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].slot(), PromptSlot::DeveloperPolicy);
-    assert!(
-        fragments[0]
-            .text()
-            .contains("Remember repository-specific implementation preferences.")
-    );
+    assert!(matches!(
+        fragments[0].content(),
+        ContentItem::InputText { text }
+            if text.contains("Remember repository-specific implementation preferences.")
+    ));
 }
 
 #[tokio::test]
@@ -221,8 +228,11 @@ async fn add_ad_hoc_note_tool_creates_note_file() {
             model: "gpt-test".to_string(),
             dex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
             conversation_history: dex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            attachment_store: dex_core::passthrough_image_store(),
+            ephemeral: false,
             environments: Vec::new(),
             payload: payload.clone(),
         })
@@ -266,8 +276,11 @@ async fn add_ad_hoc_note_tool_rejects_paths_as_filenames() {
             model: "gpt-test".to_string(),
             dex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
             conversation_history: dex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            attachment_store: dex_core::passthrough_image_store(),
+            ephemeral: false,
             environments: Vec::new(),
             payload,
         })
@@ -312,8 +325,11 @@ async fn read_tool_reads_memory_file() {
             model: "gpt-test".to_string(),
             dex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
             conversation_history: dex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            attachment_store: dex_core::passthrough_image_store(),
+            ephemeral: false,
             environments: Vec::new(),
             payload: payload.clone(),
         })
@@ -428,8 +444,11 @@ async fn search_tool_accepts_multiple_queries() {
             model: "gpt-test".to_string(),
             dex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
             conversation_history: dex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            attachment_store: dex_core::passthrough_image_store(),
+            ephemeral: false,
             environments: Vec::new(),
             payload: payload.clone(),
         })
@@ -503,8 +522,11 @@ async fn search_tool_accepts_windowed_all_match_mode() {
             model: "gpt-test".to_string(),
             dex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
             conversation_history: dex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            attachment_store: dex_core::passthrough_image_store(),
+            ephemeral: false,
             environments: Vec::new(),
             payload: payload.clone(),
         })
@@ -558,8 +580,11 @@ async fn search_tool_rejects_legacy_single_query() {
             model: "gpt-test".to_string(),
             dex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
             conversation_history: dex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            attachment_store: dex_core::passthrough_image_store(),
+            ephemeral: false,
             environments: Vec::new(),
             payload,
         })
@@ -573,7 +598,10 @@ async fn search_tool_rejects_legacy_single_query() {
     assert!(err.to_string().contains("query"));
 }
 
-fn memory_tool(memory_root: &Path, tool_name: &str) -> Arc<dyn ToolExecutor<ToolCall>> {
+fn memory_tool(
+    memory_root: &Path,
+    tool_name: &str,
+) -> Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>> {
     let expected_tool_name = memory_tool_name(tool_name);
     crate::tools::memory_tools(
         LocalMemoriesBackend::from_memory_root(memory_root),

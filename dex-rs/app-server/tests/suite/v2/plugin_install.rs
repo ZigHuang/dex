@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicUsize;
@@ -8,6 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 use anyhow::bail;
 use app_test_support::ChatGptAuthFixture;
+use app_test_support::DEFAULT_CLIENT_NAME;
 use app_test_support::TestAppServer;
 use app_test_support::start_analytics_events_server;
 use app_test_support::write_chatgpt_auth;
@@ -27,12 +29,21 @@ use dex_app_server_protocol::AppsListParams;
 use dex_app_server_protocol::AppsListResponse;
 use dex_app_server_protocol::ListMcpServerStatusParams;
 use dex_app_server_protocol::ListMcpServerStatusResponse;
+use dex_app_server_protocol::McpServerOauthLoginCompletedNotification;
+use dex_app_server_protocol::McpServerOauthLoginResponse;
+use dex_app_server_protocol::McpServerToolCallParams;
+use dex_app_server_protocol::McpServerToolCallResponse;
 use dex_app_server_protocol::PluginAuthPolicy;
 use dex_app_server_protocol::PluginAvailability;
 use dex_app_server_protocol::PluginInstallParams;
 use dex_app_server_protocol::PluginInstallResponse;
 use dex_app_server_protocol::RequestId;
+use dex_app_server_protocol::ThreadStartParams;
+use dex_app_server_protocol::ThreadStartResponse;
 use dex_config::types::AuthCredentialsStoreMode;
+use dex_http_client::HttpClientBuilder;
+use dex_rmcp_client::McpOAuthCallbackMode;
+use dex_rmcp_client::resolve_mcp_oauth_callback_url;
 use dex_utils_absolute_path::AbsolutePathBuf;
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -42,7 +53,7 @@ use rmcp::model::JsonObject;
 use rmcp::model::ListToolsResult;
 use rmcp::model::MetaObject;
 use rmcp::model::ServerCapabilities;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::model::Tool;
 use rmcp::model::ToolAnnotations;
 use rmcp::transport::StreamableHttpServerConfig;
@@ -50,10 +61,12 @@ use rmcp::transport::StreamableHttpService;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use serde_json::json;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::io::AsyncBufReadExt;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use url::Url;
 use wiremock::Match;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -574,6 +587,22 @@ async fn plugin_install_tracks_analytics_when_remote_detail_fetch_fails() -> Res
     assert_eq!(err.error.code, -32600);
     assert!(err.error.message.contains("failed with status 404"));
 
+    let payload = wait_for_plugin_analytics_payload(&server, "dex_plugin_install_failed").await?;
+    let event_params = &payload["events"][0]["event_params"];
+    assert_eq!(
+        payload["events"][0]["event_type"],
+        "dex_plugin_install_failed"
+    );
+    assert_eq!(event_params["plugin_id"], json!(null));
+    assert_eq!(event_params["remote_plugin_id"], REMOTE_PLUGIN_ID);
+    assert_eq!(event_params["plugin_name"], json!(null));
+    assert_eq!(event_params["marketplace_name"], json!(null));
+    assert_eq!(event_params["source"], "manual");
+    assert_eq!(
+        event_params["error_type"],
+        "remote_catalog_unexpected_status"
+    );
+    assert_eq!(event_params["sub_error_type"], "http_404");
     Ok(())
 }
 
@@ -630,7 +659,21 @@ async fn plugin_install_tracks_analytics_when_remote_install_is_rate_limited() -
         /*expected_count*/ 1,
     )
     .await?;
-
+    let payload = wait_for_plugin_analytics_payload(&server, "dex_plugin_install_failed").await?;
+    let event_params = &payload["events"][0]["event_params"];
+    assert_eq!(
+        payload["events"][0]["event_type"],
+        "dex_plugin_install_failed"
+    );
+    assert_eq!(event_params["plugin_id"], "linear@openai-curated-remote");
+    assert_eq!(event_params["remote_plugin_id"], REMOTE_PLUGIN_ID);
+    assert_eq!(event_params["marketplace_name"], "openai-curated-remote");
+    assert_eq!(event_params["source"], "manual");
+    assert_eq!(
+        event_params["error_type"],
+        "remote_catalog_unexpected_status"
+    );
+    assert_eq!(event_params["sub_error_type"], "http_429");
     Ok(())
 }
 
@@ -691,7 +734,16 @@ async fn plugin_install_rejects_remote_plugin_disabled_by_admin_before_download(
             .join("plugins/cache/openai-curated-remote/linear")
             .exists()
     );
-
+    let payload = wait_for_plugin_analytics_payload(&server, "dex_plugin_install_failed").await?;
+    let event_params = &payload["events"][0]["event_params"];
+    assert_eq!(
+        payload["events"][0]["event_type"],
+        "dex_plugin_install_failed"
+    );
+    assert_eq!(event_params["plugin_id"], "linear@openai-curated-remote");
+    assert_eq!(event_params["remote_plugin_id"], REMOTE_PLUGIN_ID);
+    assert_eq!(event_params["error_type"], "remote_plugin_not_available");
+    assert_eq!(event_params["sub_error_type"], "disabled_by_admin");
     Ok(())
 }
 
@@ -731,7 +783,19 @@ async fn plugin_install_rejects_remote_plugin_not_available() -> Result<()> {
         /*expected_count*/ 0,
     )
     .await?;
-
+    let payload = wait_for_plugin_analytics_payload(&server, "dex_plugin_install_failed").await?;
+    let event_params = &payload["events"][0]["event_params"];
+    assert_eq!(
+        payload["events"][0]["event_type"],
+        "dex_plugin_install_failed"
+    );
+    assert_eq!(event_params["plugin_id"], "linear@openai-curated-remote");
+    assert_eq!(event_params["remote_plugin_id"], REMOTE_PLUGIN_ID);
+    assert_eq!(event_params["error_type"], "remote_plugin_not_available");
+    assert_eq!(
+        event_params["sub_error_type"],
+        "install_policy_not_available"
+    );
     Ok(())
 }
 
@@ -808,6 +872,20 @@ async fn plugin_install_tracks_analytics_when_marketplace_file_cannot_be_read() 
             .contains("failed to read marketplace file")
     );
 
+    let payload =
+        wait_for_plugin_analytics_payload(&analytics_server, "dex_plugin_install_failed").await?;
+    let event_params = &payload["events"][0]["event_params"];
+    assert_eq!(
+        payload["events"][0]["event_type"],
+        "dex_plugin_install_failed"
+    );
+    assert_eq!(event_params["plugin_id"], json!(null));
+    assert_eq!(event_params["remote_plugin_id"], json!(null));
+    assert_eq!(event_params["error_type"], "marketplace_io");
+    assert_eq!(
+        event_params["sub_error_type"],
+        "failed_to_read_marketplace_file"
+    );
     Ok(())
 }
 
@@ -949,6 +1027,26 @@ async fn plugin_install_tracks_analytics_event() -> Result<()> {
         timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(response.apps_needing_auth, Vec::<AppSummary>::new());
 
+    let payload =
+        wait_for_plugin_analytics_payload(&analytics_server, "dex_plugin_installed").await?;
+    assert_eq!(
+        payload,
+        json!({
+            "events": [{
+                "event_type": "dex_plugin_installed",
+                "event_params": {
+                    "plugin_id": "sample-plugin@debug",
+                    "remote_plugin_id": null,
+                    "plugin_name": "sample-plugin",
+                    "marketplace_name": "debug",
+                    "has_skills": false,
+                    "mcp_server_count": 0,
+                    "connector_ids": [],
+                    "product_client_id": DEFAULT_CLIENT_NAME,
+                }
+            }]
+        })
+    );
     Ok(())
 }
 
@@ -998,6 +1096,23 @@ async fn plugin_install_failure_tracks_analytics_event() -> Result<()> {
     .await??;
     assert_eq!(err.error.code, -32600);
 
+    let payload =
+        wait_for_plugin_analytics_payload(&analytics_server, "dex_plugin_install_failed").await?;
+    let event_params = &payload["events"][0]["event_params"];
+    assert_eq!(
+        payload["events"][0]["event_type"],
+        "dex_plugin_install_failed"
+    );
+    assert_eq!(event_params["plugin_id"], "sample-plugin@debug");
+    assert_eq!(event_params["remote_plugin_id"], json!(null));
+    assert_eq!(event_params["plugin_name"], "sample-plugin");
+    assert_eq!(event_params["marketplace_name"], "debug");
+    assert_eq!(event_params["has_skills"], json!(null));
+    assert_eq!(event_params["mcp_server_count"], json!(null));
+    assert_eq!(event_params["connector_ids"], json!(null));
+    assert_eq!(event_params["product_client_id"], DEFAULT_CLIENT_NAME);
+    assert_eq!(event_params["source"], "manual");
+    assert_eq!(event_params["error_type"], "store_invalid");
     Ok(())
 }
 
@@ -1039,6 +1154,25 @@ async fn plugin_install_tracks_remote_plugin_analytics_event() -> Result<()> {
         json!({"install_attempt_id": INSTALL_ATTEMPT_ID})
     );
 
+    let payload = wait_for_plugin_analytics_payload(&server, "dex_plugin_installed").await?;
+    assert_eq!(
+        payload,
+        json!({
+            "events": [{
+                "event_type": "dex_plugin_installed",
+                "event_params": {
+                    "plugin_id": "linear@openai-curated-remote",
+                    "remote_plugin_id": REMOTE_PLUGIN_ID,
+                    "plugin_name": "linear",
+                    "marketplace_name": "openai-curated-remote",
+                    "has_skills": true,
+                    "mcp_server_count": 0,
+                    "connector_ids": [],
+                    "product_client_id": DEFAULT_CLIENT_NAME,
+                }
+            }]
+        })
+    );
     Ok(())
 }
 
@@ -1049,6 +1183,7 @@ async fn plugin_install_preserves_status_when_remote_bundle_error_body_is_too_la
     let server = MockServer::start().await;
     let bundle_url =
         mount_remote_plugin_bundle(&server, /*status_code*/ 503, vec![b'x'; 8 * 1024 + 1]).await;
+    let bundle_url = format!("{bundle_url}?sig=signed-token");
     configure_remote_plugin_test(dex_home.path(), &server)?;
     mount_remote_plugin_detail(&server, REMOTE_PLUGIN_ID, "1.2.3", Some(&bundle_url)).await;
     mount_empty_remote_installed_plugins(&server).await;
@@ -1084,6 +1219,7 @@ async fn plugin_install_preserves_status_when_remote_bundle_error_body_is_too_la
         8192
     );
     assert!(!err.error.message.contains("exceeded maximum size"));
+    assert!(!err.error.message.contains("signed-token"));
     wait_for_remote_plugin_request_count(
         &server,
         "GET",
@@ -1098,7 +1234,18 @@ async fn plugin_install_preserves_status_when_remote_bundle_error_body_is_too_la
         /*expected_count*/ 0,
     )
     .await?;
-
+    let payload = wait_for_plugin_analytics_payload(&server, "dex_plugin_install_failed").await?;
+    let event_params = &payload["events"][0]["event_params"];
+    assert_eq!(
+        payload["events"][0]["event_type"],
+        "dex_plugin_install_failed"
+    );
+    assert_eq!(event_params["plugin_id"], "linear@openai-curated-remote");
+    assert_eq!(event_params["remote_plugin_id"], REMOTE_PLUGIN_ID);
+    assert_eq!(event_params["marketplace_name"], "openai-curated-remote");
+    assert_eq!(event_params["source"], "manual");
+    assert_eq!(event_params["error_type"], "remote_bundle_download_status");
+    assert_eq!(event_params["sub_error_type"], "http_5xx");
     assert!(
         !dex_home
             .path()
@@ -1351,17 +1498,20 @@ url = "https://example.com/allowed-mcp"
 }
 
 #[tokio::test]
-async fn plugin_install_skips_mcp_oauth_disabled_by_plugin_config() -> Result<()> {
+async fn plugin_install_skips_mcp_oauth_for_disabled_server() -> Result<()> {
     let oauth_server = MockServer::start().await;
+    let mcp_settings = "enabled = false";
     let dex_home = TempDir::new()?;
     std::fs::write(
         dex_home.path().join("config.toml"),
-        r#"[features]
+        format!(
+            r#"[features]
 plugins = true
 
 [plugins."sample-plugin@debug".mcp_servers.sample-mcp]
-enabled = false
-"#,
+{mcp_settings}
+"#
+        ),
     )?;
 
     let repo_root = TempDir::new()?;
@@ -1408,10 +1558,8 @@ enabled = false
             .get("plugins")
             .and_then(|plugins| plugins.get("sample-plugin@debug"))
             .and_then(|plugin| plugin.get("mcp_servers"))
-            .and_then(|servers| servers.get("sample-mcp"))
-            .and_then(|server| server.get("enabled"))
-            .and_then(toml::Value::as_bool),
-        Some(false)
+            .and_then(|servers| servers.get("sample-mcp")),
+        Some(&toml::from_str::<toml::Value>(mcp_settings)?)
     );
     Ok(())
 }
@@ -1645,7 +1793,10 @@ async fn plugin_install_starts_mcp_oauth_through_configured_http_proxy() -> Resu
                 "sample-mcp": {
                     "type": "http",
                     "url": format!("{resource_url}/mcp"),
-                    "oauth": {"callbackPort": plugin_callback_port},
+                    "oauth": {
+                        "callbackPort": plugin_callback_port,
+                        "callbackUrl": "http://127.0.0.1/plugin/callback",
+                    },
                 }
             }
         }))?,
@@ -1702,12 +1853,211 @@ async fn plugin_install_starts_mcp_oauth_through_configured_http_proxy() -> Resu
         .as_str()
         .expect("OAuth client registration redirect URI")
         .parse()?;
+    let expected_redirect_uri: Uri =
+        format!("http://127.0.0.1:{plugin_callback_port}/plugin/callback/Jb0pRxZ4-luq").parse()?;
+    assert_eq!(redirect_uri, expected_redirect_uri);
+    Ok(())
+}
+
+#[test_case(false, false, false; "legacy provider falls back to default callback")]
+#[test_case(false, true, false; "legacy provider falls back to global callback")]
+#[test_case(true, true, false; "issuer bound provider preserves registered callback")]
+#[test_case(false, true, true; "legacy provider preserves server specific registered callback")]
+#[tokio::test]
+async fn plugin_oauth_login_preserves_registered_callbacks_or_uses_legacy_fallback(
+    issuer_supported: bool,
+    use_global_callback: bool,
+    callback_already_server_specific: bool,
+) -> Result<()> {
+    let oauth = MockServer::start().await;
+    let authorization_server = oauth.uri();
+    let server_url = format!("{authorization_server}/mcp");
+    let resource_metadata_url = format!("{authorization_server}/oauth-resource");
+    let challenge = format!("Bearer resource_metadata=\"{resource_metadata_url}\"");
+
+    let global_callback = use_global_callback.then_some("http://127.0.0.1/global/callback");
+    let legacy_callback = resolve_mcp_oauth_callback_url(
+        &server_url,
+        global_callback,
+        McpOAuthCallbackMode::CallbackSpecific,
+    )?;
+    let callback_id = legacy_callback
+        .rsplit('/')
+        .next()
+        .expect("legacy callback should contain the server-specific callback ID");
+    let registered_callback = if callback_already_server_specific {
+        format!("http://127.0.0.1/callback/registered/{callback_id}")
+    } else {
+        "http://127.0.0.1/callback/registered".to_string()
+    };
+
+    let dex_home = TempDir::new()?;
+    let global_callback_config = global_callback
+        .map(|callback| format!("mcp_oauth_callback_url = \"{callback}\"\n"))
+        .unwrap_or_default();
+    std::fs::write(
+        dex_home.path().join("config.toml"),
+        format!(
+            "mcp_oauth_credentials_store = \"file\"\n{global_callback_config}\n[features]\nplugins = true\n"
+        ),
+    )?;
+
+    let repo_root = TempDir::new()?;
+    write_plugin_marketplace(
+        repo_root.path(),
+        "debug",
+        "sample-plugin",
+        "./sample-plugin",
+        /*install_policy*/ None,
+        /*auth_policy*/ None,
+    )?;
+    write_plugin_source(repo_root.path(), "sample-plugin", &[])?;
+    std::fs::write(
+        repo_root.path().join("sample-plugin/.mcp.json"),
+        serde_json::to_vec_pretty(&json!({
+            "mcpServers": {
+                "sample-mcp": {
+                    "type": "http",
+                    "url": server_url,
+                    "oauth": {
+                        "clientId": "registered-client",
+                        "callbackUrl": registered_callback,
+                    },
+                }
+            }
+        }))?,
+    )?;
+    let marketplace_path =
+        AbsolutePathBuf::try_from(repo_root.path().join(".agents/plugins/marketplace.json"))?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+    let install_id = mcp
+        .send_plugin_install_request(PluginInstallParams {
+            marketplace_path: Some(marketplace_path),
+            remote_marketplace_name: None,
+            install_attempt_id: None,
+            plugin_name: "sample-plugin".to_string(),
+        })
+        .await?;
+    let _: PluginInstallResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(install_id)).await??;
+
+    // Install before exposing OAuth metadata so automatic plugin login cannot
+    // launch a platform browser; the explicit public login remains end-to-end.
+    Mock::given(method("GET"))
+        .and(path("/mcp"))
+        .respond_with(
+            ResponseTemplate::new(401).insert_header("WWW-Authenticate", challenge.as_str()),
+        )
+        .mount(&oauth)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/oauth-resource"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "resource": authorization_server,
+            "authorization_servers": [authorization_server],
+        })))
+        .mount(&oauth)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": authorization_server,
+            "authorization_endpoint": format!("{authorization_server}/oauth/authorize"),
+            "token_endpoint": format!("{authorization_server}/oauth/token"),
+            "registration_endpoint": format!("{authorization_server}/oauth/register"),
+            "response_types_supported": ["code"],
+            "code_challenge_methods_supported": ["S256"],
+            "authorization_response_iss_parameter_supported": issuer_supported,
+        })))
+        .mount(&oauth)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/register"))
+        .respond_with(ResponseTemplate::new(400))
+        .expect(0)
+        .mount(&oauth)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "registered-plugin-token",
+            "token_type": "Bearer",
+        })))
+        .expect(1)
+        .mount(&oauth)
+        .await;
+
+    let login_id = mcp
+        .send_raw_request(
+            "mcpServer/oauth/login",
+            Some(json!({
+                "name": "sample-mcp",
+                "scopes": ["read"],
+                "timeoutSecs": 10,
+            })),
+        )
+        .await?;
+    let response: McpServerOauthLoginResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(login_id)).await??;
+    let authorization_url = Url::parse(&response.authorization_url)?;
+    let query: BTreeMap<_, _> = authorization_url.query_pairs().into_owned().collect();
     assert_eq!(
-        redirect_uri
-            .authority()
-            .and_then(axum::http::uri::Authority::port_u16),
-        Some(plugin_callback_port)
+        query.get("client_id").map(String::as_str),
+        Some("registered-client")
     );
+
+    let mut callback_url = Url::parse(&query["redirect_uri"])?;
+    let expected_callback = if issuer_supported || callback_already_server_specific {
+        registered_callback.as_str()
+    } else {
+        legacy_callback.as_str()
+    };
+    assert_eq!(callback_url.path(), Url::parse(expected_callback)?.path());
+    callback_url
+        .query_pairs_mut()
+        .append_pair("code", "registered-plugin-code")
+        .append_pair("state", &query["state"]);
+    if issuer_supported {
+        callback_url
+            .query_pairs_mut()
+            .append_pair("iss", &authorization_server);
+    }
+    HttpClientBuilder::new()
+        .build_direct()?
+        .get(callback_url)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let completed: McpServerOauthLoginCompletedNotification = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_notification("mcpServer/oauthLogin/completed"),
+    )
+    .await??;
+    assert_eq!(
+        completed.login_id.as_deref(),
+        Some(
+            response
+                .login_id
+                .as_deref()
+                .expect("login response should contain an ID")
+        )
+    );
+    assert_eq!(
+        completed,
+        McpServerOauthLoginCompletedNotification {
+            name: "sample-mcp".to_string(),
+            thread_id: None,
+            login_id: response.login_id,
+            success: true,
+            error: None,
+        }
+    );
+    oauth.verify().await;
     Ok(())
 }
 
@@ -1762,8 +2112,17 @@ connectors = true
     Ok(())
 }
 
+#[test_case("", None, true; "legacy activation")]
+#[test_case("[plugins._default]\nenabled = false", None, false; "default disabled")]
+#[test_case("[plugins._default]\nenabled = false\n[plugins.\"linear@openai-curated-remote\"]\nenabled = true", None, true; "explicitly enabled overrides default")]
+#[test_case("", Some("[plugins._default]\nenabled = false"), false; "default disabled during install")]
+#[test_case("", Some("[plugins._default]\nenabled = \"invalid\""), false; "invalid policy during install skips auth")]
 #[tokio::test]
-async fn plugin_install_starts_remote_mcp_oauth_for_install_response_only_app() -> Result<()> {
+async fn plugin_install_remote_auth_setup_respects_activation_policy(
+    plugin_config: &str,
+    plugin_config_after_install: Option<&str>,
+    expected_auth: bool,
+) -> Result<()> {
     let dex_home = TempDir::new()?;
     let server = MockServer::start().await;
     let oauth_server = MockServer::start().await;
@@ -1774,9 +2133,36 @@ async fn plugin_install_starts_remote_mcp_oauth_for_install_response_only_app() 
     )
     .await;
     configure_remote_plugin_with_apps_test(dex_home.path(), &server)?;
+    let config_path = dex_home.path().join("config.toml");
+    let original_config = std::fs::read_to_string(&config_path)?;
+    let config_contents = format!("{original_config}\n{plugin_config}\n");
+    std::fs::write(&config_path, &config_contents)?;
     mount_remote_plugin_detail(&server, REMOTE_PLUGIN_ID, "1.2.3", Some(&bundle_url)).await;
     mount_empty_remote_installed_plugins(&server).await;
-    mount_remote_plugin_install_with_apps_needing_auth(&server, REMOTE_PLUGIN_ID, &["alpha"]).await;
+    let updated_config = plugin_config_after_install
+        .map(|plugin_config| format!("{original_config}\n{plugin_config}\n"));
+    let expected_config = updated_config.as_ref().unwrap_or(&config_contents).clone();
+    let install_config_path = config_path.clone();
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/backend-api/ps/plugins/{REMOTE_PLUGIN_ID}/install"
+        )))
+        .and(query_param("includeAppsNeedingAuth", "true"))
+        .and(header("authorization", "Bearer chatgpt-token"))
+        .and(header("chatgpt-account-id", "account-123"))
+        .respond_with(move |_request: &Request| {
+            if let Some(updated_config) = &updated_config {
+                std::fs::write(&install_config_path, updated_config)
+                    .expect("install responder should update config");
+            }
+            ResponseTemplate::new(/*s*/ 200).set_body_json(json!({
+                "id": REMOTE_PLUGIN_ID,
+                "enabled": true,
+                "app_ids_needing_auth": ["alpha"],
+            }))
+        })
+        .mount(&server)
+        .await;
 
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
@@ -1792,16 +2178,44 @@ async fn plugin_install_starts_remote_mcp_oauth_for_install_response_only_app() 
         response,
         PluginInstallResponse {
             auth_policy: PluginAuthPolicy::OnUse,
-            apps_needing_auth: vec![AppSummary {
-                id: "alpha".to_string(),
-                name: "alpha".to_string(),
-                description: None,
-                install_url: Some("https://chatgpt.com/apps/alpha/alpha".to_string()),
-                category: None,
-            }],
+            apps_needing_auth: if expected_auth {
+                vec![AppSummary {
+                    id: "alpha".to_string(),
+                    name: "alpha".to_string(),
+                    description: None,
+                    install_url: Some("https://chatgpt.com/apps/alpha/alpha".to_string()),
+                    category: None,
+                }]
+            } else {
+                Vec::new()
+            },
         }
     );
-    assert!(oauth_discovery_request_count(&oauth_server).await > 0);
+    if expected_auth {
+        assert!(oauth_discovery_request_count(&oauth_server).await > 0);
+    } else {
+        assert!(
+            oauth_server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty()
+        );
+    }
+    wait_for_remote_plugin_request_count(
+        &server,
+        "POST",
+        &format!("/ps/plugins/{REMOTE_PLUGIN_ID}/install"),
+        /*expected_count*/ 1,
+    )
+    .await?;
+    assert!(
+        dex_home
+            .path()
+            .join("plugins/cache/openai-curated-remote/linear/1.2.3/.dex-plugin/plugin.json")
+            .is_file()
+    );
+    assert_eq!(std::fs::read_to_string(config_path)?, expected_config);
     Ok(())
 }
 
@@ -1886,23 +2300,51 @@ async fn plugin_install_skips_remote_mcp_oauth_disabled_by_plugin_config() -> Re
     Ok(())
 }
 
+#[test_case(false; "legacy manifest")]
+#[test_case(true; "agent plugin manifest")]
 #[tokio::test]
-async fn plugin_install_skips_remote_mcp_oauth_for_bundled_same_name_app() -> Result<()> {
+async fn plugin_install_skips_remote_mcp_oauth_for_service_generated_app(
+    agent_plugin: bool,
+) -> Result<()> {
     let dex_home = TempDir::new()?;
     let server = MockServer::start().await;
     let oauth_server = MockServer::start().await;
+    let plugin_manifest = if agent_plugin {
+        json!({
+            "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+            "name": "linear",
+            "extensions": {"com.openai": {"apps": "./.app.json"}}
+        })
+    } else {
+        json!({"name": "linear"})
+    };
+    let mcp_config = json!({
+        "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+        "mcpServers": {"sample-mcp": {
+            "type": if agent_plugin { "streamable-http" } else { "http" },
+            "url": format!("{}/mcp", oauth_server.uri())
+        }}
+    });
+    let service_app_manifest = json!({"apps": {"sample-mcp": {"id": "alpha"}}});
     let bundle_url = mount_remote_plugin_bundle(
         &server,
         /*status_code*/ 200,
-        remote_plugin_bundle_tar_gz_bytes_with_app_and_mcp_config(
-            "linear",
-            r#"{"apps":{"sample-mcp":{"id":"alpha"}}}"#,
-            &oauth_server.uri(),
+        remote_plugin_bundle_tar_gz_bytes_with_entries(
+            &plugin_manifest.to_string(),
+            Some(r#"{"apps":{"bundled":{"id":"bundled-app"}}}"#),
+            Some(&mcp_config.to_string()),
         )?,
     )
     .await;
     configure_remote_plugin_with_apps_test(dex_home.path(), &server)?;
-    mount_remote_plugin_detail(&server, REMOTE_PLUGIN_ID, "1.2.3", Some(&bundle_url)).await;
+    mount_remote_plugin_detail_with_app_manifest(
+        &server,
+        REMOTE_PLUGIN_ID,
+        "1.2.3",
+        Some(&bundle_url),
+        service_app_manifest.clone(),
+    )
+    .await;
     mount_empty_remote_installed_plugins(&server).await;
     mount_remote_plugin_install_with_apps_needing_auth(&server, REMOTE_PLUGIN_ID, &["alpha"]).await;
 
@@ -1929,7 +2371,21 @@ async fn plugin_install_skips_remote_mcp_oauth_for_bundled_same_name_app() -> Re
             }],
         }
     );
-    assert_eq!(oauth_discovery_request_count(&oauth_server).await, 0);
+    assert_eq!(
+        oauth_server
+            .received_requests()
+            .await
+            .expect("recorded MCP endpoint requests")
+            .len(),
+        0
+    );
+    let installed_app_manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(
+            dex_home
+                .path()
+                .join("plugins/cache/openai-curated-remote/linear/1.2.3/.app.json"),
+        )?)?;
+    assert_eq!(installed_app_manifest, service_app_manifest);
     Ok(())
 }
 
@@ -2078,6 +2534,12 @@ async fn plugin_install_makes_bundled_mcp_servers_available_to_followup_requests
         .await?;
 
     let request_id = mcp
+        .send_thread_start_request(ThreadStartParams::default())
+        .await?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    let request_id = mcp
         .send_plugin_install_request(PluginInstallParams {
             marketplace_path: Some(marketplace_path),
             remote_marketplace_name: None,
@@ -2092,7 +2554,24 @@ async fn plugin_install_makes_bundled_mcp_servers_available_to_followup_requests
     assert!(!config.contains("[mcp_servers.sample-mcp]"));
 
     let request_id = mcp
+        .send_mcp_server_tool_call_request(McpServerToolCallParams {
+            thread_id: thread.id,
+            server: "sample-mcp".to_string(),
+            tool: "echo".to_string(),
+            arguments: Some(json!({ "message": "installed in the same thread" })),
+            meta: None,
+        })
+        .await?;
+    let response: McpServerToolCallResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert_eq!(
+        response.structured_content,
+        Some(json!({ "echo": "ECHOING: installed in the same thread", "env": null })),
+    );
+
+    let request_id = mcp
         .send_list_mcp_server_status_request(ListMcpServerStatusParams {
+            server_name: None,
             cursor: None,
             limit: None,
             detail: None,
@@ -2193,8 +2672,8 @@ struct PluginInstallMcpServer {
 }
 
 impl ServerHandler for PluginInstallMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     fn list_tools(
@@ -2384,7 +2863,73 @@ fn write_analytics_config(dex_home: &std::path::Path, base_url: &str) -> std::io
     )
 }
 
-async fn mount_backend_analytics_events(_server: &MockServer) {}
+async fn mount_backend_analytics_events(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/backend-api/dex/analytics-events/events"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"status":"ok"}"#))
+        .mount(server)
+        .await;
+}
+
+async fn wait_for_plugin_analytics_payload(
+    server: &MockServer,
+    event_type: &str,
+) -> Result<serde_json::Value> {
+    timeout(DEFAULT_TIMEOUT, async {
+        loop {
+            let Some(requests) = server.received_requests().await else {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            };
+            for request in requests.iter().filter(|request| {
+                request.method == "POST"
+                    && request.url.path().ends_with("/dex/analytics-events/events")
+            }) {
+                let mut payload: serde_json::Value = serde_json::from_slice(&request.body)
+                    .map_err(|err| anyhow::anyhow!("invalid analytics payload: {err}"))?;
+                let events = payload["events"]
+                    .as_array_mut()
+                    .ok_or_else(|| anyhow::anyhow!("analytics payload missing events array"))?;
+                events.retain(|event| event["event_type"] == event_type);
+                if !events.is_empty() {
+                    return Ok(payload);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn plugin_analytics_wait_ignores_unrelated_requests_and_batched_events() -> Result<()> {
+    let server = MockServer::start().await;
+    mount_backend_analytics_events(&server).await;
+    let client = HttpClientBuilder::new().build_direct()?;
+    let expected = json!({
+        "event_type": "dex_plugin_install_failed",
+        "event_params": {"plugin_id": "sample-plugin@debug"}
+    });
+    for events in [
+        json!([{"event_type": "dex_turn_event"}]),
+        json!([{"event_type": "dex_thread_initialized"}, expected.clone()]),
+    ] {
+        client
+            .post(format!(
+                "{}/backend-api/dex/analytics-events/events",
+                server.uri()
+            ))
+            .json(&json!({"events": events}))
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+    assert_eq!(
+        wait_for_plugin_analytics_payload(&server, "dex_plugin_install_failed").await?,
+        json!({"events": [expected]})
+    );
+    Ok(())
+}
 
 async fn oauth_discovery_request_count(server: &MockServer) -> usize {
     server
@@ -2895,29 +3440,6 @@ fn remote_plugin_bundle_tar_gz_bytes_with_mcp_config(
     )
 }
 
-fn remote_plugin_bundle_tar_gz_bytes_with_app_and_mcp_config(
-    plugin_name: &str,
-    app_manifest: &str,
-    mcp_base_url: &str,
-) -> Result<Vec<u8>> {
-    let manifest = format!(r#"{{"name":"{plugin_name}"}}"#);
-    let mcp_config = format!(
-        r#"{{
-  "mcpServers": {{
-    "sample-mcp": {{
-      "type": "http",
-      "url": "{mcp_base_url}/mcp"
-    }}
-  }}
-}}"#
-    );
-    remote_plugin_bundle_tar_gz_bytes_with_entries(
-        &manifest,
-        Some(app_manifest),
-        Some(mcp_config.as_str()),
-    )
-}
-
 fn remote_plugin_bundle_tar_gz_bytes_with_contents(
     plugin_manifest: &str,
     app_manifest: Option<&str>,
@@ -2934,6 +3456,10 @@ fn remote_plugin_bundle_tar_gz_bytes_with_entries(
     app_manifest: Option<&str>,
     mcp_config: Option<&str>,
 ) -> Result<Vec<u8>> {
+    let agent_plugin =
+        serde_json::from_str::<serde_json::Value>(plugin_manifest).is_ok_and(|manifest| {
+            manifest["$schema"] == "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+        });
     let skill = "---\nname: plan-work\ndescription: Track work in Linear.\n---\n\n# Plan Work\n";
     let encoder = GzEncoder::new(Vec::new(), Compression::default());
     let mut tar = tar::Builder::new(encoder);
@@ -2949,11 +3475,23 @@ fn remote_plugin_bundle_tar_gz_bytes_with_entries(
             /*mode*/ 0o644,
         ),
     ];
+    if agent_plugin {
+        entries.push((
+            "plugin.json",
+            plugin_manifest.as_bytes(),
+            /*mode*/ 0o644,
+        ));
+    }
     if let Some(app_manifest) = app_manifest {
         entries.push((".app.json", app_manifest.as_bytes(), /*mode*/ 0o644));
     }
     if let Some(mcp_config) = mcp_config {
-        entries.push((".mcp.json", mcp_config.as_bytes(), /*mode*/ 0o644));
+        let path = if agent_plugin {
+            "mcp.json"
+        } else {
+            ".mcp.json"
+        };
+        entries.push((path, mcp_config.as_bytes(), /*mode*/ 0o644));
     }
     for (path, contents, mode) in entries {
         let mut header = tar::Header::new_gnu();

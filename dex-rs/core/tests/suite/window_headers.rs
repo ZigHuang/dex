@@ -1,4 +1,3 @@
-use super::compact::COMPACT_WARNING_MESSAGE;
 use anyhow::Result;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
@@ -14,7 +13,6 @@ use dex_core::TurnInputRequest;
 use dex_core::compact::SUMMARIZATION_PROMPT;
 use dex_protocol::protocol::EventMsg;
 use dex_protocol::protocol::Op;
-use dex_protocol::protocol::WarningEvent;
 use dex_protocol::user_input::UserInput;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
@@ -67,12 +65,10 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
 
     let forked = resumed
         .thread_manager
-        .fork_thread(
+        .fork_legacy_thread(
             /*snapshot*/ 0usize,
-            resumed.config.clone(),
+            dex_core::StartThreadOptions::new(resumed.config.clone()),
             rollout_path,
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
         )
         .await?;
     submit_user_turn(&forked.thread, "after fork").await?;
@@ -129,6 +125,13 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
         metadata[2]["context_window_id"],
         metadata[3]["context_window_id"]
     );
+    assert_eq!(
+        metadata
+            .iter()
+            .map(|metadata| metadata["window_number"].as_u64())
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(0), Some(1), Some(1), Some(0)]
+    );
 
     Ok(())
 }
@@ -145,11 +148,6 @@ async fn submit_user_turn(dex: &Arc<DexThread>, text: &str) -> Result<()> {
 
 async fn submit_compact_turn(dex: &Arc<DexThread>) -> Result<()> {
     dex.submit(Op::Compact).await?;
-    let warning_event = wait_for_event(dex, |event| matches!(event, EventMsg::Warning(_))).await;
-    let EventMsg::Warning(WarningEvent { message }) = warning_event else {
-        panic!("expected warning event after compact");
-    };
-    assert_eq!(message, COMPACT_WARNING_MESSAGE);
     wait_for_event(dex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     Ok(())
 }

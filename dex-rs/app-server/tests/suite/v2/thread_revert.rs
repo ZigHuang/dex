@@ -5,6 +5,9 @@ use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_request_user_input_sse_response;
+use app_test_support::write_models_cache_with_models;
+use core_test_support::load_default_config_for_test;
+use core_test_support::responses;
 use dex_app_server_protocol::AskForApproval;
 use dex_app_server_protocol::ClientInfo;
 use dex_app_server_protocol::ClientRequest;
@@ -13,7 +16,10 @@ use dex_app_server_protocol::JSONRPCError;
 use dex_app_server_protocol::JSONRPCMessage;
 use dex_app_server_protocol::RequestId;
 use dex_app_server_protocol::SortDirection;
+use dex_app_server_protocol::ThreadForkParams;
+use dex_app_server_protocol::ThreadForkResponse;
 use dex_app_server_protocol::ThreadHistoryMode;
+use dex_app_server_protocol::ThreadItemsListCursor;
 use dex_app_server_protocol::ThreadItemsListParams;
 use dex_app_server_protocol::ThreadItemsListResponse;
 use dex_app_server_protocol::ThreadResumeParams;
@@ -30,21 +36,398 @@ use dex_app_server_protocol::TurnStartParams;
 use dex_app_server_protocol::TurnStartResponse;
 use dex_app_server_protocol::TurnStatus;
 use dex_app_server_protocol::UserInput;
+use dex_features::Feature;
 use dex_protocol::config_types::CollaborationMode;
 use dex_protocol::config_types::ModeKind;
+use dex_protocol::config_types::Personality;
 use dex_protocol::config_types::Settings;
 use dex_protocol::openai_models::ReasoningEffort;
+use dex_protocol::protocol::EventMsg;
+use dex_protocol::protocol::MultiAgentVersion;
+use dex_rollout::RolloutItem;
+use dex_rollout::read_session_meta_line;
+use dex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
+use serde_json::Value;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+#[test_case::test_case(None; "default_paginated")]
+#[test_case::test_case(Some(ThreadHistoryMode::Legacy); "explicit_legacy")]
 #[tokio::test]
-async fn thread_revert_replaces_paginated_history_before_turn() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
+async fn thread_revert_rejects_ephemeral_without_losing_context(
+    history_mode: Option<ThreadHistoryMode>,
+) -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Remembered answer").await;
     let dex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri()).write(dex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .build()
+        .await?;
+    initialize_experimental(&mut mcp).await?;
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            ephemeral: Some(true),
+            history_mode,
+            ..Default::default()
+        })
+        .await?;
+    let completed = mcp
+        .start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "Remember this task".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let request_id = mcp
+        .send_request(
+            "thread/revert",
+            Some(serde_json::to_value(ThreadRevertParams {
+                thread_id: thread.id.clone(),
+                before_turn_id: completed.turn.id,
+            })?),
+        )
+        .await?;
+    let error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_eq!(
+        error.error,
+        dex_app_server_protocol::JSONRPCErrorError {
+            code: -32600,
+            message: "ephemeral threads do not support thread/revert".to_string(),
+            data: None,
+        }
+    );
+    mcp.start_turn_and_wait_for_completion(TurnStartParams {
+        thread_id: thread.id,
+        input: vec![UserInput::Text {
+            text: "Continue".to_string(),
+            text_elements: Vec::new(),
+        }],
+        ..Default::default()
+    })
+    .await?;
+    let requests = server.received_requests().await.expect("response requests");
+    let followup = requests
+        .iter()
+        .rev()
+        .find(|request| request.url.path().ends_with("/responses"))
+        .expect("followup request")
+        .body_json::<Value>()?;
+    let input = followup["input"].as_array().expect("model input");
+    for (role, text) in [
+        ("user", "Remember this task"),
+        ("assistant", "Remembered answer"),
+    ] {
+        assert!(
+            input.iter().any(|item| item["role"] == role
+                && item["content"]
+                    .as_array()
+                    .is_some_and(|content| content.iter().any(|part| part["text"] == text))),
+            "missing prior {role} message from followup: {followup}"
+        );
+    }
+    Ok(())
+}
+
+#[test_case::test_case(false; "live_reload")]
+#[test_case::test_case(true; "cold_resume")]
+#[tokio::test]
+async fn thread_revert_preserves_model_selected_multi_agent_version(restart: bool) -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let dex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::MultiAgentV2)
+        .write(dex_home.path())?;
+    let config = load_default_config_for_test(&dex_home).await;
+    let mut model = dex_core::test_support::construct_model_info_offline("mock-model", &config);
+    model.multi_agent_version = Some(MultiAgentVersion::V2);
+    write_models_cache_with_models(dex_home.path(), vec![model]).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .build()
+        .await?;
+    initialize_experimental(&mut mcp).await?;
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            history_mode: Some(ThreadHistoryMode::Paginated),
+            ..Default::default()
+        })
+        .await?;
+    let completed = mcp
+        .start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "First message".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadRevertResponse = mcp
+        .request(|request_id| ClientRequest::ThreadRevert {
+            request_id,
+            params: ThreadRevertParams {
+                thread_id: thread.id.clone(),
+                before_turn_id: completed.turn.id,
+            },
+        })
+        .await?;
+    if restart {
+        // Restart before another turn can persist a replacement TurnContext.
+        mcp.shutdown_gracefully().await?;
+        mcp = TestAppServer::builder()
+            .with_dex_home(dex_home.path())
+            .build()
+            .await?;
+        initialize_experimental(&mut mcp).await?;
+        let _: ThreadResumeResponse = mcp
+            .request(|request_id| ClientRequest::ThreadResume {
+                request_id,
+                params: ThreadResumeParams {
+                    thread_id: thread.id.clone(),
+                    exclude_turns: true,
+                    ..Default::default()
+                },
+            })
+            .await?;
+    }
+    mcp.start_turn_and_wait_for_completion(TurnStartParams {
+        thread_id: thread.id,
+        input: vec![UserInput::Text {
+            text: "Edited first message".to_string(),
+            text_elements: Vec::new(),
+        }],
+        ..Default::default()
+    })
+    .await?;
+
+    let requests = server.received_requests().await.expect("response requests");
+    let mut multi_agent_namespaces = Vec::new();
+    for request in requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+    {
+        let body = request.body_json::<Value>()?;
+        multi_agent_namespaces.push(
+            body["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .filter(|name| matches!(*name, "collaboration" | "multi_agent_v1"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(
+        multi_agent_namespaces,
+        vec![vec!["collaboration"], vec!["collaboration"]]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_revert_preserves_fork_cutoff_after_cold_resume() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let dex_home = TempDir::new()?;
+    let updated_workspace = TempDir::new()?;
+    let saved_cwd = AbsolutePathBuf::from_absolute_path(updated_workspace.path().canonicalize()?)?
+        .into_path_buf();
+    let extra_workspace = TempDir::new()?;
+    let saved_roots = vec![
+        AbsolutePathBuf::from_absolute_path(&saved_cwd)?,
+        AbsolutePathBuf::from_absolute_path(extra_workspace.path().canonicalize()?)?,
+    ];
+    MockResponsesConfig::new(&server.uri()).write(dex_home.path())?;
+    // This fixture checks host-native cwd and workspace restoration across fork and revert.
+    let mut mcp = TestAppServer::builder()
+        .with_dex_home(dex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    initialize_experimental(&mut mcp).await?;
+    let ThreadStartResponse { thread: parent, .. } = mcp
+        .request(|request_id| ClientRequest::ThreadStart {
+            request_id,
+            params: ThreadStartParams {
+                history_mode: Some(ThreadHistoryMode::Paginated),
+                ..Default::default()
+            },
+        })
+        .await?;
+    let mut parent_turns = Vec::new();
+    for text in ["parent first", "parent second"] {
+        let completed = mcp
+            .start_turn_and_wait_for_completion(TurnStartParams {
+                thread_id: parent.id.clone(),
+                cwd: Some(parent.cwd.as_path().to_path_buf()),
+                input: vec![UserInput::Text {
+                    text: text.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        parent_turns.push(completed.turn.id);
+    }
+    let ThreadForkResponse { thread: child, .. } = mcp
+        .request(|request_id| ClientRequest::ThreadFork {
+            request_id,
+            params: ThreadForkParams {
+                thread_id: parent.id.clone(),
+                cwd: Some(dex_home.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        })
+        .await?;
+    let child_meta = read_session_meta_line(child.path.as_ref().expect("child rollout"))
+        .await?
+        .meta;
+    let fork_cutoff = child_meta
+        .history_base
+        .expect("fork history base")
+        .end_ordinal_exclusive;
+    assert_eq!(child_meta.forked_from_ordinal_exclusive, Some(fork_cutoff));
+    let inherited_revert_cutoff =
+        std::fs::read_to_string(parent.path.as_ref().expect("parent rollout"))?
+            .lines()
+            .map(dex_rollout::parse_rollout_line)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .find_map(|line| match line.item {
+                RolloutItem::EventMsg(EventMsg::TurnStarted(turn))
+                    if turn.turn_id == parent_turns[1] =>
+                {
+                    line.ordinal
+                }
+                _ => None,
+            })
+            .expect("inherited turn start ordinal");
+    let mut child_turns = Vec::new();
+    for (text, runtime_workspace_roots) in [
+        ("child first", None),
+        ("child second", Some(saved_roots.clone())),
+    ] {
+        let completed = mcp
+            .start_turn_and_wait_for_completion(TurnStartParams {
+                thread_id: child.id.clone(),
+                cwd: Some(saved_cwd.clone()),
+                runtime_workspace_roots,
+                input: vec![UserInput::Text {
+                    text: text.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        child_turns.push(completed.turn.id);
+    }
+
+    // First revert within the child, then revert into its inherited parent history.
+    for (before_turn_id, expected_cutoff) in [
+        (child_turns[1].clone(), fork_cutoff),
+        (parent_turns[1].clone(), inherited_revert_cutoff),
+    ] {
+        let ThreadRevertResponse {
+            thread: reverted, ..
+        } = mcp
+            .request(|request_id| ClientRequest::ThreadRevert {
+                request_id,
+                params: ThreadRevertParams {
+                    thread_id: child.id.clone(),
+                    before_turn_id,
+                },
+            })
+            .await?;
+        let meta = read_session_meta_line(reverted.path.as_ref().expect("reverted rollout"))
+            .await?
+            .meta;
+        assert_eq!(meta.forked_from_ordinal_exclusive, Some(expected_cutoff));
+        if expected_cutoff == fork_cutoff {
+            assert!(
+                meta.history_base
+                    .expect("child revert base")
+                    .end_ordinal_exclusive
+                    > fork_cutoff
+            );
+        }
+
+        mcp.shutdown_gracefully().await?;
+        mcp = TestAppServer::builder()
+            .with_dex_home(dex_home.path())
+            .without_auto_env()
+            .build()
+            .await?;
+        initialize_experimental(&mut mcp).await?;
+        let ThreadResumeResponse {
+            cwd,
+            runtime_workspace_roots,
+            ..
+        } = mcp
+            .request(|request_id| ClientRequest::ThreadResume {
+                request_id,
+                params: ThreadResumeParams {
+                    thread_id: child.id.clone(),
+                    ..Default::default()
+                },
+            })
+            .await?;
+        assert_eq!(
+            (cwd.as_path(), runtime_workspace_roots),
+            (saved_cwd.as_path(), saved_roots.clone())
+        );
+        mcp.start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: child.id.clone(),
+            input: vec![UserInput::Text {
+                text: "continue after revert and cold resume".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+        let requests = server.received_requests().await.expect("response requests");
+        let body = requests
+            .iter()
+            .rev()
+            .find(|request| request.url.path().ends_with("/responses"))
+            .expect("resumed model request")
+            .body_json::<Value>()?;
+        let metadata: Value = serde_json::from_str(
+            body["client_metadata"]["x-dex-turn-metadata"]
+                .as_str()
+                .expect("turn metadata"),
+        )?;
+        assert_eq!(
+            (
+                metadata["forked_from_thread_id"].as_str(),
+                metadata["forked_from_ordinal_exclusive"].as_u64()
+            ),
+            (Some(parent.id.as_str()), Some(expected_cutoff))
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_revert_replaces_paginated_history_before_turn() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let response_mock =
+        responses::mount_sse_sequence(&server, vec![responses::sse_completed("done"); 4]).await;
+    let dex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_model("gpt-5.5")
+        .enable_feature(Feature::FastMode)
+        .write(dex_home.path())?;
     let mut mcp = TestAppServer::builder()
         .with_dex_home(dex_home.path())
         .build()
@@ -54,6 +437,8 @@ async fn thread_revert_replaces_paginated_history_before_turn() -> Result<()> {
     let ThreadStartResponse { thread, .. } = mcp
         .start_thread(ThreadStartParams {
             history_mode: Some(ThreadHistoryMode::Paginated),
+            service_tier: Some(Some("priority".to_string())),
+            personality: Some(Personality::Friendly),
             ..Default::default()
         })
         .await?;
@@ -67,6 +452,8 @@ async fn thread_revert_replaces_paginated_history_before_turn() -> Result<()> {
                     text: text.to_string(),
                     text_elements: Vec::new(),
                 }],
+                model: (text == "second").then_some("gpt-daybreak-blue-latest".to_string()),
+                personality: (text == "second").then_some(Personality::None),
                 ..Default::default()
             })
             .await?;
@@ -115,7 +502,7 @@ async fn thread_revert_replaces_paginated_history_before_turn() -> Result<()> {
             params: ThreadItemsListParams {
                 thread_id: thread.id.clone(),
                 turn_id: None,
-                cursor: items_backwards_cursor,
+                cursor: items_backwards_cursor.map(ThreadItemsListCursor::Opaque),
                 limit: None,
                 sort_direction: None,
             },
@@ -189,21 +576,25 @@ async fn thread_revert_replaces_paginated_history_before_turn() -> Result<()> {
                 text: "third".to_string(),
                 text_elements: Vec::new(),
             }],
+            model: Some("gpt-5.5".to_string()),
             ..Default::default()
         })
         .await?;
-    let requests = server.received_requests().await.expect("response requests");
-    let model_input = requests
-        .iter()
-        .rev()
-        .find(|request| request.url.path().ends_with("/responses"))
-        .expect("third turn response request")
-        .body_json::<serde_json::Value>()?["input"]
-        .clone();
+    let body = response_mock
+        .last_request()
+        .expect("third turn request")
+        .body_json();
+    assert_eq!(body["service_tier"], "priority");
+    assert!(
+        !body["instructions"]
+            .as_str()
+            .is_some_and(|instructions| { instructions.contains("# Personality") })
+    );
+    let model_input = body["input"].clone();
     let model_input = serde_json::to_string(&model_input)?;
-    assert!(model_input.contains("first"));
-    assert!(!model_input.contains("second"));
-    assert!(model_input.contains("third"));
+    assert!(model_input.contains(r#""text":"first""#));
+    assert!(!model_input.contains(r#""text":"second""#));
+    assert!(model_input.contains(r#""text":"third""#));
     assert_eq!(
         turn_ids_from_cursor(
             &mut mcp,
@@ -365,6 +756,8 @@ async fn initialize_experimental(mcp: &mut TestAppServer) -> Result<()> {
                 version: "0.1.0".to_string(),
             },
             Some(InitializeCapabilities {
+                required_human_approval: false,
+                explicit_gateway_oauth: false,
                 experimental_api: true,
                 request_attestation: false,
                 opt_out_notification_methods: None,

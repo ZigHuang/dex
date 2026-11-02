@@ -1,0 +1,87 @@
+---
+source: tui/src/streaming/mermaid_tests.rs
+expression: "stages.join(\"\\n\\n---\\n\\n\")"
+---
+Before.
+
+
+---
+
+Before.
+
+flowchart LR
+A["Dex reply<br/>completed"] --> B["Rendered in Ghostty"]
+
+---
+
+Before.
+
+┌───────────┐  ┌─────────────────────┐
+│ Dex reply │  │ Rendered in Ghostty │
+│ completed │  │                     │
+└┬──────────┘  └┬────────────────────┘
+ │              ▲
+ │              │
+ │              │
+ │              │
+ └──────────────┘
+
+---
+
+Before.
+
+┌───────────┐  ┌─────────────────────┐
+│ Dex reply │  │ Rendered in Ghostty │
+│ completed │  │                     │
+└┬──────────┘  └┬────────────────────┘
+ │              ▲
+ │              │
+ │              │
+ │              │
+ └──────────────┘
+
+After.
+
+---
+
+Before.
+
+This
+Mermaid
+diagram
+doesn't
+fit the
+current
+terminal
+width.
+flowchart LR
+A["Dex reply<br/>completed"] --> B["Rendered in Ghostty"]
+
+After.
+
+---
+
+Before.
+
+```mermaid
+flowchart LR
+A["Dex reply<br/>completed"] --> B["Rendered in Ghostty"]
+```
+
+After.
+
+---
+
+Before.
+
+┌───────────┐  ┌─────────────────────┐
+│ Dex reply │  │ Rendered in Ghostty │
+│ completed │  │                     │
+└┬──────────┘  └┬────────────────────┘
+ │              ▲
+ │              │
+ │              │
+ │              │
+ └──────────────┘
+
+After.

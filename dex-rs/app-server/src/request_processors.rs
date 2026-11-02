@@ -171,7 +171,6 @@ use dex_app_server_protocol::RateLimitResetCreditStatus;
 use dex_app_server_protocol::RateLimitResetCreditsSummary;
 use dex_app_server_protocol::RateLimitResetType;
 use dex_app_server_protocol::RequestId;
-use dex_app_server_protocol::ReviewDelivery as ApiReviewDelivery;
 use dex_app_server_protocol::ReviewStartParams;
 use dex_app_server_protocol::ReviewStartResponse;
 use dex_app_server_protocol::ReviewTarget as ApiReviewTarget;
@@ -179,7 +178,6 @@ use dex_app_server_protocol::SandboxMode;
 use dex_app_server_protocol::SendAddCreditsNudgeEmailParams;
 use dex_app_server_protocol::SendAddCreditsNudgeEmailResponse;
 use dex_app_server_protocol::ServerNotification;
-use dex_app_server_protocol::ServerRequestResolvedNotification;
 use dex_app_server_protocol::SkillSummary;
 use dex_app_server_protocol::SkillsConfigWriteParams;
 use dex_app_server_protocol::SkillsConfigWriteResponse;
@@ -228,10 +226,12 @@ use dex_app_server_protocol::ThreadIncrementElicitationParams;
 use dex_app_server_protocol::ThreadIncrementElicitationResponse;
 use dex_app_server_protocol::ThreadInjectItemsParams;
 use dex_app_server_protocol::ThreadInjectItemsResponse;
-use dex_app_server_protocol::ThreadItem;
 use dex_app_server_protocol::ThreadItemEntry;
+use dex_app_server_protocol::ThreadItemPayload;
 use dex_app_server_protocol::ThreadItemsListParams;
 use dex_app_server_protocol::ThreadItemsListResponse;
+use dex_app_server_protocol::ThreadItemsReadParams;
+use dex_app_server_protocol::ThreadItemsReadResponse;
 use dex_app_server_protocol::ThreadListCwdFilter;
 use dex_app_server_protocol::ThreadListParams;
 use dex_app_server_protocol::ThreadListResponse;
@@ -261,7 +261,6 @@ use dex_app_server_protocol::ThreadRealtimeStopResponse;
 use dex_app_server_protocol::ThreadResumeInitialTurnsPageParams;
 use dex_app_server_protocol::ThreadResumeParams;
 use dex_app_server_protocol::ThreadResumeResponse;
-use dex_app_server_protocol::ThreadRollbackParams;
 use dex_app_server_protocol::ThreadSearchOccurrence;
 use dex_app_server_protocol::ThreadSearchOccurrencesParams;
 use dex_app_server_protocol::ThreadSearchOccurrencesResponse;
@@ -283,6 +282,8 @@ use dex_app_server_protocol::ThreadStartParams;
 use dex_app_server_protocol::ThreadStartResponse;
 use dex_app_server_protocol::ThreadStartedNotification;
 use dex_app_server_protocol::ThreadStatus;
+use dex_app_server_protocol::ThreadTimelineListParams;
+use dex_app_server_protocol::ThreadTimelineListResponse;
 use dex_app_server_protocol::ThreadTurnsListParams;
 use dex_app_server_protocol::ThreadTurnsListResponse;
 use dex_app_server_protocol::ThreadUnarchiveParams;
@@ -297,6 +298,9 @@ use dex_app_server_protocol::TurnError;
 use dex_app_server_protocol::TurnInterruptParams;
 use dex_app_server_protocol::TurnInterruptResponse;
 use dex_app_server_protocol::TurnItemsView;
+use dex_app_server_protocol::TurnSettingsUpdateParams;
+use dex_app_server_protocol::TurnSettingsUpdateResponse;
+use dex_app_server_protocol::TurnSettingsUpdateStatus;
 use dex_app_server_protocol::TurnStartParams;
 use dex_app_server_protocol::TurnStartResponse;
 use dex_app_server_protocol::TurnStatus;
@@ -361,6 +365,7 @@ use dex_core::read_head_for_summary;
 use dex_core::sandboxing::SandboxPermissions;
 use dex_core::truncate_rollout_after_turn_id;
 use dex_core::truncate_rollout_before_turn_id;
+use dex_core::validate_environment_ids_and_cwds;
 use dex_core::windows_sandbox::WindowsSandboxLevelExt;
 use dex_core::windows_sandbox::WindowsSandboxSetupMode as CoreWindowsSandboxSetupMode;
 use dex_core::windows_sandbox::WindowsSandboxSetupRequest;
@@ -434,6 +439,8 @@ use dex_protocol::error::Result as DexResult;
 use dex_protocol::items::TurnItem;
 use dex_protocol::models::ResponseItem;
 use dex_protocol::openai_models::ReasoningEffort;
+use dex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
+use dex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
 use dex_protocol::protocol::AgentStatus;
 use dex_protocol::protocol::ConversationAudioParams;
 use dex_protocol::protocol::ConversationSpeechParams;
@@ -447,14 +454,12 @@ use dex_protocol::protocol::GitInfo as CoreGitInfo;
 use dex_protocol::protocol::McpAuthStatus as CoreMcpAuthStatus;
 use dex_protocol::protocol::Op;
 use dex_protocol::protocol::RealtimeVoicesList;
-use dex_protocol::protocol::ReviewDelivery as CoreReviewDelivery;
 use dex_protocol::protocol::ReviewRequest;
 use dex_protocol::protocol::ReviewTarget as CoreReviewTarget;
 use dex_protocol::protocol::SessionConfiguredEvent;
 #[cfg(test)]
 use dex_protocol::protocol::SessionMetaLine;
-use dex_protocol::protocol::TurnEnvironmentSelection;
-use dex_protocol::protocol::TurnEnvironmentSelections;
+use dex_protocol::protocol::TurnEnvironmentRequest;
 use dex_protocol::protocol::W3cTraceContext;
 use dex_protocol::protocol::strip_user_message_prefix;
 use dex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
@@ -465,7 +470,7 @@ use dex_rmcp_client::perform_oauth_login_return_url;
 use dex_rollout::InitialHistory;
 use dex_rollout::ResumedHistory;
 use dex_rollout::RolloutItem;
-use dex_rollout::is_persisted_rollout_item;
+use dex_rollout::persisted_rollout_item;
 use dex_rollout::state_db::StateDbHandle;
 use dex_rollout::state_db::reconcile_rollout;
 use dex_state::ThreadMetadata;
@@ -477,7 +482,9 @@ use dex_thread_store::DeleteThreadsParams as StoreDeleteThreadsParams;
 use dex_thread_store::GitInfoPatch as StoreGitInfoPatch;
 use dex_thread_store::ItemSortKey as StoreItemSortKey;
 use dex_thread_store::ListItemsParams as StoreListItemsParams;
+use dex_thread_store::ListItemsPosition as StoreListItemsPosition;
 use dex_thread_store::ListThreadsParams as StoreListThreadsParams;
+use dex_thread_store::ListTimelineParams as StoreListTimelineParams;
 use dex_thread_store::ListTurnsParams as StoreListTurnsParams;
 use dex_thread_store::LoadThreadHistoryParams as StoreLoadThreadHistoryParams;
 use dex_thread_store::LocalThreadStore;
@@ -526,12 +533,15 @@ use uuid::Uuid;
 #[cfg(test)]
 use dex_app_server_protocol::ServerRequest;
 
-mod account_processor;
+pub(crate) mod account_processor;
 mod apps_processor;
 mod bedrock_auth;
 mod catalog_processor;
 mod command_exec_processor;
-mod config_processor;
+pub(crate) mod config_processor;
+#[cfg(test)]
+#[path = "request_processors/config_reload_tests.rs"]
+mod config_reload_tests;
 mod diagnostics;
 mod environment_processor;
 mod feedback_processor;
@@ -541,16 +551,22 @@ mod initialize_processor;
 mod marketplace_processor;
 mod mcp_event_stream;
 mod mcp_processor;
+mod memory_status;
 mod persisted_resume_settings;
 mod plugins;
 mod process_exec_processor;
 mod projects;
 mod remote_control_processor;
+mod rollout;
 mod search;
+mod thread_attachments;
 mod thread_enrichment;
 mod thread_fork_goal;
+mod thread_input;
+mod thread_memory;
 mod thread_processor;
 mod thread_queue_processor;
+mod thread_read_state;
 mod thread_sections;
 mod token_usage_replay;
 mod turn_processor;
@@ -578,6 +594,7 @@ pub(crate) use remote_control_processor::RemoteControlRequestProcessor;
 pub(crate) use search::SearchRequestProcessor;
 pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
 pub(crate) use thread_processor::ThreadRequestProcessor;
+pub(crate) use thread_processor::ThreadResumeTarget;
 pub(crate) use thread_queue_processor::ThreadQueueRequestProcessor;
 pub(crate) use turn_processor::TurnRequestProcessor;
 pub(crate) use windows_sandbox_processor::WindowsSandboxRequestProcessor;
@@ -587,11 +604,27 @@ use crate::error_code::invalid_request;
 use crate::filters::compute_source_filters;
 use crate::filters::source_kind_matches;
 use crate::thread_state::ConnectionCapabilities;
+use crate::thread_state::PendingThreadUnloads;
 use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadState;
 use crate::thread_state::ThreadStateManager;
 use token_usage_replay::restored_token_usage_turn_id;
 use token_usage_replay::send_thread_token_usage_update_to_connection;
+
+pub(crate) fn apply_live_thread_settings(
+    thread: &mut Thread,
+    config_snapshot: &ThreadConfigSnapshot,
+) {
+    thread.model = Some(config_snapshot.model.clone());
+    thread.reasoning_effort = config_snapshot.reasoning_effort.clone();
+    thread.environments = Some(
+        config_snapshot
+            .environment_selections()
+            .iter()
+            .map(Into::into)
+            .collect(),
+    );
+}
 
 fn resolve_request_cwd(cwd: Option<PathBuf>) -> Result<Option<AbsolutePathBuf>, JSONRPCErrorError> {
     cwd.map(|cwd| {
@@ -601,14 +634,14 @@ fn resolve_request_cwd(cwd: Option<PathBuf>) -> Result<Option<AbsolutePathBuf>, 
     .transpose()
 }
 
-fn resolve_turn_environment_selections(
+fn resolve_turn_environment_requests(
     thread_manager: &ThreadManager,
     environments: Option<Vec<TurnEnvironmentParams>>,
-) -> Result<Option<Vec<TurnEnvironmentSelection>>, JSONRPCErrorError> {
+) -> Result<Option<Vec<TurnEnvironmentRequest>>, JSONRPCErrorError> {
     let Some(environments) = environments else {
         return Ok(None);
     };
-    let mut selections = Vec::with_capacity(environments.len());
+    let mut requests = Vec::with_capacity(environments.len());
     for environment in environments {
         let environment_id = environment.environment_id;
         let cwd = environment
@@ -638,17 +671,21 @@ fn resolve_turn_environment_selections(
             })
             .transpose()?
             .unwrap_or_else(|| vec![cwd.clone()]);
-        selections.push(TurnEnvironmentSelection {
+        requests.push(TurnEnvironmentRequest {
             environment_id,
             cwd,
             workspace_roots,
             config: EnvironmentConfigState::FromThread,
         });
     }
-    thread_manager
-        .validate_environment_selections(&selections)
-        .map_err(environment_selection_error)?;
-    Ok(Some(selections))
+    validate_environment_ids_and_cwds(
+        &thread_manager.environment_manager(),
+        requests
+            .iter()
+            .map(|request| (request.environment_id.as_str(), &request.cwd)),
+    )
+    .map_err(environment_selection_error)?;
+    Ok(Some(requests))
 }
 
 fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec<AbsolutePathBuf> {
@@ -661,7 +698,7 @@ fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec
     resolved_roots
 }
 
-mod config_errors;
+pub(crate) mod config_errors;
 mod request_errors;
 mod thread_delete;
 mod thread_goal_processor;
@@ -677,7 +714,6 @@ use self::thread_resume_redaction::*;
 use self::thread_summary::*;
 
 pub(crate) use self::thread_lifecycle::populate_thread_turns_from_history;
-pub(crate) use self::thread_processor::thread_from_stored_thread;
 #[cfg(test)]
 pub(crate) use self::thread_summary::read_summary_from_rollout;
 #[cfg(test)]
@@ -687,8 +723,10 @@ pub(crate) use self::thread_summary::thread_settings_from_config_snapshot;
 pub(crate) fn build_legacy_api_turns_from_rollout_items(items: &[RolloutItem]) -> Vec<Turn> {
     let mut builder = ThreadHistoryBuilder::new();
     for item in items {
-        if is_persisted_rollout_item(item, dex_protocol::protocol::ThreadHistoryMode::Legacy) {
-            builder.handle_rollout_item(item);
+        if let Some(item) =
+            persisted_rollout_item(item, dex_protocol::protocol::ThreadHistoryMode::Legacy)
+        {
+            builder.handle_rollout_item(item.as_ref());
         }
     }
     builder.finish()

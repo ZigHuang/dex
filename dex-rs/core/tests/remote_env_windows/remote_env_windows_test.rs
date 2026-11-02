@@ -2,6 +2,17 @@
 
 use anyhow::Context;
 use anyhow::Result;
+use core_test_support::responses::ev_assistant_message;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_sse_sequence;
+use core_test_support::responses::sse;
+use core_test_support::responses::start_mock_server;
+use core_test_support::test_dex::TurnInputRequest;
+use core_test_support::test_dex::test_dex;
+use core_test_support::test_dex::turn_permission_fields;
+use core_test_support::wait_for_event;
 use dex_exec_server::REMOTE_ENVIRONMENT_ID;
 use dex_protocol::config_types::CollaborationMode;
 use dex_protocol::config_types::ModeKind;
@@ -11,21 +22,10 @@ use dex_protocol::protocol::AskForApproval;
 use dex_protocol::protocol::EnvironmentConfigState;
 use dex_protocol::protocol::EventMsg;
 use dex_protocol::protocol::ExecCommandStatus;
+use dex_protocol::protocol::ThreadSettingsOverrides;
 use dex_protocol::protocol::TurnEnvironmentSelection;
 use dex_protocol::protocol::TurnEnvironmentSelections;
-use dex_protocol::protocol::ThreadSettingsOverrides;
 use dex_protocol::user_input::UserInput;
-use core_test_support::responses::ev_assistant_message;
-use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_function_call;
-use core_test_support::responses::ev_response_created;
-use core_test_support::responses::mount_sse_sequence;
-use core_test_support::responses::sse;
-use core_test_support::responses::start_mock_server;
-use core_test_support::test_dex::test_dex;
-use core_test_support::test_dex::turn_permission_fields;
-use core_test_support::test_dex::TurnInputRequest;
-use core_test_support::wait_for_event;
 use dex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -38,7 +38,7 @@ async fn windows_exec_server_runs_with_native_shell_and_cwd() -> Result<()> {
     const VERIFY_CALL_ID: &str = "wine-verify-patch";
     const PATCH_FILE: &str = "dex-apply-patch-smoke.txt";
     const COMMAND: &str = r#"if ((Get-Location).Path -ne 'C:\windows') { exit 1 }"#;
-    const VERIFY_COMMAND: &str = r#"$path = Join-Path (Get-Location) 'dex-apply-patch-smoke.txt'; if (-not (Test-Path $path)) { exit 1 }; if ([IO.File]::ReadAllText($path) -ne "patched through unified exec`n") { exit 2 }; Remove-Item $path; Write-Output 'PATCH_VERIFIED'"#;
+    const VERIFY_COMMAND: &str = r#"$path = Join-Path (Get-Location) 'dex-apply-patch-smoke.txt'; if (-not (Test-Path $path)) { exit 1 }; if ([IO.File]::ReadAllText($path) -ne "patched through unified exec`n") { exit 2 }; Remove-Item $path"#;
 
     WineExecServer
         .scope(|exec_server_url, _wine_prefix| async move {
@@ -105,6 +105,7 @@ async fn windows_exec_server_runs_with_native_shell_and_cwd() -> Result<()> {
                 vec![{
                     let cwd = PathUri::parse("file:///C:/dex-home")?;
                     TurnEnvironmentSelection {
+                        selected_capability_roots: Default::default(),
                         environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
                         cwd: cwd.clone(),
                         workspace_roots: vec![cwd],
@@ -118,7 +119,7 @@ async fn windows_exec_server_runs_with_native_shell_and_cwd() -> Result<()> {
                         text: "run the Windows smoke command".to_string(),
                         text_elements: Vec::new(),
                     }]).with_thread_settings(ThreadSettingsOverrides {
-                        environments: Some(environments),
+                        environments: Some(environments.into_requests()),
                         approval_policy: Some(AskForApproval::Never),
                         sandbox_policy: Some(sandbox_policy),
                         permission_profile,
@@ -197,13 +198,6 @@ async fn windows_exec_server_runs_with_native_shell_and_cwd() -> Result<()> {
                 verify_success != Some(false),
                 "verification command failed: {verify_output:?}"
             );
-            anyhow::ensure!(
-                verify_output
-                    .as_deref()
-                    .is_some_and(|output| output.contains("PATCH_VERIFIED")),
-                "verification command did not confirm the patched file: {verify_output:?}"
-            );
-
             let (_output, success) = request
                 .function_call_output_content_and_success(CALL_ID)
                 .context("command output should be present")?;

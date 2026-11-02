@@ -1,5 +1,8 @@
 use super::ContextualUserFragment;
 use dex_prompts::END_INSTRUCTIONS;
+use dex_protocol::models::ContentItem;
+use dex_protocol::models::ContentItemKind;
+use dex_protocol::models::input_text;
 use dex_protocol::protocol::REALTIME_CONVERSATION_CLOSE_TAG;
 use dex_protocol::protocol::REALTIME_CONVERSATION_OPEN_TAG;
 
@@ -21,6 +24,10 @@ impl RealtimeEndInstructions {
 }
 
 impl ContextualUserFragment for RealtimeEndInstructions {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("realtime_conversation.end_instructions".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }
@@ -36,11 +43,11 @@ impl ContextualUserFragment for RealtimeEndInstructions {
         )
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let instructions = self
             .instructions
             .as_deref()
             .unwrap_or_else(|| END_INSTRUCTIONS.trim());
-        format!("\n{instructions}\n")
+        input_text(format!("\n{instructions}\n"))
     }
 }

@@ -119,6 +119,70 @@
           "path": "dex-windows-sandbox-setup.exe"
         }
       }
+    },
+    "dex-windows-sandbox-service": {
+      "platforms": {
+        "windows-x86_64": {
+          "regex": "^dex-windows-sandbox-service-x86_64-pc-windows-msvc\\.exe\\.zst$",
+          "path": "dex-windows-sandbox-service.exe"
+        },
+        "windows-aarch64": {
+          "regex": "^dex-windows-sandbox-service-aarch64-pc-windows-msvc\\.exe\\.zst$",
+          "path": "dex-windows-sandbox-service.exe"
+        }
+      }
+    },
+    "dex-bazel": {
+      "platforms": {
+        "macos-aarch64": {
+          "regex": "^dex-package-aarch64-apple-darwin-bazel\\.tar\\.zst$",
+          "path": "bin/dex"
+        },
+        "macos-x86_64": {
+          "regex": "^dex-package-x86_64-apple-darwin-bazel\\.tar\\.zst$",
+          "path": "bin/dex"
+        },
+        "linux-x86_64": {
+          "regex": "^dex-package-x86_64-unknown-linux-musl-bazel\\.tar\\.zst$",
+          "path": "bin/dex"
+        },
+        "linux-aarch64": {
+          "regex": "^dex-package-aarch64-unknown-linux-musl-bazel\\.tar\\.zst$",
+          "path": "bin/dex"
+        },
+        "windows-x86_64": {
+          "regex": "^dex-package-x86_64-pc-windows-msvc-bazel\\.tar\\.zst$",
+          "path": "bin/dex.exe"
+        },
+        "windows-aarch64": {
+          "regex": "^dex-package-aarch64-pc-windows-msvc-bazel\\.tar\\.zst$",
+          "path": "bin/dex.exe"
+        }
+      }
+    },
+    "dex-command-runner-bazel": {
+      "platforms": {
+        "windows-x86_64": {
+          "regex": "^dex-command-runner-x86_64-pc-windows-msvc-bazel\\.exe\\.zst$",
+          "path": "dex-command-runner.exe"
+        },
+        "windows-aarch64": {
+          "regex": "^dex-command-runner-aarch64-pc-windows-msvc-bazel\\.exe\\.zst$",
+          "path": "dex-command-runner.exe"
+        }
+      }
+    },
+    "dex-windows-sandbox-setup-bazel": {
+      "platforms": {
+        "windows-x86_64": {
+          "regex": "^dex-windows-sandbox-setup-x86_64-pc-windows-msvc-bazel\\.exe\\.zst$",
+          "path": "dex-windows-sandbox-setup.exe"
+        },
+        "windows-aarch64": {
+          "regex": "^dex-windows-sandbox-setup-aarch64-pc-windows-msvc-bazel\\.exe\\.zst$",
+          "path": "dex-windows-sandbox-setup.exe"
+        }
+      }
     }
   }
 }

@@ -5,12 +5,9 @@ expression: frames
 before onboarding: hidden (0x0 viewport)
 ---
 after onboarding:
-╭───────────────────────────────────────╮
-│ >_ Dex (v<VERSION>)                       │
-│                                       │
-│ model:     loading   /model to change │
-│ directory: loading                    │
-╰───────────────────────────────────────╯
+
+  >_ Dex (v<VERSION>)
+     loading
 
 
 › Ask Dex to do anything

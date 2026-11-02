@@ -1,3 +1,5 @@
+use super::apply_credential_broker_requirements;
+use super::credential_broker_trusted_config;
 use super::discover_project_layers;
 use super::layer_io;
 use super::load_config_toml_for_required_layer_raw;
@@ -11,9 +13,11 @@ use super::system_config_toml_file_with_overrides;
 use super::system_requirements_toml_file_with_overrides;
 use crate::CONFIG_TOML_FILE;
 use crate::ConfigLayerSource;
+use crate::ConfigRequirements;
 use crate::LoaderOverrides;
 use crate::RequirementSource;
 use crate::RequirementsLayerEntry;
+use crate::compose_requirements;
 use crate::default_project_root_markers;
 use crate::merge_toml_values;
 use dex_file_system::ExecutorFileSystem;
@@ -122,6 +126,8 @@ pub(super) async fn load_local_config_layers_with_overrides(
     let mut discovery_config = TomlValue::Table(toml::map::Map::new());
     merge_toml_values(&mut discovery_config, &system.toml);
     merge_toml_values(&mut discovery_config, &user.toml);
+    let trusted_broker_config =
+        credential_broker_trusted_config(&discovery_config, &[], &loaded_managed);
     // Managed file and MDM values also govern the project boundary and trust.
     // Only this snapshot is resolved; the returned local layers stay raw.
     project_discovery::merge_managed_config_for_discovery(
@@ -131,15 +137,46 @@ pub(super) async fn load_local_config_layers_with_overrides(
     )?;
     let project_root_markers = project_root_markers_from_config(&discovery_config)?
         .unwrap_or_else(default_project_root_markers);
-    let trust_context = project_trust_context(
+    let requirements =
+        local_requirements_layers(fs, dex_home.as_path(), overrides, loaded_managed.clone())
+            .await?;
+    let mut trust_context = project_trust_context(
         fs,
         &discovery_config,
+        &trusted_broker_config,
         cwd,
         &project_root_markers,
         dex_home.as_path(),
         &user_file,
     )
     .await?;
+    let broker_requirements = requirements.clone().project(&[
+        vec!["features".to_string(), "network_proxy".to_string()],
+        vec!["features".to_string(), "credential_masking".to_string()],
+        vec![
+            "feature_requirements".to_string(),
+            "network_proxy".to_string(),
+        ],
+        vec![
+            "feature_requirements".to_string(),
+            "credential_masking".to_string(),
+        ],
+        // Keep the tables intact so discovery validates the same declarations as startup.
+        vec!["experimental_network".to_string()],
+        vec!["network_proxy".to_string()],
+        vec!["permissions".to_string(), "network".to_string()],
+    ]);
+    let effective_requirements =
+        compose_requirements(broker_requirements.layers.into_iter().map(|layer| {
+            RequirementsLayerEntry::from_toml_value(layer.source, layer.toml)
+                .with_base_dir(layer.base_dir)
+        }))?
+        .unwrap_or_default();
+    apply_credential_broker_requirements(
+        &mut trust_context,
+        &ConfigRequirements::try_from(effective_requirements)?,
+        &trusted_broker_config,
+    );
     let project_layers = discover_project_layers(
         fs,
         cwd,
@@ -167,10 +204,39 @@ pub(super) async fn load_local_config_layers_with_overrides(
     ];
     append_project_layers(fs, &mut config_layers, project_layers.layers).await?;
 
-    let requirements =
-        local_requirements_layers(fs, dex_home.as_path(), overrides, loaded_managed.clone())
-            .await?;
     append_legacy_config_layers(&mut config_layers, loaded_managed, &dex_home)?;
+
+    // Local config reads preserve raw executor paths. Only the profile ancestry and
+    // presence of MITM rules are needed here, before schema-specific path resolution.
+    let mut managed_profiles = TomlValue::Table(Default::default());
+    for layer in &requirements.layers {
+        if let Some(permissions) = layer.toml.get("permissions") {
+            merge_toml_values(&mut managed_profiles, permissions);
+        }
+    }
+    super::validate_project_mitm_profiles(
+        config_layers
+            .iter()
+            .map(|layer| (&layer.source, &layer.toml)),
+        managed_profiles
+            .as_table()
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| !matches!(name.as_str(), "filesystem" | "network"))
+            .map(|(name, profile)| {
+                (
+                    name.clone(),
+                    profile
+                        .get("extends")
+                        .and_then(TomlValue::as_str)
+                        .map(str::to_owned),
+                    profile
+                        .get("network")
+                        .and_then(|network| network.get("mitm"))
+                        .is_some(),
+                )
+            }),
+    )?;
 
     Ok(LocalConfigLayers {
         config: LocalTomlLayerStack {

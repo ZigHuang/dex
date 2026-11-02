@@ -1,0 +1,25 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "dex-guardian-context"
+version.workspace = true
+
+[lib]
+doctest = false
+name = "dex_guardian_context"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+dex-context-fragments = { workspace = true }
+dex-history = { workspace = true }
+dex-protocol = { workspace = true }
+dex-utils-output-truncation = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+dex-protocol-test-support = { workspace = true }
+pretty_assertions = { workspace = true }

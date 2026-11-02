@@ -56,7 +56,7 @@ def fetch_dex_v8_artifacts(
     cache_root: Path | None = None,
 ) -> RustyV8ArtifactPair:
     version = version or resolved_v8_crate_version()
-    release_url = f"https://github.com/openai/dex/releases/download/rusty-v8-v{version}"
+    release_url = f"https://github.com/openai/codex/releases/download/rusty-v8-v{version}"
     target = spec.target
     cache_dir = (cache_root or default_cache_root()) / f"rusty-v8-{version}-{target}"
 
@@ -71,7 +71,20 @@ def fetch_dex_v8_artifacts(
     binding = cache_dir / binding_name
     checksums = cache_dir / checksums_name
 
-    download_file(f"{release_url}/{checksums.name}", checksums)
+    # A cached manifest is sufficient only while it matches this checkout's
+    # release pin. Probe without deleting it in case refresh is unavailable.
+    cached_manifest_valid = False
+    try:
+        if not checksums.is_symlink():
+            verify_release_checksum_manifest(
+                checksums, version=version, remove_invalid=False
+            )
+            cached_manifest_valid = True
+    except (OSError, RuntimeError, ValueError):
+        pass
+    if not cached_manifest_valid:
+        download_file(f"{release_url}/{checksums.name}", checksums)
+        verify_release_checksum_manifest(checksums, version=version)
     expected_checksums = load_checksums(checksums, {archive.name, binding.name})
     for artifact in [archive, binding]:
         ensure_valid_artifact(
@@ -103,6 +116,35 @@ def resolved_v8_crate_version() -> str:
 
 def default_cache_root() -> Path:
     return Path(tempfile.gettempdir()) / "dex-package"
+
+
+def verify_release_checksum_manifest(
+    checksums_path: Path, *, version: str, remove_invalid: bool = True
+) -> None:
+    version_suffix = version.replace(".", "_")
+    trusted_checksums = (
+        REPO_ROOT
+        / "third_party"
+        / "v8"
+        / f"rusty_v8_{version_suffix}_release_manifests.sha256"
+    )
+
+    for line in trusted_checksums.read_text(encoding="utf-8").splitlines():
+        digest, artifact_name = line.split(maxsplit=1)
+        if artifact_name != checksums_path.name:
+            continue
+        if has_checksum(checksums_path, digest):
+            return
+
+        if remove_invalid:
+            checksums_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"V8 checksum manifest {checksums_path} does not match its trusted SHA-256."
+        )
+
+    raise RuntimeError(
+        f"V8 checksum manifest {checksums_path.name} has no trusted SHA-256 for {version}."
+    )
 
 
 def load_checksums(checksums_path: Path, artifact_names: set[str]) -> dict[str, str]:

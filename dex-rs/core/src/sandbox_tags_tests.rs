@@ -8,6 +8,7 @@ use dex_protocol::permissions::FileSystemPath;
 use dex_protocol::permissions::FileSystemSandboxEntry;
 use dex_protocol::permissions::FileSystemSandboxKind;
 use dex_protocol::permissions::FileSystemSandboxPolicy;
+use dex_protocol::permissions::FileSystemSpecialPath;
 use dex_protocol::permissions::NetworkSandboxPolicy;
 use dex_sandboxing::SandboxType;
 use dex_sandboxing::get_platform_sandbox;
@@ -159,4 +160,49 @@ fn profile_policy_tag_reports_closest_legacy_mode() {
         permission_profile_policy_tag(&profile, cwd.as_path()),
         "workspace-write"
     );
+}
+
+#[test]
+fn policy_labels_follow_configured_roots_and_deny_rules() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let cwd = workspace.path().join("not-created");
+    let denied_root = AbsolutePathBuf::from_absolute_path(&cwd).expect("absolute root");
+    let project_root = FileSystemSandboxEntry::new(
+        FileSystemPath::Special {
+            value: FileSystemSpecialPath::ProjectRoots { subpath: None },
+        },
+        FileSystemAccessMode::Write,
+    );
+    let cases = [
+        (vec![project_root.clone()], "workspace-write"),
+        (
+            vec![
+                project_root.clone(),
+                FileSystemSandboxEntry::new(denied_root.into(), FileSystemAccessMode::Deny),
+            ],
+            "read-only",
+        ),
+        (
+            vec![
+                project_root,
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::ProjectRoots {
+                            subpath: Some("private".to_string()),
+                        },
+                    },
+                    FileSystemAccessMode::Deny,
+                ),
+            ],
+            "workspace-write",
+        ),
+    ];
+
+    for (entries, expected) in cases {
+        let profile = PermissionProfile::from_runtime_permissions(
+            &FileSystemSandboxPolicy::restricted(entries),
+            NetworkSandboxPolicy::Restricted,
+        );
+        assert_eq!(permission_profile_policy_tag(&profile, &cwd), expected);
+    }
 }

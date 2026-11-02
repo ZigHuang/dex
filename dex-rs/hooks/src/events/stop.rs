@@ -40,6 +40,8 @@ pub struct StopRequest {
 #[derive(Debug, Clone)]
 pub enum StopHookTarget {
     Stop,
+    /// Internal memory work runs policy and executor hooks, not project completion checks.
+    MemoryConsolidation,
     SubagentStop {
         agent_id: String,
         agent_type: String,
@@ -50,16 +52,26 @@ pub enum StopHookTarget {
 impl StopHookTarget {
     fn event_name(&self) -> HookEventName {
         match self {
-            Self::Stop => HookEventName::Stop,
+            Self::Stop | Self::MemoryConsolidation => HookEventName::Stop,
             Self::SubagentStop { .. } => HookEventName::SubagentStop,
         }
     }
 
     fn matcher_input(&self) -> Option<&str> {
         match self {
-            Self::Stop => None,
+            Self::Stop | Self::MemoryConsolidation => None,
             Self::SubagentStop { agent_type, .. } => Some(agent_type.as_str()),
         }
+    }
+
+    fn select_handlers(&self, handlers: &[ConfiguredHandler]) -> Vec<ConfiguredHandler> {
+        dispatcher::select_handlers(handlers, self.event_name(), self.matcher_input())
+            .into_iter()
+            .filter(|handler| {
+                !matches!(self, Self::MemoryConsolidation)
+                    || handler.runs_for_memory_consolidation()
+            })
+            .collect()
     }
 }
 
@@ -86,23 +98,22 @@ pub(crate) fn preview(
     handlers: &[ConfiguredHandler],
     request: &StopRequest,
 ) -> Vec<HookRunSummary> {
-    dispatcher::select_handlers(
-        handlers,
-        request.target.event_name(),
-        request.target.matcher_input(),
-    )
-    .into_iter()
-    .filter(|handler| matches!(handler.source_path, HandlerSourcePath::Local(_)))
-    .map(|handler| dispatcher::running_summary(&handler))
-    .collect()
+    request
+        .target
+        .select_handlers(handlers)
+        .into_iter()
+        .filter(|handler| {
+            !matches!(
+                handler.source_path,
+                HandlerSourcePath::ExecutorScoped { .. }
+            )
+        })
+        .map(|handler| dispatcher::running_summary(&handler))
+        .collect()
 }
 
 pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> StopOutcome {
-    let matched = dispatcher::select_handlers(
-        &engine.handlers,
-        request.target.event_name(),
-        request.target.matcher_input(),
-    );
+    let matched = request.target.select_handlers(&engine.handlers);
     if matched.is_empty() {
         return StopOutcome {
             hook_events: Vec::new(),
@@ -114,8 +125,17 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
         };
     }
 
-    let input_json = match request.target {
-        StopHookTarget::Stop => {
+    // Memory workers terminate on managed rejection rather than continuing the turn,
+    // so their executor cleanup must also run when a managed hook blocks completion.
+    let (executor_cleanup, matched): (Vec<_>, Vec<_>) = matched.into_iter().partition(|handler| {
+        matches!(request.target, StopHookTarget::MemoryConsolidation)
+            && matches!(
+                handler.source_path,
+                HandlerSourcePath::ExecutorScoped { .. }
+            )
+    });
+    let input = match request.target {
+        StopHookTarget::Stop | StopHookTarget::MemoryConsolidation => {
             let input = StopCommandInput {
                 session_id: request.session_id.to_string(),
                 turn_id: request.turn_id.clone(),
@@ -129,8 +149,8 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
                     request.last_assistant_message.clone(),
                 ),
             };
-            match serde_json::to_string(&input) {
-                Ok(input_json) => input_json,
+            match serde_json::to_value(input) {
+                Ok(input) => input,
                 Err(error) => {
                     return serialization_failure_outcome(
                         common::serialization_failure_hook_events(
@@ -163,8 +183,8 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
                     request.last_assistant_message.clone(),
                 ),
             };
-            match serde_json::to_string(&input) {
-                Ok(input_json) => input_json,
+            match serde_json::to_value(input) {
+                Ok(input) => input,
                 Err(error) => {
                     return serialization_failure_outcome(
                         common::serialization_failure_hook_events(
@@ -181,13 +201,26 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
     let results = dispatcher::execute_handlers_with_metadata(
         engine,
         matched,
-        input_json,
+        &input,
         request.cwd.as_path(),
-        Some(request.turn_id),
+        Some(request.turn_id.clone()),
         request.request_metadata.as_ref(),
         parse_completed,
     )
     .await;
+
+    if !executor_cleanup.is_empty() {
+        dispatcher::execute_handlers_with_metadata(
+            engine,
+            executor_cleanup,
+            &input,
+            request.cwd.as_path(),
+            Some(request.turn_id),
+            request.request_metadata.as_ref(),
+            parse_completed,
+        )
+        .await;
+    }
 
     let aggregate = aggregate_results(results.iter().map(|result| &result.data));
 
@@ -344,10 +377,11 @@ fn parse_completed(
     };
     let continuation_fragments = continuation_prompt
         .map(|prompt| {
-            vec![HookPromptFragment::from_single_hook(
-                prompt,
-                completed.run.id.clone(),
-            )]
+            vec![HookPromptFragment {
+                text: prompt,
+                hook_run_id: completed.run.id.clone(),
+                metadata: run_result.context_metadata,
+            }]
         })
         .unwrap_or_default();
 
@@ -451,6 +485,7 @@ mod tests {
                 continuation_fragments: vec![HookPromptFragment {
                     text: "retry with tests".to_string(),
                     hook_run_id: parsed.completed.run.id.clone(),
+                    metadata: dex_protocol::models::ContentItemMetadata::harness(),
                 }],
             }
         );
@@ -528,6 +563,7 @@ mod tests {
                 continuation_fragments: vec![HookPromptFragment {
                     text: "retry with tests".to_string(),
                     hook_run_id: parsed.completed.run.id.clone(),
+                    metadata: dex_protocol::models::ContentItemMetadata::harness(),
                 }],
             }
         );
@@ -646,6 +682,8 @@ mod tests {
 
     fn handler_with_async(r#async: bool) -> ConfiguredHandler {
         ConfiguredHandler {
+            builtin: false,
+            plugin_trust: None,
             event_name: HookEventName::Stop,
             matcher: None,
             timeout_sec: 600,
@@ -664,6 +702,7 @@ mod tests {
 
     fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> HandlerRunResult {
         HandlerRunResult {
+            context_metadata: dex_protocol::models::ContentItemMetadata::harness(),
             started_at: 1,
             completed_at: 2,
             duration_ms: 1,

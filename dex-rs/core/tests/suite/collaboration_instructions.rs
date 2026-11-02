@@ -9,13 +9,12 @@ use core_test_support::responses::sse;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
-use core_test_support::test_dex::local_selections;
+use core_test_support::test_dex::local_requests;
 use core_test_support::test_dex::test_dex;
 use core_test_support::wait_for_event;
 use dex_core::TurnInputRequest;
 use dex_features::Feature;
 use dex_history::RolloutItem;
-use dex_history::RolloutLine;
 use dex_login::DexAuth;
 use dex_models_manager::model_info::model_info_from_slug;
 use dex_protocol::config_types::CollaborationMode;
@@ -75,14 +74,18 @@ fn model_with_collaboration_messages(
 ) -> dex_protocol::openai_models::ModelInfo {
     let mut model = model_info_from_slug(slug);
     let model_messages = model.model_messages.get_or_insert(ModelMessages {
+        apps: None,
+        content_filter_guidance: None,
+        persistent_instructions: None,
+        tools: None,
         instructions_template: None,
-        instructions_variables: None,
         approvals: None,
         collaboration_modes: None,
         auto_review: None,
         permissions: None,
         multi_agent: None,
         token_budget: None,
+        confirmation_policies: None,
         guardian_v2: None,
     });
     model_messages.collaboration_modes = Some(CollaborationModeMessages {
@@ -167,8 +170,8 @@ async fn catalog_collaboration_messages_track_mode_changes() -> Result<()> {
     .await;
 
     let model_slug = "catalog-collaboration-model";
-    let default_text = "catalog default instructions";
-    let plan_text = "catalog plan instructions";
+    let default_text = "## Plan tool\nPreserve the custom default policy.\n";
+    let plan_text = "## `update_plan`\nPreserve the custom Plan Mode policy.\n";
     let model = model_with_collaboration_messages(model_slug, Some(default_text), Some(plan_text));
     let mut builder = test_dex()
         .with_model(model_slug)
@@ -540,7 +543,7 @@ async fn collaboration_instructions_added_on_user_turn() -> Result<()> {
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
+                environments: Some(local_requests(test.config.cwd.clone())),
                 approval_policy: Some(test.config.permissions.approval_policy.value()),
                 sandbox_policy: Some(test.config.legacy_sandbox_policy()),
                 summary: Some(
@@ -587,7 +590,7 @@ async fn collaboration_instructions_omitted_when_disabled() -> Result<()> {
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
+                environments: Some(local_requests(test.config.cwd.clone())),
                 approval_policy: Some(test.config.permissions.approval_policy.value()),
                 sandbox_policy: Some(test.config.legacy_sandbox_policy()),
                 summary: Some(
@@ -608,46 +611,6 @@ async fn collaboration_instructions_omitted_when_disabled() -> Result<()> {
         count_messages_containing(&dev_texts, COLLABORATION_MODE_OPEN_TAG),
         0
     );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn override_then_next_turn_uses_updated_collaboration_instructions() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let req = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-
-    let test = test_dex().build(&server).await?;
-    let collab_text = "override instructions";
-    let collaboration_mode = collab_mode_with_instructions(Some(collab_text));
-
-    core_test_support::submit_thread_settings(
-        &test.dex,
-        ThreadSettingsOverrides {
-            collaboration_mode: Some(collaboration_mode),
-            ..Default::default()
-        },
-    )
-    .await?;
-
-    test.dex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "hello".into(),
-            text_elements: Vec::new(),
-        }]))
-        .await?;
-    wait_for_event(&test.dex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let input = req.single_request().input();
-    let dev_texts = developer_texts(&input);
-    let collab_text = collab_xml(collab_text);
-    assert_eq!(count_messages_containing(&dev_texts, &collab_text), 1);
 
     Ok(())
 }
@@ -685,7 +648,7 @@ async fn user_turn_overrides_collaboration_instructions_after_override() -> Resu
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
+                environments: Some(local_requests(test.config.cwd.clone())),
                 approval_policy: Some(test.config.permissions.approval_policy.value()),
                 sandbox_policy: Some(test.config.legacy_sandbox_policy()),
                 summary: Some(
@@ -989,13 +952,14 @@ async fn resume_replays_collaboration_instructions() -> Result<()> {
     .await;
 
     let mut builder = test_dex();
-    let initial = builder.build(&server).await?;
+    let initial = builder.build_with_auto_env(&server).await?;
 
     let collab_text = "resume instructions";
+    let mode = collab_mode_for_model(ModeKind::Plan, "gpt-5.5", Some(collab_text));
     core_test_support::submit_thread_settings(
         &initial.dex,
         ThreadSettingsOverrides {
-            collaboration_mode: Some(collab_mode_with_instructions(Some(collab_text))),
+            collaboration_mode: Some(mode),
             ..Default::default()
         },
     )
@@ -1011,6 +975,10 @@ async fn resume_replays_collaboration_instructions() -> Result<()> {
     wait_for_event(&initial.dex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let resumed = builder.restart(&server, &initial).await?;
+    assert_eq!(
+        resumed.dex.config_snapshot().await.collaboration_mode.mode,
+        ModeKind::Plan
+    );
     resumed
         .dex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -1074,7 +1042,7 @@ async fn cold_resume_refreshes_legacy_collaboration_snapshot_once(
     let legacy_rollout = std::fs::read_to_string(&rollout_path)?
         .lines()
         .map(|original_line| {
-            let mut line = serde_json::from_str::<RolloutLine>(original_line)?;
+            let mut line = dex_rollout::parse_rollout_line(original_line)?;
             if let RolloutItem::WorldState(world_state) = &mut line.item
                 && let Some(snapshot) = world_state.state.get_mut("collaboration_mode")
             {

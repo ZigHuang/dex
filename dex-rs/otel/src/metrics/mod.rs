@@ -1,3 +1,4 @@
+pub(crate) mod buffered;
 mod client;
 mod config;
 mod error;
@@ -9,6 +10,7 @@ pub(crate) mod timer;
 pub(crate) mod validation;
 
 use crate::config::StatsigMetricsSettings;
+pub use crate::metrics::buffered::record_global_operation;
 pub use crate::metrics::client::MetricsClient;
 pub use crate::metrics::config::MetricsConfig;
 pub use crate::metrics::config::MetricsExporter;
@@ -16,12 +18,28 @@ pub use crate::metrics::error::MetricsError;
 pub use crate::metrics::error::Result;
 pub use crate::metrics::process::record_process_start_once;
 pub use names::*;
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::RwLock;
 pub use tags::ORIGINATOR_TAG;
 pub use tags::SessionMetricTagValues;
 pub use tags::bounded_originator_tag_value;
 
 static GLOBAL_METRICS: OnceLock<MetricsClient> = OnceLock::new();
+
+pub(crate) fn install_global(mut metrics: MetricsClient) -> MetricsClient {
+    let active = GLOBAL_METRICS
+        .get()
+        .and_then(|current| current.active.clone())
+        .unwrap_or_else(|| Arc::new(RwLock::new(Arc::clone(&metrics.inner))));
+    *active
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&metrics.inner);
+    metrics.active = Some(active);
+    let _ = GLOBAL_METRICS.set(metrics.clone());
+    buffered::GLOBAL.enable(&metrics);
+    metrics
+}
 
 pub fn global() -> Option<MetricsClient> {
     GLOBAL_METRICS.get().cloned()

@@ -17,6 +17,7 @@ dex-core = { workspace = true }
 dex-extension-api = { workspace = true }
 dex-features = { workspace = true }
 dex-otel = { workspace = true }
+dex-protocol = { workspace = true }
 dex-tools = { workspace = true }
 dex-utils-absolute-path = { workspace = true }
 dex-utils-output-truncation = { workspace = true }

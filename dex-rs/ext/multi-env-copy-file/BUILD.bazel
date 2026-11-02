@@ -1,0 +1,17 @@
+load("//:defs.bzl", "dex_rust_crate")
+
+dex_rust_crate(
+    name = "multi-env-copy-file",
+    crate_name = "dex_multi_env_copy_file",
+    extra_binaries = [
+        "//dex-rs/bwrap:bwrap",
+        "//dex-rs/code-mode-host:dex-code-mode-host",
+        "//dex-rs/linux-sandbox:dex-linux-sandbox",
+        "//dex-rs/cli:dex",
+        "//dex-rs/windows-sandbox-rs:dex-command-runner",
+        "//dex-rs/windows-sandbox-rs:dex-windows-managed-deny-probe",
+        "//dex-rs/windows-sandbox-rs:dex-windows-sandbox-setup",
+    ],
+    run_tests_with_wine_exec = True,
+    test_tags = ["no-sandbox"],
+)

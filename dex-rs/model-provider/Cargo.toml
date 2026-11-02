@@ -13,24 +13,39 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+dex-utils-process = { workspace = true }
+chrono = { workspace = true }
 dex-api = { workspace = true }
 dex-agent-identity = { workspace = true }
 dex-aws-auth = { workspace = true }
 dex-http-client = { workspace = true }
 dex-feedback = { workspace = true }
+dex-features = { workspace = true }
 dex-login = { workspace = true }
+dex-runtime-agent-instance = { workspace = true }
+dex-keyring-store = { workspace = true }
 dex-model-provider-info = { workspace = true }
 dex-models-manager = { workspace = true }
 dex-otel = { workspace = true }
 dex-protocol = { workspace = true }
 dex-response-debug-context = { workspace = true }
+dex-secrets = { workspace = true }
 http = { workspace = true }
-tokio = { workspace = true, features = ["process", "sync", "time"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "process", "sync", "time"] }
 tracing = { workspace = true, features = ["log"] }
+url = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
+dex-utils-cargo-bin = { workspace = true }
 dex-utils-redacted-string = { workspace = true }
+dex-utils-rustls-provider = { workspace = true }
 pretty_assertions = { workspace = true }
-serde_json = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 wiremock = { workspace = true }
