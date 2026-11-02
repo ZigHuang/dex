@@ -27,7 +27,9 @@ class InstallShTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(
             requests,
-            [f"https://api.github.com/repos/openai/dex/releases/tags/rust-v{VERSION}"],
+            [
+                f"https://api.github.com/repos/ZigHuang/dex/releases/tags/rust-v{VERSION}"
+            ],
         )
         self.assertIn(
             f"Could not fetch GitHub release metadata for Dex {VERSION}",
@@ -42,9 +44,9 @@ class InstallShTest(unittest.TestCase):
         self.assertEqual(
             requests,
             [
-                "https://api.github.com/repos/openai/dex/releases/tags/"
+                "https://api.github.com/repos/ZigHuang/dex/releases/tags/"
                 f"rust-v{VERSION}",
-                "https://github.com/openai/dex/releases/download/"
+                "https://github.com/ZigHuang/dex/releases/download/"
                 f"rust-v{VERSION}/dex-package_SHA256SUMS",
             ],
         )
@@ -58,9 +60,9 @@ class InstallShTest(unittest.TestCase):
         self.assertEqual(
             requests,
             [
-                "https://api.github.com/repos/openai/dex/releases/tags/"
+                "https://api.github.com/repos/ZigHuang/dex/releases/tags/"
                 f"rust-v{version}",
-                "https://github.com/openai/dex/releases/download/"
+                "https://github.com/ZigHuang/dex/releases/download/"
                 f"rust-v{version}/dex-package_SHA256SUMS",
             ],
         )
@@ -73,8 +75,8 @@ class InstallShTest(unittest.TestCase):
         self.assertEqual(
             requests,
             [
-                "https://api.github.com/repos/openai/dex/releases/latest",
-                "https://github.com/openai/dex/releases/download/"
+                "https://api.github.com/repos/ZigHuang/dex/releases/latest",
+                "https://github.com/ZigHuang/dex/releases/download/"
                 f"rust-v{VERSION}/dex-package_SHA256SUMS",
             ],
         )
@@ -89,8 +91,8 @@ class InstallShTest(unittest.TestCase):
         self.assertEqual(
             requests,
             [
-                "https://api.github.com/repos/openai/dex/releases/latest",
-                "https://github.com/openai/dex/releases/download/"
+                "https://api.github.com/repos/ZigHuang/dex/releases/latest",
+                "https://github.com/ZigHuang/dex/releases/download/"
                 f"rust-v{VERSION}/dex-package_SHA256SUMS",
             ],
         )
@@ -132,10 +134,12 @@ class InstallShTest(unittest.TestCase):
             )
             self.assertTrue(os.access(host_path, os.X_OK))
 
-    def test_releases_latest_installs_verified_package_by_default(self) -> None:
+    def test_github_latest_installs_verified_package_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            archive_path, checksum_path, metadata_json = create_package_release(root)
+            archive_path, checksum_path, metadata_json = create_package_release(
+                root, include_exec_server=True
+            )
 
             result, requests = run_installer_in(
                 root,
@@ -151,11 +155,17 @@ class InstallShTest(unittest.TestCase):
             self.assertEqual(
                 requests,
                 [
-                    "https://releases.openai.com/dex/channels/latest",
-                    f"https://releases.openai.com/dex/releases/{VERSION}/dex-package_SHA256SUMS",
-                    f"https://releases.openai.com/dex/releases/{VERSION}/dex-package-aarch64-apple-darwin.tar.gz",
+                    "https://api.github.com/repos/ZigHuang/dex/releases/latest",
+                    "https://github.com/ZigHuang/dex/releases/download/"
+                    f"rust-v{VERSION}/dex-package_SHA256SUMS",
+                    "https://github.com/ZigHuang/dex/releases/download/"
+                    f"rust-v{VERSION}/dex-package-aarch64-apple-darwin.tar.gz",
                 ],
             )
+
+            current = root / "dex-home/packages/standalone/current"
+            for binary in ("dex", "dex-code-mode-host", "dex-exec-server"):
+                self.assertTrue(os.access(current / "bin" / binary, os.X_OK))
 
     def test_daemon_install_preserves_visible_cli_and_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -659,7 +669,7 @@ class InstallShTest(unittest.TestCase):
                         archive_path=archive_path,
                         checksum_path=checksum_path,
                         force_macos=True,
-                        use_mirror=None,
+                        use_mirror=True,
                     )
 
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -667,10 +677,10 @@ class InstallShTest(unittest.TestCase):
                         requests,
                         [
                             "https://releases.openai.com/dex/channels/latest",
-                            "https://api.github.com/repos/openai/dex/releases/latest",
-                            "https://github.com/openai/dex/releases/download/"
+                            "https://api.github.com/repos/ZigHuang/dex/releases/latest",
+                            "https://github.com/ZigHuang/dex/releases/download/"
                             f"rust-v{VERSION}/dex-package_SHA256SUMS",
-                            "https://github.com/openai/dex/releases/download/"
+                            "https://github.com/ZigHuang/dex/releases/download/"
                             f"rust-v{VERSION}/dex-package-aarch64-apple-darwin.tar.gz",
                         ],
                     )
@@ -693,7 +703,7 @@ class InstallShTest(unittest.TestCase):
                 archive_path=archive_path,
                 checksum_path=checksum_path,
                 force_macos=True,
-                use_mirror=None,
+                use_mirror=True,
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -701,11 +711,11 @@ class InstallShTest(unittest.TestCase):
                 requests,
                 [
                     f"https://releases.openai.com/dex/releases/{VERSION}/release.json",
-                    "https://api.github.com/repos/openai/dex/releases/tags/"
+                    "https://api.github.com/repos/ZigHuang/dex/releases/tags/"
                     f"rust-v{VERSION}",
-                    "https://github.com/openai/dex/releases/download/"
+                    "https://github.com/ZigHuang/dex/releases/download/"
                     f"rust-v{VERSION}/dex-package_SHA256SUMS",
-                    "https://github.com/openai/dex/releases/download/"
+                    "https://github.com/ZigHuang/dex/releases/download/"
                     f"rust-v{VERSION}/dex-package-aarch64-apple-darwin.tar.gz",
                 ],
             )
@@ -723,7 +733,7 @@ class InstallShTest(unittest.TestCase):
                 archive_path=archive_path,
                 checksum_path=checksum_path,
                 force_macos=True,
-                use_mirror=None,
+                use_mirror=True,
                 releases_mode="asset_fallback",
             )
 
@@ -733,10 +743,10 @@ class InstallShTest(unittest.TestCase):
                 [
                     "https://releases.openai.com/dex/channels/latest",
                     f"https://releases.openai.com/dex/releases/{VERSION}/dex-package_SHA256SUMS",
-                    "https://github.com/openai/dex/releases/download/"
+                    "https://github.com/ZigHuang/dex/releases/download/"
                     f"rust-v{VERSION}/dex-package_SHA256SUMS",
                     f"https://releases.openai.com/dex/releases/{VERSION}/dex-package-aarch64-apple-darwin.tar.gz",
-                    "https://github.com/openai/dex/releases/download/"
+                    "https://github.com/ZigHuang/dex/releases/download/"
                     f"rust-v{VERSION}/dex-package-aarch64-apple-darwin.tar.gz",
                 ],
             )
@@ -754,7 +764,7 @@ class InstallShTest(unittest.TestCase):
                 archive_path=archive_path,
                 checksum_path=checksum_path,
                 force_macos=True,
-                use_mirror=None,
+                use_mirror=True,
                 releases_mode="corrupt_assets",
             )
 
@@ -764,10 +774,10 @@ class InstallShTest(unittest.TestCase):
                 [
                     "https://releases.openai.com/dex/channels/latest",
                     f"https://releases.openai.com/dex/releases/{VERSION}/dex-package_SHA256SUMS",
-                    "https://github.com/openai/dex/releases/download/"
+                    "https://github.com/ZigHuang/dex/releases/download/"
                     f"rust-v{VERSION}/dex-package_SHA256SUMS",
                     f"https://releases.openai.com/dex/releases/{VERSION}/dex-package-aarch64-apple-darwin.tar.gz",
-                    "https://github.com/openai/dex/releases/download/"
+                    "https://github.com/ZigHuang/dex/releases/download/"
                     f"rust-v{VERSION}/dex-package-aarch64-apple-darwin.tar.gz",
                 ],
             )
@@ -791,7 +801,7 @@ class InstallShTest(unittest.TestCase):
                 archive_path=archive_path,
                 checksum_path=checksum_path,
                 force_macos=True,
-                use_mirror=None,
+                use_mirror=True,
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -800,9 +810,9 @@ class InstallShTest(unittest.TestCase):
                 [
                     "https://releases.openai.com/dex/channels/latest",
                     f"https://releases.openai.com/dex/releases/{VERSION}/dex-package_SHA256SUMS",
-                    "https://github.com/openai/dex/releases/download/"
+                    "https://github.com/ZigHuang/dex/releases/download/"
                     f"rust-v{VERSION}/dex-package_SHA256SUMS",
-                    "https://api.github.com/repos/openai/dex/releases/tags/"
+                    "https://api.github.com/repos/ZigHuang/dex/releases/tags/"
                     f"rust-v{VERSION}",
                     f"https://releases.openai.com/dex/releases/{VERSION}/dex-package-aarch64-apple-darwin.tar.gz",
                 ],
@@ -835,7 +845,7 @@ class InstallShTest(unittest.TestCase):
                 checksum_path=checksum_path,
                 releases_checksum_path=mirror_checksum_path,
                 force_macos=True,
-                use_mirror=None,
+                use_mirror=True,
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -844,9 +854,9 @@ class InstallShTest(unittest.TestCase):
                 [
                     "https://releases.openai.com/dex/channels/latest",
                     f"https://releases.openai.com/dex/releases/{VERSION}/dex-package_SHA256SUMS",
-                    "https://github.com/openai/dex/releases/download/"
+                    "https://github.com/ZigHuang/dex/releases/download/"
                     f"rust-v{VERSION}/dex-package_SHA256SUMS",
-                    "https://api.github.com/repos/openai/dex/releases/tags/"
+                    "https://api.github.com/repos/ZigHuang/dex/releases/tags/"
                     f"rust-v{VERSION}",
                     f"https://releases.openai.com/dex/releases/{VERSION}/dex-package-aarch64-apple-darwin.tar.gz",
                 ],
@@ -865,7 +875,7 @@ class InstallShTest(unittest.TestCase):
                 archive_path=archive_path,
                 checksum_path=checksum_path,
                 force_macos=True,
-                use_mirror=None,
+                use_mirror=True,
                 releases_mode="corrupt_checksum_and_github",
             )
 
@@ -875,9 +885,9 @@ class InstallShTest(unittest.TestCase):
                 [
                     "https://releases.openai.com/dex/channels/latest",
                     f"https://releases.openai.com/dex/releases/{VERSION}/dex-package_SHA256SUMS",
-                    "https://github.com/openai/dex/releases/download/"
+                    "https://github.com/ZigHuang/dex/releases/download/"
                     f"rust-v{VERSION}/dex-package_SHA256SUMS",
-                    "https://api.github.com/repos/openai/dex/releases/tags/"
+                    "https://api.github.com/repos/ZigHuang/dex/releases/tags/"
                     f"rust-v{VERSION}",
                 ],
             )
@@ -936,9 +946,9 @@ class InstallShTest(unittest.TestCase):
                 first_requests,
                 [
                     f"https://releases.openai.com/dex/releases/{VERSION}/release.json",
-                    "https://api.github.com/repos/openai/dex/releases/tags/"
+                    "https://api.github.com/repos/ZigHuang/dex/releases/tags/"
                     f"rust-v{VERSION}",
-                    "https://github.com/openai/dex/releases/download/"
+                    "https://github.com/ZigHuang/dex/releases/download/"
                     f"rust-v{VERSION}/dex-npm-darwin-arm64-{VERSION}.tgz",
                 ],
             )
@@ -958,7 +968,7 @@ class InstallShTest(unittest.TestCase):
                 second_requests,
                 [
                     f"https://releases.openai.com/dex/releases/{VERSION}/release.json",
-                    "https://api.github.com/repos/openai/dex/releases/tags/"
+                    "https://api.github.com/repos/ZigHuang/dex/releases/tags/"
                     f"rust-v{VERSION}",
                 ],
             )
@@ -1068,7 +1078,7 @@ def run_installer_in(
                   exit 22
                 fi
                 ;;
-              https://github.com/openai/dex/releases/download/*/dex-package_SHA256SUMS)
+              https://github.com/ZigHuang/dex/releases/download/*/dex-package_SHA256SUMS)
                 if [ "$DEX_TEST_RELEASES_MODE" = "corrupt_checksum_and_github" ]; then
                   printf '<html>proxy error</html>\n' >"$output"
                   exit 0
@@ -1079,14 +1089,14 @@ def run_installer_in(
                   exit 22
                 fi
                 ;;
-              https://github.com/openai/dex/releases/download/*/dex-package-*.tar.gz)
+              https://github.com/ZigHuang/dex/releases/download/*/dex-package-*.tar.gz)
                 if [ -n "$DEX_TEST_ARCHIVE_PATH" ]; then
                   cp "$DEX_TEST_ARCHIVE_PATH" "$output"
                 else
                   exit 22
                 fi
                 ;;
-              https://github.com/openai/dex/releases/download/*/dex-npm-*.tgz)
+              https://github.com/ZigHuang/dex/releases/download/*/dex-npm-*.tgz)
                 if [ -n "$DEX_TEST_LEGACY_ARCHIVE_PATH" ]; then
                   cp "$DEX_TEST_LEGACY_ARCHIVE_PATH" "$output"
                 else

@@ -1,0 +1,219 @@
+name: Dex release
+
+on:
+  push:
+    tags:
+      - "rust-v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  DEX_REPO_ROOT: ${{ github.workspace }}
+
+jobs:
+  metadata:
+    if: github.repository == 'ZigHuang/dex'
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+      - name: Validate release version
+        id: version
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+
+          version = tomllib.loads(Path("dex-rs/Cargo.toml").read_text())["workspace"]["package"]["version"]
+          tag = f"rust-v{version}"
+          if version == "0.0.0":
+              raise SystemExit("Set the workspace version before building a release")
+          if os.environ["GITHUB_EVENT_NAME"] == "push" and os.environ["GITHUB_REF_NAME"] != tag:
+              raise SystemExit(f"Release tag must match the workspace version: {tag}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={version}\ntag={tag}\n")
+          PY
+
+  build:
+    needs: metadata
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    env:
+      TARGET: ${{ matrix.target }}
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+          architecture: ${{ runner.os == 'Windows' && 'x64' || runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Zig
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: "0.14.0"
+          use-cache: false
+      - name: Install musl build tools
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash .github/scripts/install-musl-build-tools.sh
+      - name: Configure MSVC
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/setup-msvc-env
+        with:
+          target: ${{ matrix.target }}
+      - uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: ${{ matrix.target }}
+      - name: Build and hash bwrap
+        if: runner.os == 'Linux'
+        shell: bash
+        working-directory: dex-rs
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "$TARGET" --bin bwrap
+          bwrap_path="target/$TARGET/release/bwrap"
+          strip --strip-debug --strip-unneeded "$bwrap_path"
+          digest="$(sha256sum "$bwrap_path" | cut -d ' ' -f 1)"
+          echo "DEX_BWRAP_SHA256=$digest" >> "$GITHUB_ENV"
+      - name: Build Dex and helpers
+        shell: bash
+        working-directory: dex-rs
+        run: |
+          set -euo pipefail
+          export STABLE_GIT_COMMIT="$(git rev-parse HEAD)"
+          build_args=(--bin dex --bin dex-code-mode-host --bin dex-exec-server)
+          if [[ "$TARGET" == *-pc-windows-msvc ]]; then
+            build_args+=(--bin dex-command-runner --bin dex-windows-sandbox-setup)
+          fi
+          if [[ "$TARGET" == x86_64-pc-windows-msvc ]]; then
+            export LIBSQLITE3_FLAGS=SQLITE_DISABLE_INTRINSIC
+          fi
+          if [[ "$TARGET" == *-unknown-linux-musl ]]; then
+            export AWS_LC_SYS_NO_JITTER_ENTROPY=1
+          fi
+          cargo build --locked --release --target "$TARGET" "${build_args[@]}"
+      - name: Assemble and verify complete package
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="dex-rs/target/$TARGET/release"
+          executable_suffix=""
+          resource_args=()
+          if [[ "$TARGET" == *-pc-windows-msvc ]]; then
+            executable_suffix=".exe"
+            resource_args+=(--dex-command-runner-bin "$release_dir/dex-command-runner.exe")
+            resource_args+=(--dex-windows-sandbox-setup-bin "$release_dir/dex-windows-sandbox-setup.exe")
+          elif [[ "$TARGET" == *-unknown-linux-musl ]]; then
+            resource_args+=(--bwrap-bin "$release_dir/bwrap")
+          fi
+          python3 scripts/build_dex_package.py \
+            --target "$TARGET" \
+            --variant dex \
+            --package-version "$RELEASE_VERSION" \
+            --package-dir "$RUNNER_TEMP/dex-package" \
+            --archive-output "dist/dex-package-$TARGET.tar.gz" \
+            --entrypoint-bin "$release_dir/dex$executable_suffix" \
+            --code-mode-host-bin "$release_dir/dex-code-mode-host$executable_suffix" \
+            --exec-server-bin "$release_dir/dex-exec-server$executable_suffix" \
+            --strip all \
+            "${resource_args[@]}"
+          "$RUNNER_TEMP/dex-package/bin/dex$executable_suffix" --version
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: dex-package-${{ matrix.target }}
+          path: dist/dex-package-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push'
+    needs: [metadata, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: dex-release-publication
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+      RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: dex-package-*
+          path: dist
+          merge-multiple: true
+      - name: Prepare checksums and installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          archives = sorted(Path("dist").glob("dex-package-*.tar.gz"))
+          if len(archives) != 6:
+              raise SystemExit("Expected all six platform packages before publishing")
+          with Path("dist/dex-package_SHA256SUMS").open("w") as manifest:
+              for archive in archives:
+                  with archive.open("rb") as source:
+                      digest = hashlib.file_digest(source, "sha256").hexdigest()
+                  manifest.write(f"{digest}  {archive.name}\n")
+          PY
+          cp scripts/install/install.sh scripts/install/install.ps1 dist/
+      - name: Publish GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --verify-tag --draft --generate-notes --title "Dex v$RELEASE_VERSION"
+          fi
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --latest
+          fi

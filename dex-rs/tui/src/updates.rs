@@ -59,7 +59,7 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
 
 // We use the latest version from the cask if installation is via homebrew - homebrew does not immediately pick up the latest release and can lag behind.
 const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/dex.json";
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/dex/releases/latest";
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/ZigHuang/dex/releases/latest";
 
 #[derive(Deserialize, Debug, Clone)]
 struct ReleaseInfo {

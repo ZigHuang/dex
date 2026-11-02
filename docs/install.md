@@ -1,5 +1,25 @@
 ## Installing & building
 
+### GitHub Releases
+
+Standalone installers and complete platform packages are published to
+[ZigHuang/dex Releases](https://github.com/ZigHuang/dex/releases). The installers
+download packages from GitHub by default and verify their SHA-256 checksums.
+
+The `Dex release` workflow uses GitHub-hosted runners to build Linux, macOS, and
+Windows packages for x86_64 and arm64. Run it manually to build downloadable
+Actions artifacts. To publish a release, set the Cargo workspace version to the
+upstream version and push the matching tag:
+
+```bash
+git tag rust-v0.166.0
+git push origin rust-v0.166.0
+```
+
+Tag builds upload all six complete packages, `dex-package_SHA256SUMS`,
+`install.sh`, and `install.ps1` to GitHub Releases. Each package includes the
+CLI, code-mode host, executor, and platform resources required for normal startup.
+
 ### System requirements
 
 | Requirement                 | Details                                                         |
@@ -16,7 +36,7 @@ The GitHub Release also contains a [DotSlash](https://dotslash-cli.com/) file fo
 
 ```bash
 # Clone the repository and navigate to the root of the Cargo workspace.
-git clone https://github.com/openai/dex.git
+git clone https://github.com/ZigHuang/dex.git
 cd dex/dex-rs
 
 # Install the Rust toolchain, if necessary.

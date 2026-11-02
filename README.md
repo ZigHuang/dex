@@ -4,7 +4,7 @@
 
 <p align="center"><strong>Dex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
-  <img src="https://github.com/openai/dex/blob/main/.github/dex-cli-splash.png" alt="Dex CLI splash" width="80%" />
+  <img src="https://github.com/ZigHuang/dex/blob/main/.github/dex-cli-splash.png" alt="Dex CLI splash" width="80%" />
 </p>
 </br>
 If you want Dex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/dex/ide">install in your IDE.</a>
@@ -20,24 +20,16 @@ If you want Dex in your code editor (VS Code, Cursor, Windsurf), <a href="https:
 Run the following on Mac or Linux to install Dex CLI:
 
 ```shell
-curl -fsSL https://chatgpt.com/dex/install.sh | sh
+curl -fsSL https://github.com/ZigHuang/dex/releases/latest/download/install.sh | sh
 ```
 
 Run the following on Windows to install Dex CLI:
 
 ```shell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/dex/install.ps1 | iex"
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/ZigHuang/dex/releases/latest/download/install.ps1 | iex"
 ```
 
-The standalone installers download from `https://releases.openai.com/dex` by default and fall back to GitHub Releases if a metadata or asset download is unavailable. To force GitHub Releases, set `DEX_INSTALLER_USE_RELEASES_OPENAI_COM` to `false` (`0` and `no` are also accepted):
-
-```shell
-curl -fsSL https://chatgpt.com/dex/install.sh | DEX_INSTALLER_USE_RELEASES_OPENAI_COM=false sh
-```
-
-```powershell
-$env:DEX_INSTALLER_USE_RELEASES_OPENAI_COM='false'; irm https://chatgpt.com/dex/install.ps1 | iex
-```
+The standalone installers download complete packages from [ZigHuang/dex GitHub Releases](https://github.com/ZigHuang/dex/releases). Package checksums are verified before installation.
 
 Dex CLI can also be installed via the following package managers:
 
@@ -54,18 +46,18 @@ brew install --cask dex
 Then simply run `dex` to get started.
 
 <details>
-<summary>You can also go to the <a href="https://github.com/openai/dex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+<summary>You can also go to the <a href="https://github.com/ZigHuang/dex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
 
 Each GitHub Release contains many executables, but in practice, you likely want one of these:
 
 - macOS
-  - Apple Silicon/arm64: `dex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `dex-x86_64-apple-darwin.tar.gz`
+  - Apple Silicon/arm64: `dex-package-aarch64-apple-darwin.tar.gz`
+  - x86_64 (older Mac hardware): `dex-package-x86_64-apple-darwin.tar.gz`
 - Linux
-  - x86_64: `dex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `dex-aarch64-unknown-linux-musl.tar.gz`
+  - x86_64: `dex-package-x86_64-unknown-linux-musl.tar.gz`
+  - arm64: `dex-package-aarch64-unknown-linux-musl.tar.gz`
 
-Each archive contains a single entry with the platform baked into the name (e.g., `dex-x86_64-unknown-linux-musl`), so you likely want to rename it to `dex` after extracting it.
+Use the standalone installer to verify checksums and select the complete package. Manual installations must keep `dex-package.json`, `bin/`, `dex-resources/`, and `dex-path/` together so the daemon and helper executables are available.
 
 </details>
 

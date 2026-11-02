@@ -5,8 +5,8 @@ expression: rendered
 ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │ ✨ Update available! 0.166.0 -> 9.9.9                                                                      │
 │ Run powershell -ExecutionPolicy Bypass -c '$env:DEX_NON_INTERACTIVE=1; irm                                 │
-│ https://chatgpt.com/dex/install.ps1 | iex' to update.                                                      │
+│ https://github.com/ZigHuang/dex/releases/latest/download/install.ps1 | iex' to update.                     │
 │                                                                                                            │
 │ See full release notes:                                                                                    │
-│ https://github.com/openai/dex/releases/latest                                                              │
+│ https://github.com/ZigHuang/dex/releases/latest                                                            │
 ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

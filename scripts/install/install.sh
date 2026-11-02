@@ -5,7 +5,7 @@ set -eu
 RELEASE="${DEX_RELEASE:-latest}"
 NON_INTERACTIVE="${DEX_NON_INTERACTIVE:-false}"
 DAEMON_ONLY="${DEX_INSTALL_DAEMON_ONLY:-0}"
-DEFAULT_PREFER_RELEASES_OPENAI_COM="true"
+DEFAULT_PREFER_RELEASES_OPENAI_COM="false"
 PREFER_RELEASES_OPENAI_COM="${DEX_INSTALLER_USE_RELEASES_OPENAI_COM:-$DEFAULT_PREFER_RELEASES_OPENAI_COM}"
 RELEASES_BASE_URL="https://releases.openai.com/dex"
 RELEASES_CONNECT_TIMEOUT=10
@@ -99,7 +99,8 @@ Environment:
   DEX_RELEASE          Version to install; overridden by --release.
   DEX_NON_INTERACTIVE  Set to 1, true, or yes to skip prompts.
   DEX_INSTALLER_USE_RELEASES_OPENAI_COM
-                         Set to 0, false, or no to use GitHub Releases.
+                         GitHub Releases is the default. Set to 1, true, or yes
+                         to prefer the legacy releases.openai.com mirror.
 EOF
         exit 0
         ;;
@@ -320,7 +321,7 @@ release_url_for_asset() {
   asset="$1"
   resolved_version="$2"
 
-  printf 'https://github.com/openai/dex/releases/download/rust-v%s/%s\n' "$resolved_version" "$asset"
+  printf 'https://github.com/ZigHuang/dex/releases/download/rust-v%s/%s\n' "$resolved_version" "$asset"
 }
 
 releases_url_for_asset() {
@@ -333,7 +334,7 @@ releases_url_for_asset() {
 release_metadata_url() {
   resolved_version="$1"
 
-  printf 'https://api.github.com/repos/openai/dex/releases/tags/rust-v%s\n' "$resolved_version"
+  printf 'https://api.github.com/repos/ZigHuang/dex/releases/tags/rust-v%s\n' "$resolved_version"
 }
 
 parse_downloaded_release_metadata() {
@@ -362,7 +363,7 @@ resolve_release_from_github() {
   normalized_version="$1"
   if [ "$normalized_version" = "latest" ]; then
     requested_release="latest"
-    metadata_url="https://api.github.com/repos/openai/dex/releases/latest"
+    metadata_url="https://api.github.com/repos/ZigHuang/dex/releases/latest"
   else
     resolved_version="$normalized_version"
     requested_release="$resolved_version"
