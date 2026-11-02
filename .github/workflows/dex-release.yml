@@ -45,7 +45,7 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ steps.source.outputs.ref }}
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
       - name: Validate release version
@@ -142,7 +142,7 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.metadata.outputs.source_sha }}
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
           architecture: ${{ runner.os == 'Windows' && 'x64' || runner.arch == 'ARM64' && 'arm64' || 'x64' }}
