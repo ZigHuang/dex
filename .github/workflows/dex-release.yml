@@ -20,7 +20,7 @@ env:
 jobs:
   metadata:
     if: github.repository == 'ZigHuang/dex'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-slim
     permissions:
       contents: read
       actions: write
