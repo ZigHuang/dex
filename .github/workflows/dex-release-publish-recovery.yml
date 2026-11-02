@@ -1,4 +1,4 @@
-name: Publish Dex 0.166.0 recovered packages
+name: Complete Dex 0.166.0 with recovered macOS packages
 
 on:
   push:
@@ -9,16 +9,13 @@ permissions:
   contents: read
 
 jobs:
-  publish:
+  wait:
     if: github.repository == 'ZigHuang/dex'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     permissions:
       actions: read
-      contents: write
-    concurrency:
-      group: dex-release-publication
-      cancel-in-progress: false
+      contents: read
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -88,6 +85,25 @@ jobs:
                   raise SystemExit("Timed out waiting for complete release packages")
               time.sleep(120)
           PY
+  publish:
+    needs: wait
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: write
+    concurrency:
+      group: dex-release-publication
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: rust-v0.166.0
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          ref: rust-v0.166.0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           github-token: ${{ github.token }}
@@ -185,16 +201,28 @@ jobs:
                   raise SystemExit(result.stderr)
               return json.loads(result.stdout)
 
+          expected = {}
+          for path in Path("dist").iterdir():
+              with path.open("rb") as contents:
+                  expected[path.name] = (path.stat().st_size, "sha256:" + hashlib.file_digest(contents, "sha256").hexdigest())
           existing = release()
           if existing is None:
               subprocess.run(["gh", "release", "create", tag, *[str(path) for path in sorted(Path("dist").iterdir())],
                               "--verify-tag", "--draft", "--generate-notes", "--title", "Dex v0.166.0"], check=True)
           elif existing["draft"]:
               subprocess.run(["gh", "release", "upload", tag, *[str(path) for path in sorted(Path("dist").iterdir())], "--clobber"], check=True)
-          expected = {}
-          for path in Path("dist").iterdir():
-              with path.open("rb") as contents:
-                  expected[path.name] = (path.stat().st_size, "sha256:" + hashlib.file_digest(contents, "sha256").hexdigest())
+          else:
+              assets = {asset["name"]: (asset["size"], asset["digest"]) for asset in existing["assets"]}
+              assert set(assets) <= set(expected), assets
+              for name, digest in assets.items():
+                  if name != "dex-package_SHA256SUMS":
+                      assert digest == expected[name], name
+              missing = sorted(set(expected) - set(assets))
+              if missing or assets.get("dex-package_SHA256SUMS") != expected["dex-package_SHA256SUMS"]:
+                  assert not existing.get("immutable", False), "This release does not allow adding assets"
+                  if missing:
+                      subprocess.run(["gh", "release", "upload", tag, *[str(Path("dist") / name) for name in missing]], check=True)
+                  subprocess.run(["gh", "release", "upload", tag, "dist/dex-package_SHA256SUMS", "--clobber"], check=True)
           uploaded = release()
           assert uploaded["tag_name"] == tag and not uploaded["prerelease"]
           assets = {asset["name"]: (asset["size"], asset["digest"]) for asset in uploaded["assets"]}

@@ -1,0 +1,193 @@
+name: Publish ready Dex 0.166.0 Linux and Windows packages
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/dex-release-linux-publish.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  cancel_old_wait:
+    if: github.repository == 'ZigHuang/dex'
+    runs-on: ubuntu-slim
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Replace the previous all-platform publication wait
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          base = "https://api.github.com/repos/ZigHuang/dex/actions/runs/41445895205"
+          headers = {"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json"}
+          with urllib.request.urlopen(urllib.request.Request(base, headers=headers), timeout=30) as response:
+              run = json.load(response)
+          if run["status"] != "completed":
+              with urllib.request.urlopen(urllib.request.Request(base + "/cancel", data=b"", headers=headers, method="POST"), timeout=30):
+                  pass
+          PY
+  publish:
+    needs: cancel_old_wait
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: write
+    concurrency:
+      group: dex-release-publication
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: rust-v0.166.0
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          ref: rust-v0.166.0
+      - name: Verify original release source and Linux functional checks
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import tomllib
+          import urllib.request
+
+          assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == "bc4e4e319fb4c0523ee7f9231248f293b95c0c79"
+          assert tomllib.loads(Path("dex-rs/Cargo.toml").read_text())["workspace"]["package"]["version"] == "0.166.0"
+          headers = {"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json"}
+          for run_id, expected in ((41424118118, "d796a1c09ab318c726e2c7a932962b301789c6c2"),):
+              request = urllib.request.Request(f"https://api.github.com/repos/ZigHuang/dex/actions/runs/{run_id}", headers=headers)
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  assert json.load(response)["head_sha"] == expected
+          request = urllib.request.Request("https://api.github.com/repos/ZigHuang/dex/actions/runs/41451102539", headers=headers)
+          with urllib.request.urlopen(request, timeout=30) as response:
+              smoke = json.load(response)
+          assert smoke["conclusion"] == "success", smoke
+          PY
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          github-token: ${{ github.token }}
+          run-id: 41424118118
+          pattern: dex-package-*-unknown-linux-musl
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          github-token: ${{ github.token }}
+          run-id: 41424118118
+          pattern: dex-package-*-pc-windows-msvc
+          path: dist
+          merge-multiple: true
+      - name: Validate the four ready packages and create their checksum manifest
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path, PurePosixPath
+          import shutil
+          import tarfile
+          
+          targets = {
+              "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl",
+              "aarch64-pc-windows-msvc", "x86_64-pc-windows-msvc",
+          }
+          expected = {f"dex-package-{target}.tar.gz" for target in targets}
+          assert {path.name for path in Path("dist").iterdir()} == expected
+          checksums = []
+          for target in sorted(targets):
+              archive = Path("dist") / f"dex-package-{target}.tar.gz"
+              suffix = ".exe" if "windows" in target else ""
+              required = {
+                  f"bin/dex{suffix}", f"bin/dex-code-mode-host{suffix}",
+                  f"bin/dex-exec-server{suffix}", f"dex-path/rg{suffix}",
+              }
+              if "linux" in target:
+                  required.add("dex-resources/bwrap")
+              if "windows" in target:
+                  required.update({"dex-resources/dex-command-runner.exe", "dex-resources/dex-windows-sandbox-setup.exe"})
+              members = {}
+              metadata = None
+              with tarfile.open(archive, mode="r|gz") as package:
+                  for member in package:
+                      name = str(PurePosixPath(member.name))
+                      assert name not in members, name
+                      members[name] = member
+                      if name == "dex-package.json":
+                          metadata = json.load(package.extractfile(member))
+              assert metadata == {
+                  "layoutVersion": 1, "version": "0.166.0", "target": target, "variant": "dex",
+                  "entrypoint": f"bin/dex{suffix}", "execServer": f"bin/dex-exec-server{suffix}",
+                  "resourcesDir": "dex-resources", "pathDir": "dex-path",
+              }, metadata
+              for name in required:
+                  member = members[name]
+                  assert member.isfile() and member.size > 0, name
+                  if "windows" not in target:
+                      assert member.mode & 0o100, name
+              with archive.open("rb") as package:
+                  digest = hashlib.file_digest(package, "sha256").hexdigest()
+              checksums.append(f"{digest}  {archive.name}\n")
+              print("Verified complete package:", target)
+          Path("dist/dex-package_SHA256SUMS").write_text("".join(sorted(checksums, key=lambda line: line.split()[1])))
+          for installer in ("install.sh", "install.ps1"):
+              shutil.copyfile(Path("scripts/install") / installer, Path("dist") / installer)
+          PY
+      - name: Publish the stable release with ready packages
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          tag = os.environ["RELEASE_TAG"]
+          endpoint = "repos/" + os.environ["GH_REPO"] + "/releases/tags/" + tag
+          def release():
+              result = subprocess.run(["gh", "api", endpoint], capture_output=True, text=True)
+              if result.returncode:
+                  if "HTTP 404" in result.stderr:
+                      return None
+                  raise SystemExit(result.stderr)
+              return json.loads(result.stdout)
+
+          expected = {}
+          files = sorted(Path("dist").iterdir())
+          for path in files:
+              with path.open("rb") as contents:
+                  expected[path.name] = (path.stat().st_size, "sha256:" + hashlib.file_digest(contents, "sha256").hexdigest())
+          assert len(expected) == 7
+          existing = release()
+          if existing is None:
+              subprocess.run(["gh", "release", "create", tag, *map(str, files),
+                              "--verify-tag", "--draft", "--generate-notes", "--title", "Dex v0.166.0"], check=True)
+          elif existing["draft"]:
+              subprocess.run(["gh", "release", "upload", tag, *map(str, files), "--clobber"], check=True)
+          uploaded = release()
+          assert uploaded["tag_name"] == tag and not uploaded["prerelease"]
+          assets = {asset["name"]: (asset["size"], asset["digest"]) for asset in uploaded["assets"]}
+          assert set(expected) <= set(assets)
+          for name, digest in expected.items():
+              if name != "dex-package_SHA256SUMS" or len(assets) == 7:
+                  assert assets[name] == digest, name
+          if uploaded["draft"]:
+              subprocess.run(["gh", "release", "edit", tag, "--draft=false", "--prerelease=false", "--latest"], check=True)
+          published = release()
+          assert not published["draft"] and not published["prerelease"]
+          assert not published.get("immutable", False), "The release must support adding macOS packages later"
+          print("Published ready Linux and Windows packages:", published["html_url"])
+          PY
