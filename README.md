@@ -29,7 +29,7 @@ Run the following on Windows to install Dex CLI:
 powershell -ExecutionPolicy ByPass -c "irm https://github.com/ZigHuang/dex/releases/latest/download/install.ps1 | iex"
 ```
 
-The standalone installers download complete packages from [ZigHuang/dex GitHub Releases](https://github.com/ZigHuang/dex/releases). Package checksums are verified before installation.
+The standalone installers download complete packages from [ZigHuang/dex GitHub Releases](https://github.com/ZigHuang/dex/releases). Without `--release` or `DEX_RELEASE`, they install the latest stable release, select your operating system and architecture, and verify package checksums. Rerun the same command to upgrade to the latest version.
 
 Dex CLI can also be installed via the following package managers:
 

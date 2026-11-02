@@ -6,6 +6,16 @@ Standalone installers and complete platform packages are published to
 [ZigHuang/dex Releases](https://github.com/ZigHuang/dex/releases). The installers
 download packages from GitHub by default and verify their SHA-256 checksums.
 
+Install or update to the latest stable release on Linux or macOS:
+
+```bash
+curl -fsSL https://github.com/ZigHuang/dex/releases/latest/download/install.sh | sh
+```
+
+The command selects your operating system and architecture automatically. No
+version is required: the installer resolves GitHub's latest stable release on
+each run. Use `--release` or `DEX_RELEASE` only when selecting a specific version.
+
 The `Dex release` workflow uses GitHub-hosted runners to build Linux, macOS, and
 Windows packages for x86_64 and arm64. Run it manually to build downloadable
 Actions artifacts. To publish a release, set the Cargo workspace version to the
@@ -24,7 +34,9 @@ If an unpublished release fails because of its CI configuration, fix the
 workflow on `main` and push a tag such as `rebuild-1-rust-v0.166.0`. This runs the
 updated workflow against the original `rust-v0.166.0` source commit and stops
 earlier attempts for that version. Use another rebuild number for further retries.
-Published releases require a new version.
+Source changes to a published release require a new version. Missing platform
+packages may be added from the same original tag; update the checksum manifest
+when adding them and preserve the existing package archives.
 
 ### System requirements
 
