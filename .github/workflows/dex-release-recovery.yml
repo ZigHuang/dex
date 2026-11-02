@@ -1,0 +1,80 @@
+name: Dex release recovery
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/dex-release-recovery.yml]
+
+permissions:
+  actions: write
+  checks: write
+  contents: read
+
+jobs:
+  recover:
+    if: github.repository == 'ZigHuang/dex'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Stop failed release and collect Windows ARM diagnostics
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.error
+          import urllib.request
+
+          base = "https://api.github.com/repos/ZigHuang/dex"
+          token = os.environ["GH_TOKEN"]
+          headers = {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json"}
+
+          def request(path, payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              method = "GET" if payload is None else "POST"
+              with urllib.request.urlopen(urllib.request.Request(base + path, data=data, headers=headers, method=method), timeout=30) as response:
+                  content = response.read()
+              return json.loads(content) if content else None
+
+          run = request("/actions/runs/41415793810")
+          jobs = request("/actions/runs/41415793810/jobs?per_page=100")["jobs"]
+          if run["name"] != "Dex release" or run["head_sha"] != "bc4e4e319fb4c0523ee7f9231248f293b95c0c79":
+              raise SystemExit("Unexpected release attempt")
+          if not any(job["conclusion"] == "failure" for job in jobs):
+              raise SystemExit("This release attempt has no failed jobs")
+          if run["status"] != "completed":
+              try:
+                  request("/actions/runs/41415793810/cancel", {})
+                  print("Stopped the failed original release attempt")
+              except urllib.error.HTTPError as error:
+                  if error.code != 409:
+                      raise
+          result = subprocess.run(
+              ["curl", "-fsSL", "--connect-timeout", "10", "--max-time", "60", "-H", "Authorization: Bearer " + token,
+               base + "/actions/jobs/125179430595/logs"],
+              check=True, capture_output=True,
+          )
+          log = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.stdout.decode("utf-8-sig", errors="replace"))
+          lines = log.splitlines()
+          indexes = [index for index, line in enumerate(lines) if re.search(r"error:|error\[|fatal:", line, re.IGNORECASE)]
+          selected = set()
+          for index in indexes[-8:]:
+              selected.update(range(max(0, index - 8), min(len(lines), index + 28)))
+          excerpt = "\n".join(lines[index] for index in sorted(selected)) if selected else "\n".join(lines[-80:])
+          excerpt = excerpt[-30000:]
+          check = request("/check-runs", {
+              "name": "Dex Windows ARM release diagnostics",
+              "head_sha": run["head_sha"],
+              "status": "completed",
+              "conclusion": "neutral",
+              "output": {"title": "Original Windows ARM build failure", "summary": "```text\n" + excerpt + "\n```"},
+          })
+          print("Compiler diagnostics check:", check["id"])
+          PY
