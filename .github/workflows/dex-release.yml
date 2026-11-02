@@ -101,7 +101,7 @@ jobs:
           for run in runs["workflow_runs"]:
               branch = run["head_branch"] or ""
               same_release = branch == tag or (branch.startswith("rebuild-") and branch.endswith("-" + tag))
-              if run["name"] != "Dex release" or not same_release or run["status"] == "completed" or str(run["id"]) == os.environ["GITHUB_RUN_ID"]:
+              if run["name"] != "Dex release" or not same_release or run["status"] == "completed" or run["id"] >= int(os.environ["GITHUB_RUN_ID"]):
                   continue
               request = urllib.request.Request(f"{base}/actions/runs/{run['id']}/cancel", data=b"", headers=headers, method="POST")
               try:
