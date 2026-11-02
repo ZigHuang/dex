@@ -26,24 +26,38 @@ jobs:
             https://api.github.com/repos/ZigHuang/dex/actions/jobs/125179430682/logs \
             --output "$RUNNER_TEMP/release-build.log"
           python3 - <<'PY'
+          import gzip
+          import io
           import json
           import os
           from pathlib import Path
           import urllib.request
+          import zipfile
 
-          lines = Path(os.environ["RUNNER_TEMP"], "release-build.log").read_text(errors="replace").splitlines()
+          raw = Path(os.environ["RUNNER_TEMP"], "release-build.log").read_bytes()
+          size = len(raw)
+          signature = raw[:8].hex()
+          if raw.startswith(b"\x1f\x8b"):
+              raw = gzip.decompress(raw)
+          if zipfile.is_zipfile(io.BytesIO(raw)):
+              with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                  text = "\n".join(archive.read(name).decode("utf-8", errors="replace") for name in archive.namelist() if not name.endswith("/"))
+          else:
+              encoding = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8"
+              text = raw.decode(encoding, errors="replace")
+          lines = text.splitlines()
           matches = [index for index, line in enumerate(lines) if any(term in line.lower() for term in ("error:", "error[", "fatal error", "failed to run", "could not compile"))]
           selected = set()
           for index in matches:
               selected.update(range(max(0, index - 4), min(len(lines), index + 12)))
-          excerpt = "\n".join(lines[index] for index in sorted(selected)[-100:])
+          excerpt = "\n".join(lines[index] for index in sorted(selected)[-100:]) if selected else "\n".join(lines[-70:])
           excerpt = excerpt.replace(os.environ["GH_TOKEN"], "[redacted]")
           payload = {
               "name": "Dex release compiler diagnostics",
               "head_sha": "bc4e4e319fb4c0523ee7f9231248f293b95c0c79",
               "status": "completed",
               "conclusion": "neutral",
-              "output": {"title": "Windows x64 compiler output", "summary": "```text\n" + excerpt[-14000:] + "\n```"},
+              "output": {"title": "Windows x64 compiler output", "summary": f"Log bytes: {size}; signature: {signature}\n\n```text\n" + excerpt[-14000:] + "\n```"},
           }
           request = urllib.request.Request(
               "https://api.github.com/repos/ZigHuang/dex/check-runs",
