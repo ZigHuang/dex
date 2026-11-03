@@ -167,6 +167,64 @@ class InstallShTest(unittest.TestCase):
             for binary in ("dex", "dex-code-mode-host", "dex-exec-server"):
                 self.assertTrue(os.access(current / "bin" / binary, os.X_OK))
 
+    def test_interrupted_archive_is_resumed_and_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive, checksum, metadata = create_package_release(root, include_exec_server=True)
+            result, requests = run_installer_in(
+                root, "latest", metadata_json=metadata, archive_path=archive,
+                checksum_path=checksum, force_macos=True, network_scenario="archive_reset_once",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            package_url = f"https://github.com/ZigHuang/dex/releases/download/rust-v{VERSION}/{archive.name}"
+            self.assertEqual(requests.count(package_url), 2)
+            self.assertIn("--continue-at -", (root / "curl-arguments.log").read_text())
+            self.assertTrue((root / "dex-home/packages/standalone/current/bin/dex-exec-server").is_file())
+
+    def test_github_api_fallback_installs_after_browser_download_resets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive, checksum, metadata = create_package_release(root, include_exec_server=True)
+            release = json.loads(metadata)
+            for item, asset_id in zip(release["assets"], (101, 102)):
+                item["url"] = f"https://api.github.com/repos/ZigHuang/dex/releases/assets/{asset_id}"
+            result, requests = run_installer_in(
+                root, "latest", metadata_json=json.dumps(release), archive_path=archive,
+                checksum_path=checksum, force_macos=True, network_scenario="github_reset",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("https://api.github.com/repos/ZigHuang/dex/releases/assets/101?download=1", requests)
+            self.assertIn("https://api.github.com/repos/ZigHuang/dex/releases/assets/102?download=1", requests)
+            self.assertIn("Accept: application/octet-stream", (root / "curl-arguments.log").read_text())
+            self.assertTrue((root / "install-bin/dex").is_file())
+
+    def test_partial_metadata_from_reset_is_discarded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive, checksum, metadata = create_package_release(root)
+            result, requests = run_installer_in(
+                root, "latest", metadata_json=metadata, archive_path=archive,
+                checksum_path=checksum, force_macos=True, network_scenario="metadata_reset_once",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(requests.count("https://api.github.com/repos/ZigHuang/dex/releases/latest"), 2)
+
+    def test_corrupt_api_fallback_cannot_select_an_installation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive, checksum, metadata = create_package_release(root)
+            release = json.loads(metadata)
+            for item, asset_id in zip(release["assets"], (101, 102)):
+                item["url"] = f"https://api.github.com/repos/ZigHuang/dex/releases/assets/{asset_id}"
+            result, _ = run_installer_in(
+                root, "latest", metadata_json=json.dumps(release), archive_path=archive,
+                checksum_path=checksum, force_macos=True, network_scenario="github_reset_api_corrupt",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("checksum did not match expected digest", result.stderr)
+            self.assertFalse((root / "dex-home/packages/standalone/current").is_symlink())
+            self.assertFalse((root / "install-bin/dex").exists())
+
     def test_daemon_install_preserves_visible_cli_and_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir).resolve()
@@ -1012,6 +1070,7 @@ def run_installer_in(
     fail_ps: bool = False,
     daemon_only: bool = False,
     manual_update: bool = False,
+    network_scenario: str = "",
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     bin_dir = root / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -1034,20 +1093,58 @@ def run_installer_in(
               previous="$arg"
             done
             printf '%s\n' "$url" >>"$DEX_TEST_REQUEST_LOG"
+            printf '%s\n' "$*" >>"$DEX_TEST_CURL_ARGUMENTS"
+
+            if [ "$DEX_TEST_NETWORK_SCENARIO" = "github_reset" ] ||
+              [ "$DEX_TEST_NETWORK_SCENARIO" = "github_reset_api_corrupt" ]; then
+              case "$url" in
+                https://github.com/*)
+                  echo "curl: (56) Recv failure: Connection reset by peer" >&2
+                  exit 56
+                  ;;
+              esac
+            fi
+
+            if [ "$DEX_TEST_NETWORK_SCENARIO" = "archive_reset_once" ] &&
+              [ ! -f "$DEX_TEST_RETRY_MARKER" ]; then
+              case "$url" in
+                https://github.com/*/dex-package-*.tar.gz)
+                  head -c 128 "$DEX_TEST_ARCHIVE_PATH" >"$output"
+                  touch "$DEX_TEST_RETRY_MARKER"
+                  exit 56
+                  ;;
+              esac
+            fi
 
             case "$url" in
+              https://api.github.com/repos/ZigHuang/dex/releases/assets/101*)
+                if [ "$DEX_TEST_NETWORK_SCENARIO" = "github_reset_api_corrupt" ]; then
+                  printf 'corrupt archive\n' >"$output"
+                else
+                  cp "$DEX_TEST_ARCHIVE_PATH" "$output"
+                fi
+                ;;
+              https://api.github.com/repos/ZigHuang/dex/releases/assets/102*)
+                cp "$DEX_TEST_CHECKSUM_PATH" "$output"
+                ;;
               https://api.github.com/*)
                 if [ "$DEX_TEST_METADATA_FAILURE" = "1" ]; then
                   echo "curl: (22) The requested URL returned error: 403" >&2
                   exit 22
                 fi
-                printf '%s\n' "$DEX_TEST_METADATA_JSON"
+                if [ "$DEX_TEST_NETWORK_SCENARIO" = "metadata_reset_once" ] &&
+                  [ ! -f "$DEX_TEST_RETRY_MARKER" ]; then
+                  printf '{"tag_name":' >"$output"
+                  touch "$DEX_TEST_RETRY_MARKER"
+                  exit 56
+                fi
+                printf '%s\n' "$DEX_TEST_METADATA_JSON" >"$output"
                 ;;
               https://releases.openai.com/dex/channels/latest|https://releases.openai.com/dex/releases/*/release.json)
                 if [ "$DEX_TEST_RELEASES_MODE" = "channel_failure" ]; then
                   exit 22
                 fi
-                printf '%s\n' "$DEX_TEST_RELEASES_METADATA_JSON"
+                printf '%s\n' "$DEX_TEST_RELEASES_METADATA_JSON" >"$output"
                 ;;
               https://releases.openai.com/dex/releases/*/dex-package_SHA256SUMS)
                 if [ "$DEX_TEST_RELEASES_MODE" = "asset_fallback" ]; then
@@ -1166,6 +1263,9 @@ def run_installer_in(
             ),
             "DEX_TEST_RELEASES_MODE": releases_mode,
             "DEX_TEST_REQUEST_LOG": str(request_log),
+            "DEX_TEST_NETWORK_SCENARIO": network_scenario,
+            "DEX_TEST_RETRY_MARKER": str(root / "retry-marker"),
+            "DEX_TEST_CURL_ARGUMENTS": str(root / "curl-arguments.log"),
             "HOME": str(home),
             "PATH": f"{bin_dir}:/usr/bin:/bin",
             "SHELL": "/bin/sh",

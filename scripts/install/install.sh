@@ -113,68 +113,91 @@ EOF
   done
 }
 
-download_file() {
+download_file() (
   url="$1"
   output="$2"
+  kind="${3:-asset}"
+  attempt=1
+  status=1
+  rm -f "$output"
 
-  if command -v curl >/dev/null 2>&1; then
-    case "$url" in
-      "$RELEASES_BASE_URL"/*)
-        curl -fsSL --connect-timeout "$RELEASES_CONNECT_TIMEOUT" --max-time "$RELEASES_ASSET_TIMEOUT" "$url" -o "$output"
-        ;;
-      *)
-        curl -fsSL "$url" -o "$output"
-        ;;
-    esac
-    return
-  fi
+  while [ "$attempt" -le 3 ]; do
+    if command -v curl >/dev/null 2>&1; then
+      set -- --http1.1 -fsSL --retry 2 --retry-delay 1 \
+        --connect-timeout "$RELEASES_CONNECT_TIMEOUT"
+      if [ "$kind" = "metadata" ]; then
+        set -- "$@" --max-time "$RELEASES_METADATA_TIMEOUT"
+      else
+        set -- "$@" --max-time "$RELEASES_ASSET_TIMEOUT"
+      fi
+      case "$url" in
+        https://api.github.com/repos/ZigHuang/dex/releases/assets/*)
+          set -- "$@" -H "Accept: application/octet-stream"
+          ;;
+      esac
+      if [ "$kind" != "metadata" ] && [ "$attempt" -gt 1 ] && [ -s "$output" ]; then
+        set -- "$@" --continue-at -
+      fi
+      if curl "$@" "$url" -o "$output"; then
+        return 0
+      else
+        status=$?
+      fi
 
-  if command -v wget >/dev/null 2>&1; then
-    case "$url" in
-      "$RELEASES_BASE_URL"/*)
-        wget -q -t 1 -T "$RELEASES_ASSET_TIMEOUT" -O "$output" "$url"
-        ;;
-      *)
-        wget -q -O "$output" "$url"
-        ;;
-    esac
-    return
-  fi
+      case "$status" in
+        5 | 6 | 7 | 18 | 28 | 35 | 52 | 55 | 56 | 92) ;;
+        33)
+          # A server that rejects range requests needs a fresh download.
+          rm -f "$output"
+          ;;
+        *) return "$status" ;;
+      esac
+    elif command -v wget >/dev/null 2>&1; then
+      timeout="$RELEASES_ASSET_TIMEOUT"
+      if [ "$kind" = "metadata" ]; then
+        timeout="$RELEASES_METADATA_TIMEOUT"
+      fi
+      set -- -q -t 1 -T "$timeout"
+      case "$url" in
+        https://api.github.com/repos/ZigHuang/dex/releases/assets/*)
+          set -- "$@" --header="Accept: application/octet-stream"
+          ;;
+      esac
+      if wget "$@" -O "$output" "$url"; then
+        return 0
+      else
+        status=$?
+      fi
+      case "$status" in
+        4 | 5) ;;
+        *) return "$status" ;;
+      esac
+    else
+      echo "curl or wget is required to install Dex." >&2
+      return 1
+    fi
 
-  echo "curl or wget is required to install Dex." >&2
-  exit 1
-}
+    if [ "$attempt" -eq 3 ]; then
+      return "$status"
+    fi
+    if [ "$kind" = "metadata" ]; then
+      rm -f "$output"
+    fi
+    warn "Download interrupted; retrying $url."
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+)
 
-download_text() {
+download_text() (
   url="$1"
-
-  if command -v curl >/dev/null 2>&1; then
-    case "$url" in
-      "$RELEASES_BASE_URL"/*)
-        curl -fsSL --connect-timeout "$RELEASES_CONNECT_TIMEOUT" --max-time "$RELEASES_METADATA_TIMEOUT" "$url"
-        ;;
-      *)
-        curl -fsSL "$url"
-        ;;
-    esac
-    return
+  text_file="$(mktemp "${TMPDIR:-/tmp}/dex-metadata.XXXXXX")" || return 1
+  trap 'rm -f "$text_file"' 0
+  if ! download_file "$url" "$text_file" metadata; then
+    return 1
   fi
-
-  if command -v wget >/dev/null 2>&1; then
-    case "$url" in
-      "$RELEASES_BASE_URL"/*)
-        wget -q -t 1 -T "$RELEASES_METADATA_TIMEOUT" -O - "$url"
-        ;;
-      *)
-        wget -q -O - "$url"
-        ;;
-    esac
-    return
-  fi
-
-  echo "curl or wget is required to install Dex." >&2
-  exit 1
-}
+  cat "$text_file"
+)
 
 download_file_with_fallback() {
   primary_url="$1"
@@ -223,6 +246,8 @@ parse_release_metadata() {
           asset_name = value
         } else if (key == "digest") {
           asset_digest = value
+        } else if (key == "url") {
+          asset_api_url = value
         }
       }
 
@@ -270,17 +295,19 @@ parse_release_metadata() {
             asset_object_depth = object_depth
             asset_name = ""
             asset_digest = ""
+            asset_api_url = ""
           }
           expecting_value = 0
           key = ""
         } else if (char == "}") {
           if (object_depth == asset_object_depth) {
             if (asset_name != "" && asset_digest != "") {
-              print "asset\t" asset_name "\t" asset_digest
+              print "asset\t" asset_name "\t" asset_digest "\t" asset_api_url
             }
             asset_object_depth = 0
             asset_name = ""
             asset_digest = ""
+            asset_api_url = ""
           }
           object_depth--
           expecting_value = 0
@@ -474,6 +501,23 @@ release_asset_digest() {
   printf '%s\n' "$digest"
 }
 
+release_asset_api_url_or_empty() {
+  api_url="$(printf '%s\n' "$release_metadata" | awk -F '\t' -v asset="$1" '
+    $1 == "asset" && $2 == asset { print $4; exit }
+  ')"
+  api_prefix="https://api.github.com/repos/ZigHuang/dex/releases/assets/"
+  case "$api_url" in
+    "$api_prefix"*)
+      asset_id="${api_url#"$api_prefix"}"
+      case "$asset_id" in
+        "" | *[!0-9]*) return 1 ;;
+      esac
+      printf '%s?download=1\n' "$api_url"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 select_release_assets() {
   package_asset="dex-package-$vendor_target.tar.gz"
   checksum_asset="dex-package_SHA256SUMS"
@@ -501,8 +545,10 @@ select_release_assets() {
     fi
   else
     download_url="$(release_url_for_asset "$asset" "$resolved_version")"
+    download_fallback_url="$(release_asset_api_url_or_empty "$asset" || true)"
     if [ "$install_layout" = "package" ]; then
       checksum_url="$(release_url_for_asset "$checksum_asset" "$resolved_version")"
+      checksum_fallback_url="$(release_asset_api_url_or_empty "$checksum_asset" || true)"
     fi
   fi
 }

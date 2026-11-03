@@ -56,6 +56,10 @@ This downloads the installer from `main`; the installer still selects the latest
 stable GitHub Release. Both commands execute the script only after curl completes
 successfully.
 
+Package downloads also retry interrupted connections and resume partial files.
+When the GitHub download URL fails, the installer uses the GitHub Release asset
+API and verifies the same SHA-256 digest before installation.
+
 ### System requirements
 
 | Requirement                 | Details                                                         |
