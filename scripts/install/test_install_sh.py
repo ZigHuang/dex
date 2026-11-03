@@ -24,6 +24,103 @@ MISMATCH_VERSION = "0.145.0"
 
 
 class InstallShTest(unittest.TestCase):
+    def test_codex_config_reuse_preserves_files_and_separates_daemon_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            codex_home = root / "home/.codex"
+            codex_home.mkdir(parents=True)
+            config = 'model_provider = "custom"\n'
+            auth = '{"OPENAI_API_KEY":"test-credential"}\n'
+            (codex_home / "config.toml").write_text(config)
+            (codex_home / "auth.json").write_text(auth)
+            codex_binary = codex_home / "packages/app-server-daemon/current/bin/codex"
+            codex_binary.parent.mkdir(parents=True)
+            codex_binary.write_text("existing Codex daemon")
+            dex_home = root / "dex-home"
+            dex_home.mkdir()
+            (dex_home / "config.toml").write_text("original Dex config")
+            (dex_home / "auth.json").write_text("original Dex auth")
+            (dex_home / "auth.json").chmod(0o600)
+            archive, checksum, metadata = create_package_release(root, record_daemon_home=True)
+            result, _ = run_installer_in(
+                root, "latest", metadata_json=metadata, archive_path=archive,
+                checksum_path=checksum, force_macos=True, use_codex_config=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for name in ("config.toml", "auth.json"):
+                self.assertEqual((dex_home / name).resolve(), codex_home / name)
+            backup = next(dex_home.glob("codex-config-backup.*"))
+            self.assertEqual((backup / "config.toml").read_text(), "original Dex config")
+            self.assertEqual((backup / "auth.json").read_text(), "original Dex auth")
+            self.assertEqual(backup.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((backup / "auth.json").stat().st_mode & 0o777, 0o600)
+            self.assertEqual((codex_home / "config.toml").read_text(), config)
+            self.assertEqual((codex_home / "auth.json").read_text(), auth)
+            self.assertEqual(codex_binary.read_text(), "existing Codex daemon")
+            self.assertEqual((root / "daemon-home.log").read_text().strip(), str(dex_home))
+
+    def test_codex_config_reuse_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "home/.codex"
+            source.mkdir(parents=True)
+            (source / "config.toml").write_text('model_provider = "custom"\n')
+            dex_home = root / "dex-home"
+            dex_home.mkdir()
+            (dex_home / "config.toml").write_text("original config")
+            archive, checksum, metadata = create_package_release(root, record_daemon_home=True)
+            options = dict(
+                metadata_json=metadata, archive_path=archive, checksum_path=checksum,
+                force_macos=True, use_codex_config=True,
+            )
+            first, initial_requests = run_installer_in(root, "latest", **options)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            link_stat = (dex_home / "config.toml").lstat()
+            backups = list(dex_home.glob("codex-config-backup.*"))
+            (source / "config.toml").write_text('model_provider = "updated"\n')
+            second, requests = run_installer_in(root, "latest", **options)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual((dex_home / "config.toml").lstat().st_ino, link_stat.st_ino)
+            self.assertEqual(list(dex_home.glob("codex-config-backup.*")), backups)
+            self.assertEqual((dex_home / "config.toml").read_text(), 'model_provider = "updated"\n')
+            self.assertEqual(
+                requests[len(initial_requests):],
+                ["https://api.github.com/repos/ZigHuang/dex/releases/latest"],
+            )
+
+    def test_codex_config_reuse_requires_existing_codex_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            result, requests = run_installer_in(root, "latest", use_codex_config=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Codex config not found", result.stderr)
+            self.assertEqual(requests, [])
+            self.assertFalse((root / "install-bin/dex").exists())
+
+    def test_codex_config_reuse_rejects_a_shared_data_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "home/.codex"
+            source.mkdir(parents=True)
+            (source / "config.toml").write_text("original Codex config")
+            alias = root / "dex-home"
+            alias.symlink_to(source, target_is_directory=True)
+            result, requests = run_installer_in(root, "latest", use_codex_config=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("separate data directories", result.stderr)
+            self.assertEqual(requests, [])
+            self.assertEqual((source / "config.toml").read_text(), "original Codex config")
+            self.assertFalse((source / "packages").exists())
+
+    def test_codex_config_reuse_rejects_daemon_only_installation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result, requests = run_installer_in(
+                Path(temp_dir), "latest", use_codex_config=True, daemon_only=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("requires a standalone CLI", result.stderr)
+            self.assertEqual(requests, [])
+
     def test_metadata_fetch_failure_is_not_reported_as_missing_assets(self) -> None:
         result, requests = run_installer(VERSION, metadata_failure=True)
 
@@ -1214,6 +1311,7 @@ def run_installer_in(
     manual_update: bool = False,
     network_scenario: str = "",
     curl_wrapper: str | None = None,
+    use_codex_config: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     bin_dir = root / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -1445,6 +1543,7 @@ def run_installer_in(
             "DEX_TEST_NETWORK_SCENARIO": network_scenario,
             "DEX_TEST_RETRY_MARKER": str(root / "retry-marker"),
             "DEX_TEST_CURL_ARGUMENTS": str(root / "curl-arguments.log"),
+            "DEX_TEST_DAEMON_HOME_LOG": str(root / "daemon-home.log"),
             "HOME": str(home),
             "PATH": f"{bin_dir}:/usr/bin:/bin",
             "SHELL": "/bin/sh",
@@ -1465,7 +1564,7 @@ def run_installer_in(
     else:
         env["DEX_INSTALLER_USE_RELEASES_OPENAI_COM"] = "TRUE" if use_mirror else "false"
     result = subprocess.run(
-        ["/bin/sh", str(installer_path)],
+        ["/bin/sh", str(installer_path)] + (["--use-codex-config"] if use_codex_config else []),
         capture_output=True,
         check=False,
         env=env,
@@ -1493,6 +1592,7 @@ def create_package_release(
     binary_version: str = VERSION,
     target: str = "aarch64-apple-darwin",
     include_exec_server: bool = False,
+    record_daemon_home: bool = False,
 ) -> tuple[Path, Path, str]:
     package_dir = root / "package"
     (package_dir / "bin").mkdir(parents=True)
@@ -1507,7 +1607,12 @@ def create_package_release(
     )
     write_executable(
         package_dir / "bin" / "dex",
-        f"#!/bin/sh\nprintf 'dex-cli {binary_version}\\n'\n",
+        "#!/bin/sh\n"
+        + ('if [ "$*" = "app-server daemon start" ]; then\n'
+           '  printf "%s\\n" "$DEX_HOME" > "$DEX_TEST_DAEMON_HOME_LOG"\n'
+           '  exit 0\n'
+           'fi\n' if record_daemon_home else "")
+        + f"printf 'dex-cli {binary_version}\\n'\n",
     )
     write_executable(
         package_dir / "bin" / "dex-code-mode-host",

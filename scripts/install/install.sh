@@ -5,6 +5,7 @@ set -eu
 RELEASE="${DEX_RELEASE:-latest}"
 NON_INTERACTIVE="${DEX_NON_INTERACTIVE:-false}"
 DAEMON_ONLY="${DEX_INSTALL_DAEMON_ONLY:-0}"
+USE_CODEX_CONFIG="false"
 DEFAULT_PREFER_RELEASES_OPENAI_COM="false"
 PREFER_RELEASES_OPENAI_COM="${DEX_INSTALLER_USE_RELEASES_OPENAI_COM:-$DEFAULT_PREFER_RELEASES_OPENAI_COM}"
 RELEASES_BASE_URL="https://releases.openai.com/dex"
@@ -91,9 +92,16 @@ parse_args() {
         RELEASE="$2"
         shift
         ;;
+      --use-codex-config)
+        USE_CODEX_CONFIG="true"
+        ;;
       --help | -h)
         cat <<EOF
-Usage: install.sh [--release VERSION]
+Usage: install.sh [--release VERSION] [--use-codex-config]
+
+Options:
+  --use-codex-config   Back up Dex config, link Codex config and file credentials,
+                      and start Dex's separate background service.
 
 Environment:
   DEX_RELEASE          Version to install; overridden by --release.
@@ -112,6 +120,53 @@ EOF
     shift
   done
 }
+
+validate_codex_config() (
+  if [ "$DAEMON_ONLY" = "1" ]; then
+    echo "--use-codex-config requires a standalone CLI installation." >&2
+    return 1
+  fi
+  codex_source_home="$HOME/.codex"
+  if [ ! -f "$codex_source_home/config.toml" ]; then
+    echo "Codex config not found at $codex_source_home/config.toml. Configure API access in Dex, or configure Codex first." >&2
+    return 1
+  fi
+  mkdir -p "$DEX_HOME_DIR"
+  codex_real_home="$(cd -P "$codex_source_home" && pwd)"
+  dex_real_home="$(cd -P "$DEX_HOME_DIR" && pwd)"
+  if [ "$dex_real_home" = "$codex_real_home" ]; then
+    echo "Dex and Codex need separate data directories. Rerun with DEX_HOME=\"\$HOME/.dex\"." >&2
+    return 1
+  fi
+)
+
+reuse_codex_config() (
+  backup_dir=""
+  for config_file in config.toml auth.json; do
+    source="$HOME/.codex/$config_file"
+    target="$DEX_HOME_DIR/$config_file"
+    [ -f "$source" ] || continue
+    if [ "$(readlink "$target" 2>/dev/null || true)" = "$source" ]; then
+      continue
+    fi
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      if [ -z "$backup_dir" ]; then
+        backup_dir="$(mktemp -d "$DEX_HOME_DIR/codex-config-backup.XXXXXX")"
+      fi
+      mv "$target" "$backup_dir/$config_file"
+    fi
+    if ! ln -s "$source" "$target"; then
+      if [ -n "$backup_dir" ] && { [ -e "$backup_dir/$config_file" ] || [ -L "$backup_dir/$config_file" ]; }; then
+        mv "$backup_dir/$config_file" "$target"
+      fi
+      return 1
+    fi
+    step "Using Codex $config_file"
+  done
+  if [ -n "$backup_dir" ]; then
+    step "Previous Dex configuration saved to $backup_dir"
+  fi
+)
 
 download_file() (
   url="$1"
@@ -1339,6 +1394,10 @@ parse_args "$@"
 require_command mktemp
 require_command tar
 
+if [ "$USE_CODEX_CONFIG" = "true" ]; then
+  validate_codex_config
+fi
+
 case "$(uname -s)" in
   Darwin)
     os="darwin"
@@ -1576,6 +1635,12 @@ if ! prune_standalone_releases; then
 fi
 release_install_lock
 handle_conflicting_install
+
+if [ "$USE_CODEX_CONFIG" = "true" ]; then
+  reuse_codex_config
+  step "Starting Dex background service"
+  DEX_HOME="$DEX_HOME_DIR" "$BIN_PATH" app-server daemon start
+fi
 
 case "$path_action" in
   added)

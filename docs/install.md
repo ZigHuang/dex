@@ -9,14 +9,17 @@ download packages from GitHub by default and verify their SHA-256 checksums.
 Install or update to the latest stable release on Linux or macOS:
 
 ```bash
-curl --http1.1 -fsSL --retry 5 --retry-all-errors --connect-timeout 10 \
+curl --http1.1 -fsSL --retry 5 --retry-all-errors --connect-timeout 30 \
   https://github.com/ZigHuang/dex/releases/latest/download/install.sh \
-  -o /tmp/dex-install.sh && sh /tmp/dex-install.sh
+  -o /tmp/dex-install.sh && DEX_HOME="$HOME/.dex" sh /tmp/dex-install.sh
 ```
 
 The command selects your operating system and architecture automatically. No
 version is required: the installer resolves GitHub's latest stable release on
 each run. Use `--release` or `DEX_RELEASE` only when selecting a specific version.
+Installation sets up the CLI. API access still needs to be configured; a fresh
+installation shows the API key or Bedrock setup screen. To reuse an existing
+Codex configuration, pass `--use-codex-config` as described below.
 
 The `Dex release` workflow uses GitHub-hosted runners to build Linux, macOS, and
 Windows packages for x86_64 and arm64. Run it manually to build downloadable
@@ -46,10 +49,10 @@ If GitHub's script download fails with a connection reset or curl error 56,
 retrieve the installer through the repository API:
 
 ```bash
-curl --http1.1 -fsSL --retry 5 --retry-all-errors --connect-timeout 10 \
+curl --http1.1 -fsSL --retry 5 --retry-all-errors --connect-timeout 30 \
   -H 'Accept: application/vnd.github.raw+json' \
   'https://api.github.com/repos/ZigHuang/dex/contents/scripts/install/install.sh?ref=main' \
-  -o /tmp/dex-install.sh && sh /tmp/dex-install.sh
+  -o /tmp/dex-install.sh && DEX_HOME="$HOME/.dex" sh /tmp/dex-install.sh
 ```
 
 This downloads the installer from `main`; the installer still selects the latest
@@ -74,24 +77,17 @@ socket names, but their executables are named `dex` and `codex`. Sharing the who
 home with `DEX_HOME="$HOME/.codex"` can therefore select a Codex daemon package that
 has no `bin/dex`; `dex app-server daemon start` preserves that existing selection.
 
-The following backs up existing Dex configuration files, links the available
-Codex files, and starts Dex with its own daemon package:
+After exiting an open setup screen, run the installer with `--use-codex-config`.
+This requires an existing `~/.codex/config.toml`, backs up changed Dex files in
+`~/.dex/codex-config-backup.*`, links the Codex configuration and any `auth.json`,
+and starts Dex with its own daemon package. Repeating the command preserves
+existing links and selects the latest stable release:
 
 ```bash
-(
-  set -e
-  mkdir -p "$HOME/.dex"
-  dex_backup_stamp="$(date +%Y%m%d-%H%M%S)-$$"
-  for dex_config_file in config.toml auth.json; do
-    [ -f "$HOME/.codex/$dex_config_file" ] || continue
-    if [ -e "$HOME/.dex/$dex_config_file" ] || [ -L "$HOME/.dex/$dex_config_file" ]; then
-      mv "$HOME/.dex/$dex_config_file" "$HOME/.dex/$dex_config_file.bak.$dex_backup_stamp"
-    fi
-    ln -s "$HOME/.codex/$dex_config_file" "$HOME/.dex/$dex_config_file"
-  done
-  DEX_HOME="$HOME/.dex" dex app-server daemon start
-  DEX_HOME="$HOME/.dex" dex
-)
+curl --http1.1 -fsSL --retry 5 --retry-all-errors --connect-timeout 30 \
+  -H 'Accept: application/vnd.github.raw+json' \
+  'https://api.github.com/repos/ZigHuang/dex/contents/scripts/install/install.sh?ref=main' \
+  -o /tmp/dex-install.sh && DEX_HOME="$HOME/.dex" sh /tmp/dex-install.sh --use-codex-config
 ```
 
 ### System requirements
