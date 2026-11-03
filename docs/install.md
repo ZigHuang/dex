@@ -66,6 +66,34 @@ reused when the installer is run again for the same asset and SHA-256 digest.
 When the GitHub download URL fails, the installer resumes through the GitHub
 Release asset API and verifies the same SHA-256 digest before installation.
 
+### Reuse Codex configuration
+
+Keep Dex's home at `~/.dex` and link the Codex configuration and file credentials.
+Dex and Codex both use `packages/app-server-daemon` and the same daemon state and
+socket names, but their executables are named `dex` and `codex`. Sharing the whole
+home with `DEX_HOME="$HOME/.codex"` can therefore select a Codex daemon package that
+has no `bin/dex`; `dex app-server daemon start` preserves that existing selection.
+
+The following backs up existing Dex configuration files, links the available
+Codex files, and starts Dex with its own daemon package:
+
+```bash
+(
+  set -e
+  mkdir -p "$HOME/.dex"
+  dex_backup_stamp="$(date +%Y%m%d-%H%M%S)-$$"
+  for dex_config_file in config.toml auth.json; do
+    [ -f "$HOME/.codex/$dex_config_file" ] || continue
+    if [ -e "$HOME/.dex/$dex_config_file" ] || [ -L "$HOME/.dex/$dex_config_file" ]; then
+      mv "$HOME/.dex/$dex_config_file" "$HOME/.dex/$dex_config_file.bak.$dex_backup_stamp"
+    fi
+    ln -s "$HOME/.codex/$dex_config_file" "$HOME/.dex/$dex_config_file"
+  done
+  DEX_HOME="$HOME/.dex" dex app-server daemon start
+  DEX_HOME="$HOME/.dex" dex
+)
+```
+
 ### System requirements
 
 | Requirement                 | Details                                                         |
