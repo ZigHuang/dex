@@ -8,8 +8,8 @@ DAEMON_ONLY="${DEX_INSTALL_DAEMON_ONLY:-0}"
 DEFAULT_PREFER_RELEASES_OPENAI_COM="false"
 PREFER_RELEASES_OPENAI_COM="${DEX_INSTALLER_USE_RELEASES_OPENAI_COM:-$DEFAULT_PREFER_RELEASES_OPENAI_COM}"
 RELEASES_BASE_URL="https://releases.openai.com/dex"
-RELEASES_CONNECT_TIMEOUT=10
-RELEASES_METADATA_TIMEOUT=30
+RELEASES_CONNECT_TIMEOUT=30
+RELEASES_METADATA_TIMEOUT=60
 RELEASES_ASSET_TIMEOUT=300
 release_source="github"
 
@@ -117,28 +117,44 @@ download_file() (
   url="$1"
   output="$2"
   kind="${3:-asset}"
+  preserve_partial="${4:-false}"
   attempt=1
+  max_attempts=5
+  if [ "$kind" = "metadata" ]; then
+    max_attempts=3
+  fi
   status=1
-  rm -f "$output"
+  if [ "$preserve_partial" != "true" ] || [ "$kind" = "metadata" ]; then
+    rm -f "$output"
+  fi
 
-  while [ "$attempt" -le 3 ]; do
+  while [ "$attempt" -le "$max_attempts" ]; do
     if command -v curl >/dev/null 2>&1; then
-      set -- --http1.1 -fsSL --retry 2 --retry-delay 1 \
-        --connect-timeout "$RELEASES_CONNECT_TIMEOUT"
+      # Retry in the shell: curl's built-in retries discard newly received data.
+      set -- --http1.1 -fSL --connect-timeout "$RELEASES_CONNECT_TIMEOUT"
       if [ "$kind" = "metadata" ]; then
-        set -- "$@" --max-time "$RELEASES_METADATA_TIMEOUT"
+        set -- "$@" -sS --max-time "$RELEASES_METADATA_TIMEOUT"
       else
-        set -- "$@" --max-time "$RELEASES_ASSET_TIMEOUT"
+        # Allow slow downloads to finish; retry connections that stop transferring.
+        set -- "$@" --max-time 0 --speed-limit 1024 --speed-time 30
+        if [ -t 2 ]; then
+          set -- "$@" --progress-bar
+        else
+          set -- "$@" -sS
+        fi
+      fi
+      if [ "$attempt" -gt 1 ]; then
+        set -- "$@" --ipv4
       fi
       case "$url" in
         https://api.github.com/repos/ZigHuang/dex/releases/assets/*)
           set -- "$@" -H "Accept: application/octet-stream"
           ;;
       esac
-      if [ "$kind" != "metadata" ] && [ "$attempt" -gt 1 ] && [ -s "$output" ]; then
+      if [ "$kind" != "metadata" ] && [ -s "$output" ]; then
         set -- "$@" --continue-at -
       fi
-      if curl "$@" "$url" -o "$output"; then
+      if http_status="$(curl "$@" --write-out '%{http_code}' "$url" -o "$output")"; then
         return 0
       else
         status=$?
@@ -146,6 +162,13 @@ download_file() (
 
       case "$status" in
         5 | 6 | 7 | 18 | 28 | 35 | 52 | 55 | 56 | 92) ;;
+        22)
+          case "$http_status" in
+            408 | 429 | 500 | 502 | 503 | 504) ;;
+            416) rm -f "$output" ;;
+            *) return "$status" ;;
+          esac
+          ;;
         33)
           # A server that rejects range requests needs a fresh download.
           rm -f "$output"
@@ -158,6 +181,9 @@ download_file() (
         timeout="$RELEASES_METADATA_TIMEOUT"
       fi
       set -- -q -t 1 -T "$timeout"
+      if [ "$kind" != "metadata" ] && [ -s "$output" ]; then
+        set -- "$@" -c
+      fi
       case "$url" in
         https://api.github.com/repos/ZigHuang/dex/releases/assets/*)
           set -- "$@" --header="Accept: application/octet-stream"
@@ -177,14 +203,19 @@ download_file() (
       return 1
     fi
 
-    if [ "$attempt" -eq 3 ]; then
+    if [ "$attempt" -eq "$max_attempts" ]; then
       return "$status"
     fi
     if [ "$kind" = "metadata" ]; then
       rm -f "$output"
     fi
-    warn "Download interrupted; retrying $url."
     attempt=$((attempt + 1))
+    if [ "$kind" != "metadata" ] && [ -s "$output" ]; then
+      received_bytes="$(wc -c < "$output" | tr -d ' ')"
+      warn "Download interrupted (curl/wget exit $status); resuming from $received_bytes bytes, attempt $attempt/$max_attempts."
+    else
+      warn "Download interrupted (curl/wget exit $status); retrying, attempt $attempt/$max_attempts."
+    fi
     sleep 1
   done
 )
@@ -199,7 +230,7 @@ download_text() (
   cat "$text_file"
 )
 
-download_file_with_fallback() {
+download_file_with_fallback() (
   primary_url="$1"
   fallback_url="$2"
   output="$3"
@@ -207,18 +238,25 @@ download_file_with_fallback() {
   fallback_asset="$5"
   required_manifest_asset="${6:-}"
 
-  if download_file "$primary_url" "$output" &&
-    verify_archive_digest "$output" "$expected_digest" &&
-    { [ -z "$required_manifest_asset" ] || package_archive_digest "$required_manifest_asset" "$output" >/dev/null; }; then
-    return
+  preserve_partial="true"
+  if download_file "$primary_url" "$output" asset true; then
+    if verify_archive_digest "$output" "$expected_digest" &&
+      { [ -z "$required_manifest_asset" ] || package_archive_digest "$required_manifest_asset" "$output" >/dev/null; }; then
+      return
+    fi
+    # A completed but invalid file must be replaced rather than resumed.
+    rm -f "$output"
+    preserve_partial="false"
   fi
 
   if [ -z "$fallback_url" ]; then
     return 1
   fi
 
-  warn "Could not download or verify $primary_url; retrying from GitHub Releases."
-  download_file "$fallback_url" "$output"
+  warn "Could not download or verify $primary_url; trying the alternate GitHub download URL."
+  if ! download_file "$fallback_url" "$output" asset "$preserve_partial"; then
+    return 1
+  fi
   if verify_archive_digest "$output" "$expected_digest" &&
     { [ -z "$required_manifest_asset" ] || package_archive_digest "$required_manifest_asset" "$output" >/dev/null; }; then
     return
@@ -230,7 +268,7 @@ download_file_with_fallback() {
   if [ -n "$required_manifest_asset" ]; then
     package_archive_digest "$required_manifest_asset" "$output" >/dev/null
   fi
-}
+)
 
 parse_release_metadata() {
   # Bound awk's record size so compact, single-line JSON stays fast on every
@@ -1458,13 +1496,25 @@ if ! release_dir_is_complete "$release_dir" "$resolved_version" "$vendor_target"
 
   step "Downloading Dex CLI"
   if [ "$install_layout" = "package" ]; then
+    step "Downloading checksum manifest"
     checksum_digest="$(release_asset_digest "$checksum_asset")"
     download_file_with_fallback "$checksum_url" "$checksum_fallback_url" "$checksum_path" "$checksum_digest" "$checksum_asset" "$asset"
     expected_digest="$(package_archive_digest "$asset" "$checksum_path")"
   else
     expected_digest="$(release_asset_digest "$asset")"
   fi
+  step "Downloading $asset (progress appears below)"
+  # The digest separates different releases and prevents mixing their partial data.
+  download_cache="$STANDALONE_ROOT/downloads"
+  mkdir -p "$download_cache"
+  archive_path="$download_cache/$asset.$expected_digest.part"
+  if [ -s "$archive_path" ]; then
+    received_bytes="$(wc -c < "$archive_path" | tr -d ' ')"
+    step "Resuming cached download from $received_bytes bytes"
+  fi
   download_file_with_fallback "$download_url" "$download_fallback_url" "$archive_path" "$expected_digest" "$asset"
+  mv "$archive_path" "$tmp_dir/$asset"
+  archive_path="$tmp_dir/$asset"
 
   step "Installing standalone package to $release_dir"
   if [ "$install_layout" = "package" ]; then

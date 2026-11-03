@@ -56,9 +56,15 @@ This downloads the installer from `main`; the installer still selects the latest
 stable GitHub Release. Both commands execute the script only after curl completes
 successfully.
 
-Package downloads also retry interrupted connections and resume partial files.
-When the GitHub download URL fails, the installer uses the GitHub Release asset
-API and verifies the same SHA-256 digest before installation.
+Package downloads show progress in a terminal and retry interrupted connections.
+A curl timeout printed during a retry does not mean the installer has exited;
+the retry message shows the next attempt and the number of bytes already received.
+Slow transfers may run for more than five minutes. Connections that stop sending
+data are retried from the received offset, without curl discarding the partial file.
+Partial archives are saved under the installation's `downloads` directory and
+reused when the installer is run again for the same asset and SHA-256 digest.
+When the GitHub download URL fails, the installer resumes through the GitHub
+Release asset API and verifies the same SHA-256 digest before installation.
 
 ### System requirements
 

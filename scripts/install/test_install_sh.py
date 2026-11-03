@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,8 @@ import subprocess
 import tarfile
 import tempfile
 import textwrap
+from threading import Thread
+import time
 import unittest
 
 
@@ -166,6 +169,145 @@ class InstallShTest(unittest.TestCase):
             current = root / "dex-home/packages/standalone/current"
             for binary in ("dex", "dex-code-mode-host", "dex-exec-server"):
                 self.assertTrue(os.access(current / "bin" / binary, os.X_OK))
+            archive_request = next(
+                line for line in (root / "curl-arguments.log").read_text().splitlines()
+                if "/" + archive_path.name in line
+            )
+            downloaded_path = Path(shlex.split(archive_request)[-1])
+            self.assertTrue(downloaded_path.name.startswith(archive_path.name + "."))
+            self.assertNotEqual(downloaded_path.name, checksum_path.name)
+
+    def test_ssl_timeout_retries_with_a_longer_connection_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive, checksum, metadata = create_package_release(root)
+            result, requests = run_installer_in(
+                root, "latest", metadata_json=metadata, archive_path=archive,
+                checksum_path=checksum, force_macos=True,
+                network_scenario="archive_ssl_timeout_once",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(sum(url.endswith(archive.name) for url in requests), 2)
+            self.assertIn("exit 28", result.stderr)
+            self.assertIn("attempt 2/5", result.stderr)
+            arguments = (root / "curl-arguments.log").read_text()
+            self.assertIn("--connect-timeout 30", arguments)
+            self.assertIn("--ipv4", arguments)
+            self.assertNotIn("--retry ", arguments)
+            self.assertIn("--max-time 0 --speed-limit 1024 --speed-time 30", arguments)
+
+    def test_real_curl_timeout_resumes_from_the_received_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive, checksum, metadata = create_package_release(root)
+            requests = []
+
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *_args):
+                    pass
+
+                def do_GET(self):
+                    range_header = self.headers.get("Range")
+                    requests.append((self.path, range_header))
+                    if self.path.endswith(archive.name):
+                        body = archive.read_bytes()
+                    elif self.path.endswith(checksum.name):
+                        body = checksum.read_bytes()
+                    else:
+                        body = metadata.encode()
+                    start = int(range_header.removeprefix("bytes=").split("-")[0]) if range_header else 0
+                    self.send_response(206 if range_header else 200)
+                    self.send_header("Content-Length", str(len(body) - start))
+                    if range_header:
+                        self.send_header("Content-Range", f"bytes {start}-{len(body)-1}/{len(body)}")
+                    self.end_headers()
+                    try:
+                        if self.path.endswith(archive.name) and not range_header:
+                            self.wfile.write(body[:128])
+                            self.wfile.flush()
+                            time.sleep(0.3)
+                            self.wfile.write(body[128:])
+                        else:
+                            self.wfile.write(body[start:])
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            worker = Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            real_curl = shutil.which("curl")
+            self.assertIsNotNone(real_curl)
+            wrapper = textwrap.dedent(f"""\
+                #!/usr/bin/python3
+                import os, pathlib, subprocess, sys, urllib.parse
+                args = sys.argv[1:]
+                archive = {archive.name!r}
+                first_archive = False
+                for index, arg in enumerate(args):
+                    if arg.startswith('https://'):
+                        path = urllib.parse.urlsplit(arg).path
+                        args[index] = 'http://127.0.0.1:{server.server_port}' + path
+                        marker = pathlib.Path(os.environ['DEX_TEST_RETRY_MARKER'])
+                        if path.endswith(archive) and not marker.exists():
+                            marker.touch()
+                            first_archive = True
+                if first_archive:
+                    args += ['--max-time', '0.1']
+                args += ['--noproxy', '127.0.0.1']
+                sys.exit(subprocess.call([{real_curl!r}] + args))
+                """)
+            try:
+                result, _ = run_installer_in(
+                    root, "latest", metadata_json=metadata, archive_path=archive,
+                    checksum_path=checksum, force_macos=True, curl_wrapper=wrapper,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                archive_requests = [header for path, header in requests if path.endswith(archive.name)]
+                self.assertEqual(archive_requests, [None, "bytes=128-"])
+                self.assertIn("resuming from 128 bytes", result.stderr)
+                self.assertTrue((root / "install-bin/dex").is_file())
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join()
+
+    def test_api_fallback_preserves_a_partial_archive_after_timeouts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive, checksum, metadata = create_package_release(root)
+            release = json.loads(metadata)
+            for item, asset_id in zip(release["assets"], (101, 102)):
+                item["url"] = f"https://api.github.com/repos/ZigHuang/dex/releases/assets/{asset_id}"
+            result, requests = run_installer_in(
+                root, "latest", metadata_json=json.dumps(release), archive_path=archive,
+                checksum_path=checksum, force_macos=True, network_scenario="archive_timeouts",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(sum(url.endswith(archive.name) for url in requests), 5)
+            self.assertIn("https://api.github.com/repos/ZigHuang/dex/releases/assets/101?download=1", requests)
+
+    def test_rerunning_installer_resumes_a_cached_partial_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive, checksum, metadata = create_package_release(root)
+            options = dict(
+                metadata_json=metadata, archive_path=archive,
+                checksum_path=checksum, force_macos=True,
+            )
+            interrupted, _ = run_installer_in(
+                root, "latest", **options, network_scenario="archive_timeouts",
+            )
+            self.assertNotEqual(interrupted.returncode, 0)
+            cache = root / "dex-home/packages/standalone/downloads"
+            partial = next(cache.glob("*.part"))
+            self.assertEqual(partial.stat().st_size, 128)
+            self.assertFalse((root / "install-bin/dex").exists())
+            resumed, _ = run_installer_in(
+                root, "latest", **options, network_scenario="cached_archive",
+            )
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertIn("Resuming cached download from 128 bytes", resumed.stdout)
+            self.assertFalse(partial.exists())
 
     def test_interrupted_archive_is_resumed_and_verified(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -808,7 +950,7 @@ class InstallShTest(unittest.TestCase):
                     f"rust-v{VERSION}/dex-package-aarch64-apple-darwin.tar.gz",
                 ],
             )
-            self.assertIn("retrying from GitHub Releases", result.stderr)
+            self.assertIn("alternate GitHub download URL", result.stderr)
 
     def test_releases_corrupt_assets_fall_back_to_github(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -840,7 +982,7 @@ class InstallShTest(unittest.TestCase):
                 ],
             )
             self.assertIn("checksum did not match expected digest", result.stderr)
-            self.assertIn("retrying from GitHub Releases", result.stderr)
+            self.assertIn("alternate GitHub download URL", result.stderr)
 
     def test_releases_wrong_checksum_digest_uses_github_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -919,7 +1061,7 @@ class InstallShTest(unittest.TestCase):
                     f"https://releases.openai.com/dex/releases/{VERSION}/dex-package-aarch64-apple-darwin.tar.gz",
                 ],
             )
-            self.assertIn("retrying from GitHub Releases", result.stderr)
+            self.assertIn("alternate GitHub download URL", result.stderr)
 
     def test_releases_corrupt_github_fallback_still_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1071,6 +1213,7 @@ def run_installer_in(
     daemon_only: bool = False,
     manual_update: bool = False,
     network_scenario: str = "",
+    curl_wrapper: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     bin_dir = root / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -1116,8 +1259,35 @@ def run_installer_in(
               esac
             fi
 
+            if [ "$DEX_TEST_NETWORK_SCENARIO" = "archive_ssl_timeout_once" ] &&
+              [ ! -f "$DEX_TEST_RETRY_MARKER" ]; then
+              case "$url" in
+                https://github.com/*/dex-package-*.tar.gz)
+                  touch "$DEX_TEST_RETRY_MARKER"
+                  echo "curl: (28) SSL connection timeout" >&2
+                  exit 28
+                  ;;
+              esac
+            fi
+
+            if [ "$DEX_TEST_NETWORK_SCENARIO" = "archive_timeouts" ]; then
+              case "$url" in
+                https://github.com/*/dex-package-*.tar.gz)
+                  head -c 128 "$DEX_TEST_ARCHIVE_PATH" >"$output"
+                  exit 28
+                  ;;
+              esac
+            fi
+
             case "$url" in
               https://api.github.com/repos/ZigHuang/dex/releases/assets/101*)
+                if [ "$DEX_TEST_NETWORK_SCENARIO" = "archive_timeouts" ]; then
+                  case "$*" in
+                    *"--continue-at -"*) ;;
+                    *) exit 91 ;;
+                  esac
+                  [ "$(wc -c < "$output")" -eq 128 ] || exit 91
+                fi
                 if [ "$DEX_TEST_NETWORK_SCENARIO" = "github_reset_api_corrupt" ]; then
                   printf 'corrupt archive\n' >"$output"
                 else
@@ -1187,6 +1357,13 @@ def run_installer_in(
                 fi
                 ;;
               https://github.com/ZigHuang/dex/releases/download/*/dex-package-*.tar.gz)
+                if [ "$DEX_TEST_NETWORK_SCENARIO" = "cached_archive" ]; then
+                  case "$*" in
+                    *"--continue-at -"*) ;;
+                    *) exit 91 ;;
+                  esac
+                  [ "$(wc -c < "$output")" -eq 128 ] || exit 91
+                fi
                 if [ -n "$DEX_TEST_ARCHIVE_PATH" ]; then
                   cp "$DEX_TEST_ARCHIVE_PATH" "$output"
                 else
@@ -1208,6 +1385,8 @@ def run_installer_in(
         ),
         encoding="utf-8",
     )
+    if curl_wrapper is not None:
+        fake_curl.write_text(curl_wrapper, encoding="utf-8")
     fake_curl.chmod(0o755)
     if force_macos:
         fake_uname = bin_dir / "uname"

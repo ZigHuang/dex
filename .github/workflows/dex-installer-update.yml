@@ -1,0 +1,65 @@
+name: Update latest Dex installer
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/dex-installer-update.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.repository == 'ZigHuang/dex'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Check installer syntax and download recovery
+        run: |
+          sh -n scripts/install/install.sh
+          python3 scripts/install/test_install_sh.py
+      - name: Upload the tested installer to the latest stable release
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import time
+          import tomllib
+
+          endpoint = "repos/" + os.environ["GH_REPO"] + "/releases/latest"
+          def release():
+              return json.loads(subprocess.check_output(["gh", "api", endpoint], text=True))
+
+          current = release()
+          version = tomllib.loads(Path("dex-rs/Cargo.toml").read_text())["workspace"]["package"]["version"]
+          tag = "rust-v" + version
+          assert current["tag_name"] == tag
+          assert not current["draft"] and not current["prerelease"] and not current.get("immutable", False)
+          preserved = {asset["name"]: (asset["size"], asset["digest"]) for asset in current["assets"] if asset["name"] != "install.sh"}
+          assert len(preserved) == 8
+          installer = Path("scripts/install/install.sh")
+          expected = "sha256:" + hashlib.sha256(installer.read_bytes()).hexdigest()
+          subprocess.run(["gh", "release", "upload", tag, str(installer), "--clobber"], check=True)
+          for attempt in range(6):
+              published = release()
+              asset = next(asset for asset in published["assets"] if asset["name"] == "install.sh")
+              if asset["digest"] == expected:
+                  break
+              time.sleep(5)
+          assert asset["digest"] == expected
+          after = {asset["name"]: (asset["size"], asset["digest"]) for asset in published["assets"] if asset["name"] != "install.sh"}
+          assert after == preserved
+          print("Updated and verified installer:", published["html_url"])
+          PY
